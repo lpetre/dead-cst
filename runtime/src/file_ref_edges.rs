@@ -38,7 +38,6 @@ use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use rustc_hash::FxHashSet;
 use ty_module_resolver::{resolve_module, ModuleName};
 use ty_project::Db as ProjectDb;
 use ty_python_core::ast_ids::HasScopedUseId;
@@ -78,11 +77,21 @@ use crate::ingest::{
     stmt_creates_top_level_definition, target_is_dunder_all, DynamicParseResult,
 };
 
-/// Salsa-tracked output of [`file_to_ref_edges`]. Set semantics so
-/// duplicate emissions (a name used twice resolving to the same
-/// target) collapse to a single entry. Edges are unresolved
-/// (`NodeRef` endpoints, not `u32` graph indices) — the assembly
-/// pass translates at the end.
+/// Salsa-tracked output of [`file_to_ref_edges`]. **File-local**: every
+/// emitted [`RefSpec`] is described purely in terms of this file — a
+/// local index `src`, a `Target` that is either a resolved local index
+/// or an *unresolved* cross-file descriptor, and the edge flags. No
+/// cross-file `resolve_module` / `file_to_nodes` lookup happens here;
+/// the assembly pass resolves the [`Target::Member`] / [`Target::Dynamic`]
+/// descriptors (memoized) and translates every `src`/local index into a
+/// `u32` global graph index. Keeping the query file-local means editing
+/// file *B* never dirties file *A*'s ref edges, and the parallel extract
+/// phase never materializes another file's `file_to_nodes`.
+///
+/// `specs` is sorted + deduped before return so salsa's structural `Eq`
+/// is order-insensitive (two runs that emit the same set of edges in a
+/// different visitation order compare equal and don't re-trigger
+/// downstream invalidation).
 ///
 /// `warnings` are visitor messages (e.g. "Skipping dynamic import …")
 /// buffered per-file in pure rust. The driver flushes them to the
@@ -90,18 +99,70 @@ use crate::ingest::{
 /// per-file workers have finished — keeps `file_to_ref_edges` itself
 /// GIL-free so workers run inside `py.allow_threads` cleanly.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
-pub(crate) struct FileRefEdges<'db> {
-    pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
+pub(crate) struct FileRefEdges {
+    pub(crate) specs: Vec<RefSpec>,
     pub(crate) warnings: Vec<String>,
 }
 
-/// Per-file reference-edge collection. Salsa-tracked so the AST
-/// walk parallelizes via salsa's worker coordination, and cross-file
-/// lookups into [`file_to_nodes`] are memoized.
+/// One unresolved reference edge, expressed entirely in this file's
+/// local terms. `src` is the local index (into [`FileNodes::refs`]) of
+/// the owning node; `flags` are the edge flags (dead-branch /
+/// dynamic-import) computed locally. The `target` is resolved by the
+/// assembly pass — see [`Target`].
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) struct RefSpec {
+    pub(crate) src: u32,
+    pub(crate) target: Target,
+    pub(crate) flags: u8,
+}
+
+/// A [`RefSpec`]'s destination.
+///
+/// * `Local` — already resolved: a local index in *this* file (a
+///   use→alias edge, or a module→dunder edge). The assembly pass maps
+///   both endpoints through `local_to_global`.
+/// * `Member` — an unresolved cross-file member/attribute access past
+///   an import alias. The assembly pass runs [`resolve_member`] to turn
+///   it into zero-or-more upstream `NodeRef`s.
+/// * `Dynamic` — an unresolved `__import__` / `importlib.import_module`
+///   target. The assembly pass runs [`resolve_dynamic`].
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) enum Target {
+    Local(u32),
+    Member(MemberRef),
+    Dynamic(DynamicRef),
+}
+
+/// Unresolved descriptor for a use that flows through an import alias
+/// (or a nested-context import). Mirrors the `(spec, bound_name,
+/// extra_chain)` arguments today's `emit_upstream` takes; the assembly
+/// pass resolves it via [`resolve_member`].
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) struct MemberRef {
+    pub(crate) spec: ImportPayload,
+    pub(crate) bound_name: String,
+    pub(crate) chain: Vec<String>,
+}
+
+/// Unresolved descriptor for a dynamic import. Mirrors the
+/// `(target, fromlist)` arguments today's `emit_dynamic_edges` takes;
+/// the assembly pass resolves it via [`resolve_dynamic`].
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) struct DynamicRef {
+    pub(crate) target: String,
+    pub(crate) fromlist: Vec<String>,
+}
+
+/// Per-file reference-edge collection. Salsa-tracked so the AST walk
+/// parallelizes via salsa's worker coordination. **File-local**: it only
+/// reads *this* file's `file_to_nodes`, so editing another file never
+/// dirties this query and the parallel extract phase never pulls a peer's
+/// payload. Cross-file resolution of the emitted [`Target::Member`] /
+/// [`Target::Dynamic`] descriptors happens once, in the assembly pass.
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
-pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileRefEdges<'db> {
+pub(crate) fn file_to_ref_edges(db: &dyn ProjectDb, file: File) -> FileRefEdges {
     let self_nodes = file_to_nodes(db, file);
-    let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)> = FxHashSet::default();
+    let mut specs: Vec<RefSpec> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
     let parsed = parsed_module(db, file).load(db);
@@ -122,13 +183,13 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             continue;
         }
         let owner_ref = NodeRef::Def(def_key(db, def, &parsed));
-        if !self_nodes.ref_to_local.contains_key(&owner_ref) {
+        let Some(&owner_local) = self_nodes.ref_to_local.get(&owner_ref) else {
             continue;
-        }
+        };
 
         let kind = def.kind(db);
         let mut walker = RefWalker {
-            owner: owner_ref,
+            owner_local,
             file,
             db,
             parsed: &parsed,
@@ -137,7 +198,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             model: &model,
             dead_ranges: &dead_ranges,
             tc_ranges: &tc_ranges,
-            edges: &mut edges,
+            specs: &mut specs,
             warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
@@ -152,12 +213,15 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
     //     to the module node. The per-decl pass above intentionally
     //     skips these via `stmt_creates_top_level_definition`.
     let module_ref = NodeRef::Module(file);
+    // The module node is always local index 0, but resolve through
+    // `ref_to_local` so this stays correct if that convention changes.
+    let module_local = self_nodes.ref_to_local[&module_ref];
     for stmt in &parsed.syntax().body {
         if stmt_creates_top_level_definition(stmt) {
             continue;
         }
         let mut walker = RefWalker {
-            owner: module_ref,
+            owner_local: module_local,
             file,
             db,
             parsed: &parsed,
@@ -166,7 +230,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             model: &model,
             dead_ranges: &dead_ranges,
             tc_ranges: &tc_ranges,
-            edges: &mut edges,
+            specs: &mut specs,
             warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
@@ -191,20 +255,32 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             .as_ref()
             .is_some_and(|imp| imp.module == "__future__");
         if is_dunder_decl || is_future_import {
-            let dst = self_nodes.refs[local_idx];
-            if dst != module_ref {
-                edges.insert((module_ref, dst, 0));
+            let dst_local = local_idx as u32;
+            if dst_local != module_local {
+                specs.push(RefSpec {
+                    src: module_local,
+                    target: Target::Local(dst_local),
+                    flags: 0,
+                });
             }
         }
     }
 
-    FileRefEdges { edges, warnings }
+    // Sort + dedup so salsa's structural `Eq` on the returned `specs`
+    // is insensitive to visitation order (and duplicate emissions of
+    // the same edge collapse, as the old `FxHashSet` did).
+    specs.sort_unstable();
+    specs.dedup();
+    FileRefEdges { specs, warnings }
 }
 
 /// Per-owner walker. Mirrors today's `RefCollector` but with
 /// `NodeRef`-typed edges and a reduced feature set (see module docs).
 struct RefWalker<'a, 'db> {
-    owner: NodeRef<'db>,
+    /// Local index (into [`FileNodes::refs`]) of the node every edge
+    /// emitted by this walker originates from. Replaces the old
+    /// `owner: NodeRef` now that edges are file-local `RefSpec`s.
+    owner_local: u32,
     file: File,
     /// The project db. We can't go through `self.model.db()` for
     /// `file_to_nodes` calls because that returns `&dyn
@@ -226,7 +302,10 @@ struct RefWalker<'a, 'db> {
     /// `TYPE_CHECKING` as `True`); `find_local_bindings` recovers it
     /// from the scope-wide reachable bindings.
     tc_ranges: &'a [TextRange],
-    edges: &'a mut FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
+    /// File-local reference edges accumulated by this walk. Cross-file
+    /// targets are emitted as unresolved [`Target::Member`] /
+    /// [`Target::Dynamic`] descriptors; the assembly pass resolves them.
+    specs: &'a mut Vec<RefSpec>,
     /// Per-file warnings buffer. Workers push pure-rust strings; the
     /// driver flushes them to Python logging from the main thread.
     warnings: &'a mut Vec<String>,
@@ -251,10 +330,49 @@ struct RefWalker<'a, 'db> {
 }
 
 impl<'a, 'db> RefWalker<'a, 'db> {
-    fn emit_edge(&mut self, dst: NodeRef<'db>) {
-        if dst != self.owner {
-            self.edges.insert((self.owner, dst, self.current_flags));
+    /// Push a file-local edge `owner_local → dst` (a use→alias or
+    /// module→dunder reference). `dst` must be a node in *this* file;
+    /// self-edges are skipped.
+    fn push_local_edge(&mut self, dst: NodeRef<'db>) {
+        let Some(&dst_local) = self.self_nodes.ref_to_local.get(&dst) else {
+            return;
+        };
+        if dst_local != self.owner_local {
+            self.specs.push(RefSpec {
+                src: self.owner_local,
+                target: Target::Local(dst_local),
+                flags: self.current_flags,
+            });
         }
+    }
+
+    /// Push an unresolved cross-file member descriptor (a use flowing
+    /// through an import alias, or a nested-context import). The assembly
+    /// pass resolves it via [`resolve_member`].
+    fn push_member(&mut self, spec: ImportPayload, bound_name: &str, chain: &[&str]) {
+        self.specs.push(RefSpec {
+            src: self.owner_local,
+            target: Target::Member(MemberRef {
+                spec,
+                bound_name: bound_name.to_string(),
+                chain: chain.iter().map(|s| (*s).to_string()).collect(),
+            }),
+            flags: self.current_flags,
+        });
+    }
+
+    /// Push an unresolved dynamic-import descriptor. Always tagged
+    /// `EDGE_FLAG_DYNAMIC_IMPORT` (folded onto the current flags); the
+    /// assembly pass resolves it via [`resolve_dynamic`].
+    fn push_dynamic(&mut self, target: String, fromlist: &[&str]) {
+        self.specs.push(RefSpec {
+            src: self.owner_local,
+            target: Target::Dynamic(DynamicRef {
+                target,
+                fromlist: fromlist.iter().map(|s| (*s).to_string()).collect(),
+            }),
+            flags: self.current_flags | EDGE_FLAG_DYNAMIC_IMPORT,
+        });
     }
 
     /// Returns `EDGE_FLAG_DEAD_BRANCH` if `range` is contained in any
@@ -265,14 +383,6 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         } else {
             0
         }
-    }
-
-    /// Emit an edge from `self.owner` to a real External node carrying
-    /// the resolved upstream path: `[external dist] X` / `[external file] X`
-    /// for site-packages (via `external_fqname_for`'s PEP 503 lookup).
-    fn emit_external_node(&mut self, fqname: String, target_file: File) {
-        let key = ExternalKey::new(self.db, fqname, file_path_string(self.db, target_file));
-        self.emit_edge(NodeRef::External(key));
     }
 
     /// True when `range` falls inside a recorded type-checking block
@@ -461,10 +571,10 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         for resolution in self.find_local_bindings(name, extra_chain) {
             match resolution {
                 Resolution::Alias(dst) => {
-                    self.emit_edge(dst);
-                    // If the resolved alias is an import, emit
-                    // parallel reachability edges through it
-                    // (Principle 2).
+                    self.push_local_edge(dst);
+                    // If the resolved alias is an import, emit a parallel
+                    // member descriptor through it (Principle 2); the
+                    // assembly pass resolves the upstream edges.
                     let import_spec: Option<ImportPayload> = self
                         .self_nodes
                         .ref_to_local
@@ -479,11 +589,11 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                             }
                         });
                     if let Some(spec) = import_spec {
-                        self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+                        self.push_member(spec, name.id.as_str(), extra_chain);
                     }
                 }
                 Resolution::NestedImport { spec, bound_name } => {
-                    self.emit_upstream(&spec, &bound_name, extra_chain);
+                    self.push_member(spec, &bound_name, extra_chain);
                 }
             }
         }
@@ -508,7 +618,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 decl: None,
                 star: false,
             };
-            self.emit_upstream(&spec, bound_name, &synthetic_chain);
+            self.push_member(spec, bound_name, &synthetic_chain);
         }
         self.current_flags = 0;
     }
@@ -541,7 +651,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 decl: Some(name.to_string()),
                 star: false,
             };
-            self.emit_upstream(&spec, bound_name, &[]);
+            self.push_member(spec, bound_name, &[]);
         }
         self.current_flags = 0;
     }
@@ -607,7 +717,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 let file_pkg = file_package_name(self.model.db(), self.file);
                 let pkg = explicit_package.or(file_pkg.as_deref());
                 match resolve_dynamic_target(kind, &name, explicit_level, pkg) {
-                    Ok(target) => self.emit_dynamic_edges(&target, &fromlist),
+                    Ok(target) => self.push_dynamic(target, &fromlist),
                     Err(message) => self.warnings.push(message),
                 }
                 true
@@ -618,74 +728,6 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             }
             DynamicParseResult::NotApplicable => false,
         }
-    }
-
-    /// Emit `owner → target` plus per-fromlist-entry edges for a
-    /// dynamic import, each tagged with `EDGE_FLAG_DYNAMIC_IMPORT`.
-    fn emit_dynamic_edges(&mut self, target: &str, fromlist: &[&str]) {
-        let saved = self.current_flags;
-        self.current_flags |= EDGE_FLAG_DYNAMIC_IMPORT;
-        if fromlist.is_empty() {
-            self.emit_resolved_module(target);
-        } else {
-            self.emit_resolved_module(target);
-            for entry in fromlist {
-                if entry.is_empty() {
-                    continue;
-                }
-                let candidate = format!("{target}.{entry}");
-                if module_name_resolves(&candidate, self.file, self.model.db()) {
-                    self.emit_resolved_module(&candidate);
-                    continue;
-                }
-                // Treat as decl-style: resolve target to file, look up
-                // entry in its exports_by_name.
-                let target_file = ModuleName::new(target)
-                    .and_then(|n| resolve_module(self.db, self.file, &n))
-                    .and_then(|m| m.file(self.db));
-                if let Some(target_file) = target_file {
-                    let target_nodes = file_to_nodes(self.db, target_file);
-                    if let Some(locals) = target_nodes.exports_by_name.get(*entry) {
-                        for &local_idx in locals {
-                            self.emit_edge(target_nodes.refs[local_idx as usize]);
-                        }
-                    }
-                }
-            }
-        }
-        self.current_flags = saved;
-    }
-
-    /// Emit a single edge to the resolved module's NodeRef. First-party
-    /// modules route to a `Module` ref; site-packages modules become real
-    /// `External` nodes carrying the upstream path; stdlib and
-    /// genuinely-unresolved targets emit nothing.
-    fn emit_resolved_module(&mut self, dotted: &str) {
-        let top_level = dotted.split('.').next().unwrap_or(dotted);
-        let Some(mn) = ModuleName::new(dotted) else {
-            return;
-        };
-        let Some(module) = resolve_module(self.db, self.file, &mn) else {
-            return;
-        };
-        let Some(target_file) = module.file(self.db) else {
-            return;
-        };
-        if module
-            .search_path(self.db)
-            .is_some_and(|sp| sp.is_standard_library())
-        {
-            return;
-        }
-        if module
-            .search_path(self.db)
-            .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
-        {
-            let fqname = crate::file_payload::external_fqname_for(self.db, target_file, top_level);
-            self.emit_external_node(fqname, target_file);
-            return;
-        }
-        self.emit_edge(NodeRef::Module(target_file));
     }
 
     /// `__all__ = ["foo", "bar"]`: each string literal resolves to a
@@ -701,7 +743,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         for elem in elements {
             if let Expr::StringLiteral(s) = elem {
                 if let Some(dst) = self.lookup_module_scope_name(s.value.to_str()) {
-                    self.emit_edge(dst);
+                    self.push_local_edge(dst);
                 }
             }
         }
@@ -736,153 +778,242 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         }
         None
     }
+}
 
-    /// Emit parallel reachability edges past a local import alias.
-    /// First-party targets walk the submodule chain; site-packages
-    /// targets emit a single `NodeRef::External` edge and stop; stdlib
-    /// and genuinely-unresolved targets silently drop.
-    ///
-    /// Mirrors today's `ingest::RefCollector::emit_upstream` (lines
-    /// 1880–2032): classify the loading target, walk the submodule
-    /// chain, emit edges to the deepest module reached plus any
-    /// terminal decl.
-    fn emit_upstream(&mut self, spec: &ImportPayload, bound_name: &str, extra_chain: &[&str]) {
-        if spec.module.is_empty() {
-            return;
-        }
-        let db = self.model.db();
-        let module_first_seg = spec.module.split('.').next().unwrap_or("").to_string();
+/// Resolve a [`MemberRef`] descriptor to its upstream `NodeRef`s — the
+/// parallel reachability edges past a local import alias. First-party
+/// targets walk the submodule chain; site-packages targets yield a single
+/// interned `External`; stdlib and genuinely-unresolved targets yield
+/// nothing. Free function (was `RefWalker::emit_upstream`) so the assembly
+/// pass can run it once per distinct descriptor, memoized.
+pub(crate) fn resolve_member<'db>(
+    db: &'db dyn ProjectDb,
+    anchor: File,
+    member: &MemberRef,
+) -> Vec<NodeRef<'db>> {
+    let spec = &member.spec;
+    let bound_name = member.bound_name.as_str();
+    if spec.module.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<NodeRef<'db>> = Vec::new();
+    // `module_name_resolves` wants a `ty_python_semantic::Db`; everything
+    // else (resolve_module / module.* / file_to_nodes) takes the broader
+    // `ProjectDb` directly.
+    let model = SemanticModel::new(db, anchor);
+    let sdb = model.db();
+    let module_first_seg = spec.module.split('.').next().unwrap_or("").to_string();
 
-        let mut adjusted_chain: Vec<&str> = extra_chain.to_vec();
-        let loading_target: String;
-        let mut decl_tail: Option<String> = None;
+    let mut adjusted_chain: Vec<&str> = member.chain.iter().map(|s| s.as_str()).collect();
+    let loading_target: String;
+    let mut decl_tail: Option<String> = None;
 
-        if spec.star {
-            let candidate = format!("{}.{}", spec.module, bound_name);
-            if module_name_resolves(&candidate, self.file, db) {
-                loading_target = candidate;
-            } else {
-                loading_target = spec.module.clone();
-                decl_tail = Some(bound_name.to_string());
-            }
+    if spec.star {
+        let candidate = format!("{}.{}", spec.module, bound_name);
+        if module_name_resolves(&candidate, anchor, sdb) {
+            loading_target = candidate;
         } else {
-            match &spec.decl {
-                Some(decl) => {
-                    let candidate = format!("{}.{}", spec.module, decl);
-                    if module_name_resolves(&candidate, self.file, db) {
-                        loading_target = candidate;
-                    } else {
+            loading_target = spec.module.clone();
+            decl_tail = Some(bound_name.to_string());
+        }
+    } else {
+        match &spec.decl {
+            Some(decl) => {
+                let candidate = format!("{}.{}", spec.module, decl);
+                if module_name_resolves(&candidate, anchor, sdb) {
+                    loading_target = candidate;
+                } else {
+                    loading_target = spec.module.clone();
+                    decl_tail = Some(decl.clone());
+                }
+            }
+            None => {
+                let no_asname = bound_name == module_first_seg;
+                if no_asname && spec.module != module_first_seg {
+                    let loading_extras: Vec<&str> = spec.module.split('.').skip(1).collect();
+                    let n = loading_extras.len();
+                    let prefix_matches = adjusted_chain.len() >= n
+                        && adjusted_chain
+                            .iter()
+                            .take(n)
+                            .zip(&loading_extras)
+                            .all(|(a, b)| *a == *b);
+                    if prefix_matches {
+                        adjusted_chain.drain(..n);
                         loading_target = spec.module.clone();
-                        decl_tail = Some(decl.clone());
-                    }
-                }
-                None => {
-                    let no_asname = bound_name == module_first_seg;
-                    if no_asname && spec.module != module_first_seg {
-                        let loading_extras: Vec<&str> = spec.module.split('.').skip(1).collect();
-                        let n = loading_extras.len();
-                        let prefix_matches = adjusted_chain.len() >= n
-                            && adjusted_chain
-                                .iter()
-                                .take(n)
-                                .zip(&loading_extras)
-                                .all(|(a, b)| *a == *b);
-                        if prefix_matches {
-                            adjusted_chain.drain(..n);
-                            loading_target = spec.module.clone();
-                        } else {
-                            loading_target = module_first_seg;
-                        }
                     } else {
-                        loading_target = spec.module.clone();
+                        loading_target = module_first_seg;
                     }
+                } else {
+                    loading_target = spec.module.clone();
                 }
             }
-        }
-
-        // Classify the loading target. Site-packages targets emit a
-        // single edge to a globally-interned External node carrying the
-        // upstream path and stop (no submodule chain walk through them,
-        // since they don't have file_to_nodes payloads to look up
-        // against). Stdlib and genuinely-unresolved targets emit nothing.
-        let top_level = loading_target.split('.').next().unwrap_or(&loading_target);
-        let Some(start_mn) = ModuleName::new(&loading_target) else {
-            return;
-        };
-        let Some(start_module) = resolve_module(db, self.file, &start_mn) else {
-            return;
-        };
-        let Some(start_file) = start_module.file(db) else {
-            return;
-        };
-        if start_module
-            .search_path(db)
-            .is_some_and(|sp| sp.is_standard_library())
-        {
-            return;
-        }
-        // Non-first-party (site-packages / external paths). Mint an
-        // External node keyed by PEP 503 canonical dist name via
-        // project_dist_lookup; falls back to `[external file] X` for
-        // orphan site-packages files.
-        if start_module
-            .search_path(db)
-            .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
-        {
-            let fqname = crate::file_payload::external_fqname_for(self.db, start_file, top_level);
-            self.emit_external_node(fqname, start_file);
-            return;
-        }
-
-        // Decl-style alias: emit edge to the upstream module and the
-        // decl inside it. Attribute access past a decl is field access
-        // on the decl's value, which we don't model.
-        if let Some(decl_name) = decl_tail {
-            // Use sites land on whatever's in exports_by_name
-            // (including star-reexport aliases). Don't walk through
-            // star aliases here — the from-import binding side uses
-            // walk_exports_chain to skip past stars; this is the
-            // *use* side, which should reach the star alias itself.
-            self.emit_edge(NodeRef::Module(start_file));
-            let target_nodes = file_to_nodes(self.db, start_file);
-            if let Some(locals) = target_nodes.exports_by_name.get(&decl_name) {
-                for &local_idx in locals {
-                    self.emit_edge(target_nodes.refs[local_idx as usize]);
-                }
-            }
-            return;
-        }
-
-        // Module-style alias: walk the chain submodule-by-submodule,
-        // emit one module edge (deepest reached) plus at most one
-        // terminal decl edge.
-        let mut current_file = start_file;
-        let mut current_path = loading_target.clone();
-        let mut terminal_decl_refs: Vec<NodeRef<'db>> = Vec::new();
-        for seg in &adjusted_chain {
-            let candidate = format!("{current_path}.{seg}");
-            let submodule_file = ModuleName::new(&candidate)
-                .and_then(|mn| resolve_module(db, self.file, &mn))
-                .and_then(|m| m.file(db));
-            if let Some(sub_file) = submodule_file {
-                current_file = sub_file;
-                current_path = candidate;
-                continue;
-            }
-            // Not a submodule — check for decl in current_file's exports.
-            let target_nodes = file_to_nodes(self.db, current_file);
-            if let Some(locals) = target_nodes.exports_by_name.get(*seg) {
-                for &local_idx in locals {
-                    terminal_decl_refs.push(target_nodes.refs[local_idx as usize]);
-                }
-            }
-            break;
-        }
-        self.emit_edge(NodeRef::Module(current_file));
-        for r in terminal_decl_refs {
-            self.emit_edge(r);
         }
     }
+
+    // Classify the loading target. Site-packages targets yield a single
+    // edge to a globally-interned External node carrying the upstream path
+    // and stop (no submodule chain walk through them, since they don't have
+    // file_to_nodes payloads to look up against). Stdlib and
+    // genuinely-unresolved targets yield nothing.
+    let top_level = loading_target.split('.').next().unwrap_or(&loading_target);
+    let Some(start_mn) = ModuleName::new(&loading_target) else {
+        return out;
+    };
+    let Some(start_module) = resolve_module(db, anchor, &start_mn) else {
+        return out;
+    };
+    let Some(start_file) = start_module.file(db) else {
+        return out;
+    };
+    if start_module
+        .search_path(db)
+        .is_some_and(|sp| sp.is_standard_library())
+    {
+        return out;
+    }
+    // Non-first-party (site-packages / external paths). Mint an External
+    // node keyed by PEP 503 canonical dist name via project_dist_lookup;
+    // falls back to `[external file] X` for orphan site-packages files.
+    if start_module
+        .search_path(db)
+        .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
+    {
+        let fqname = crate::file_payload::external_fqname_for(db, start_file, top_level);
+        out.push(external_ref(db, fqname, start_file));
+        return out;
+    }
+
+    // Decl-style alias: edge to the upstream module and the decl inside it.
+    // Attribute access past a decl is field access on the decl's value,
+    // which we don't model.
+    if let Some(decl_name) = decl_tail {
+        // Use sites land on whatever's in exports_by_name (including
+        // star-reexport aliases). Don't walk through star aliases here —
+        // the from-import binding side uses walk_exports_chain to skip past
+        // stars; this is the *use* side, which should reach the star alias
+        // itself.
+        out.push(NodeRef::Module(start_file));
+        let target_nodes = file_to_nodes(db, start_file);
+        if let Some(locals) = target_nodes.exports_by_name.get(&decl_name) {
+            for &local_idx in locals {
+                out.push(target_nodes.refs[local_idx as usize]);
+            }
+        }
+        return out;
+    }
+
+    // Module-style alias: walk the chain submodule-by-submodule, yield one
+    // module edge (deepest reached) plus at most one terminal decl edge.
+    let mut current_file = start_file;
+    let mut current_path = loading_target.clone();
+    let mut terminal_decl_refs: Vec<NodeRef<'db>> = Vec::new();
+    for seg in &adjusted_chain {
+        let candidate = format!("{current_path}.{seg}");
+        let submodule_file = ModuleName::new(&candidate)
+            .and_then(|mn| resolve_module(db, anchor, &mn))
+            .and_then(|m| m.file(db));
+        if let Some(sub_file) = submodule_file {
+            current_file = sub_file;
+            current_path = candidate;
+            continue;
+        }
+        // Not a submodule — check for decl in current_file's exports.
+        let target_nodes = file_to_nodes(db, current_file);
+        if let Some(locals) = target_nodes.exports_by_name.get(*seg) {
+            for &local_idx in locals {
+                terminal_decl_refs.push(target_nodes.refs[local_idx as usize]);
+            }
+        }
+        break;
+    }
+    out.push(NodeRef::Module(current_file));
+    out.extend(terminal_decl_refs);
+    out
+}
+
+/// Resolve a dotted module path to a single destination `NodeRef`,
+/// mirroring the old `RefWalker::emit_resolved_module`: first-party →
+/// `Module`; site-packages → interned `External`; stdlib / unresolved →
+/// `None`.
+fn resolve_module_target<'db>(
+    db: &'db dyn ProjectDb,
+    anchor: File,
+    dotted: &str,
+) -> Option<NodeRef<'db>> {
+    let top_level = dotted.split('.').next().unwrap_or(dotted);
+    let mn = ModuleName::new(dotted)?;
+    let module = resolve_module(db, anchor, &mn)?;
+    let target_file = module.file(db)?;
+    if module
+        .search_path(db)
+        .is_some_and(|sp| sp.is_standard_library())
+    {
+        return None;
+    }
+    if module
+        .search_path(db)
+        .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
+    {
+        let fqname = crate::file_payload::external_fqname_for(db, target_file, top_level);
+        return Some(external_ref(db, fqname, target_file));
+    }
+    Some(NodeRef::Module(target_file))
+}
+
+/// Resolve a [`DynamicRef`] descriptor to its destination `NodeRef`s,
+/// mirroring the old `RefWalker::emit_dynamic_edges`. The
+/// `EDGE_FLAG_DYNAMIC_IMPORT` flag lives on the [`RefSpec`], not here.
+pub(crate) fn resolve_dynamic<'db>(
+    db: &'db dyn ProjectDb,
+    anchor: File,
+    dynamic: &DynamicRef,
+) -> Vec<NodeRef<'db>> {
+    let model = SemanticModel::new(db, anchor);
+    let sdb = model.db();
+    let target = dynamic.target.as_str();
+    let mut out: Vec<NodeRef<'db>> = Vec::new();
+    // The target module itself is always an edge (the old code emitted
+    // `emit_resolved_module(target)` in both fromlist branches).
+    if let Some(r) = resolve_module_target(db, anchor, target) {
+        out.push(r);
+    }
+    for entry in &dynamic.fromlist {
+        if entry.is_empty() {
+            continue;
+        }
+        let candidate = format!("{target}.{entry}");
+        if module_name_resolves(&candidate, anchor, sdb) {
+            if let Some(r) = resolve_module_target(db, anchor, &candidate) {
+                out.push(r);
+            }
+            continue;
+        }
+        // Treat as decl-style: resolve target to file, look up entry in its
+        // exports_by_name.
+        let target_file = ModuleName::new(target)
+            .and_then(|n| resolve_module(db, anchor, &n))
+            .and_then(|m| m.file(db));
+        if let Some(target_file) = target_file {
+            let target_nodes = file_to_nodes(db, target_file);
+            if let Some(locals) = target_nodes.exports_by_name.get(entry.as_str()) {
+                for &local_idx in locals {
+                    out.push(target_nodes.refs[local_idx as usize]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Mint the interned `External` `NodeRef` for a resolved site-packages
+/// target (was `RefWalker::emit_external_node`).
+fn external_ref<'db>(db: &'db dyn ProjectDb, fqname: String, target_file: File) -> NodeRef<'db> {
+    NodeRef::External(ExternalKey::new(
+        db,
+        fqname,
+        file_path_string(db, target_file),
+    ))
 }
 
 impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {

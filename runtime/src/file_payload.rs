@@ -240,7 +240,12 @@ impl NodeKind {
 /// Per-alias import metadata. Same fields as the python-facing
 /// `Import` pyclass, but without the `Py` envelope so it can live
 /// inside `NodeData`.
-#[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+///
+/// `Hash`/`Ord` are derived so it can ride inside a [`crate::file_ref_edges::MemberRef`]
+/// descriptor — those need to be sortable (deterministic salsa `Eq` on
+/// the `Vec<RefSpec>` payload) and hashable (the assemble-pass resolution
+/// memo keys on the descriptor).
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord, salsa::Update, get_size2::GetSize)]
 pub(crate) struct ImportPayload {
     pub(crate) module: String,
     pub(crate) decl: Option<String>,

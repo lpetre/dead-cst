@@ -33,7 +33,9 @@ use crate::file_extraction::{
     CallSiteFact, FileExtraction,
 };
 use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, NodeKind, NodeRef};
-use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
+use crate::file_ref_edges::{
+    file_to_ref_edges, resolve_dynamic, resolve_member, FileRefEdges, Target,
+};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
@@ -790,7 +792,7 @@ fn assemble_graph<'db>(
 
     // 2a: serial fetch. Hold borrows for the whole pass.
     let mut edge_payloads: Vec<&FileEdges<'db>> = Vec::with_capacity(project_files.len());
-    let mut ref_edge_payloads: Vec<&FileRefEdges<'db>> = Vec::with_capacity(project_files.len());
+    let mut ref_edge_payloads: Vec<&FileRefEdges> = Vec::with_capacity(project_files.len());
     for &file in project_files {
         edge_payloads.push(file_to_edges(db, file));
         ref_edge_payloads.push(file_to_ref_edges(db, file));
@@ -809,10 +811,42 @@ fn assemble_graph<'db>(
         }
     }
 
-    // 2b: pre-mint External nodes. Walk both payload streams once and
-    // intern every `External` endpoint we haven't seen. Externals dedup
-    // by fqname project-wide, so this is at most `O(distinct externals)`
-    // GIL-bound interns.
+    // 2b-resolve: turn every cross-file `RefSpec` (`Target::Member` /
+    // `Target::Dynamic`) into resolved `(src_local, dst NodeRef, flags)`
+    // rows. This is the single site of cross-file resolution, and it runs
+    // serially: `resolve_member` / `resolve_dynamic` read salsa (the
+    // module resolver, peer `file_to_nodes`) through the `!Sync` db, so
+    // they can't ride a rayon worker. A per-file `Target -> Vec<NodeRef>`
+    // memo collapses a descriptor used N times (e.g. `os.path` across a
+    // file) to one resolution. `Target::Local` specs need no cross-file
+    // work — they're translated directly in 2c.
+    let mut crossfile_resolved: Vec<Vec<(u32, NodeRef<'db>, u8)>> =
+        Vec::with_capacity(project_files.len());
+    for (&file, payload) in project_files.iter().zip(&ref_edge_payloads) {
+        let mut memo: FxHashMap<&Target, Vec<NodeRef<'db>>> = FxHashMap::default();
+        let mut resolved: Vec<(u32, NodeRef<'db>, u8)> = Vec::new();
+        for spec in &payload.specs {
+            let dsts = match &spec.target {
+                Target::Local(_) => continue,
+                target => memo.entry(target).or_insert_with(|| match target {
+                    Target::Member(m) => resolve_member(db, file, m),
+                    Target::Dynamic(d) => resolve_dynamic(db, file, d),
+                    Target::Local(_) => unreachable!("Local skipped above"),
+                }),
+            };
+            for &dst in dsts.iter() {
+                resolved.push((spec.src, dst, spec.flags));
+            }
+        }
+        crossfile_resolved.push(resolved);
+    }
+
+    // 2b-premint: intern every `External` endpoint not already minted.
+    // Externals dedup by fqname project-wide, so this is at most
+    // `O(distinct externals)` GIL-bound interns. `FileEdges` can carry an
+    // External on either endpoint; a resolved cross-file row only ever
+    // puts one in the `dst` slot (the `src` is always a local owner node,
+    // and `Target::Local` dsts are real in-file nodes — never External).
     let mut external_keys: FxHashSet<NodeRef<'db>> = FxHashSet::default();
     for payload in &edge_payloads {
         for &(src, dst, _) in &payload.edges {
@@ -824,11 +858,8 @@ fn assemble_graph<'db>(
             }
         }
     }
-    for payload in &ref_edge_payloads {
-        for &(src, dst, _) in &payload.edges {
-            if matches!(src, NodeRef::External(_)) && !ref_to_global.contains_key(&src) {
-                external_keys.insert(src);
-            }
+    for resolved in &crossfile_resolved {
+        for &(_, dst, _) in resolved {
             if matches!(dst, NodeRef::External(_)) && !ref_to_global.contains_key(&dst) {
                 external_keys.insert(dst);
             }
@@ -854,14 +885,29 @@ fn assemble_graph<'db>(
         ref_to_global.insert(r, idx);
     }
 
-    // 2c: parallel translation. `ref_to_global` is owned + read-
-    // only from here; no GIL needed. We release the GIL with
-    // `Python::allow_threads` so rayon workers don't contend with
-    // anyone else holding it. The closure is pure-Rust HashMap
-    // probes, no salsa DB access, no Py allocations.
+    // 2c: parallel translation. `ref_to_global` / `local_to_global` are
+    // owned + read-only from here; no GIL needed. We release the GIL with
+    // `Python::allow_threads` so rayon workers don't contend with anyone
+    // else holding it. Three pure-Rust streams (no salsa, no Py allocs)
+    // feed one triple list:
+    //
+    //   * `from_edges` — `FileEdges` `(NodeRef, NodeRef, flags)` triples;
+    //     both endpoints map through `ref_to_global`.
+    //   * `from_local` — `Target::Local` specs; both endpoints map through
+    //     `local_to_global[(file, idx)]`.
+    //   * `from_cross` — resolved cross-file rows; `src` maps through
+    //     `local_to_global`, `dst` through `ref_to_global`.
+    //
+    // Endpoints whose owning file wasn't enumerated drop. The
+    // `src_idx != dst_idx` guard on the two ref-edge streams reproduces
+    // the old producer's `emit_edge` self-edge skip (`dst != owner`),
+    // which can no longer run at emit time for cross-file edges (the `dst`
+    // is only known here, after resolution).
     let ref_to_global_ref = &ref_to_global;
+    let local_to_global_ref = &local_to_global;
     let edge_payloads_ref = &edge_payloads;
     let ref_edge_payloads_ref = &ref_edge_payloads;
+    let crossfile_resolved_ref = &crossfile_resolved;
     let mut triples: Vec<(usize, usize, u8)> = py.allow_threads(|| {
         use rayon::prelude::*;
         let from_edges = edge_payloads_ref.par_iter().flat_map_iter(|payload| {
@@ -871,14 +917,31 @@ fn assemble_graph<'db>(
                 Some((src_idx, dst_idx, flags))
             })
         });
-        let from_refs = ref_edge_payloads_ref.par_iter().flat_map_iter(|payload| {
-            payload.edges.iter().filter_map(|&(src, dst, flags)| {
-                let src_idx = *ref_to_global_ref.get(&src)?;
-                let dst_idx = *ref_to_global_ref.get(&dst)?;
-                Some((src_idx, dst_idx, flags))
-            })
-        });
-        let mut t: Vec<(usize, usize, u8)> = from_edges.chain(from_refs).collect();
+        let from_local = project_files
+            .par_iter()
+            .zip(ref_edge_payloads_ref)
+            .flat_map_iter(|(&file, &payload)| {
+                payload.specs.iter().filter_map(move |spec| {
+                    let Target::Local(dst_local) = &spec.target else {
+                        return None;
+                    };
+                    let src_idx = *local_to_global_ref.get(&(file, spec.src))?;
+                    let dst_idx = *local_to_global_ref.get(&(file, *dst_local))?;
+                    (src_idx != dst_idx).then_some((src_idx, dst_idx, spec.flags))
+                })
+            });
+        let from_cross = project_files
+            .par_iter()
+            .zip(crossfile_resolved_ref)
+            .flat_map_iter(|(&file, resolved)| {
+                resolved.iter().filter_map(move |&(src_local, dst, flags)| {
+                    let src_idx = *local_to_global_ref.get(&(file, src_local))?;
+                    let dst_idx = *ref_to_global_ref.get(&dst)?;
+                    (src_idx != dst_idx).then_some((src_idx, dst_idx, flags))
+                })
+            });
+        let mut t: Vec<(usize, usize, u8)> =
+            from_edges.chain(from_local).chain(from_cross).collect();
         t.par_sort_unstable();
         t.dedup();
         t
