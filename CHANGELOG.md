@@ -311,6 +311,16 @@ two versions.
   `dispatch_app()` factory dropped its now-purposeless `marker_prefix` parameter
   (it only named the removed synthetic nodes). No `plugin_api` epoch or
   `FORMAT_VERSION` bump — `keep_alive` already exists.
+- **`main_block`, `server_config`, and `project_scripts` no longer mint
+  `<__main__>:` / `<server-config>:` / `<project.scripts>:` synthetic seeds.**
+  `main_block()` stamped a `<__main__>:<module>` node pointing at the module and
+  every decl inside the `if __name__ == "__main__":` guard; `server_config()`
+  stamped a `<server-config>:<module>` node over a config file's whole top-level
+  surface; `project_scripts()` stamped one `<project.scripts>:<name>` node per
+  `[project.scripts]` entry. Each target is now kept alive by setting
+  `NodeFlags.ENTRYPOINT` directly on the decl via `keep_alive` — same
+  reachability, no orphan seed node. No `plugin_api` epoch or `FORMAT_VERSION`
+  bump — `keep_alive` already exists.
 - **Graph node indices are now deterministic across runs.** ty's `files()`
   set has no stable iteration order, so the global index assigned to each node
   (and therefore the order of `Analysis.dead()` / `reachable()` results and the

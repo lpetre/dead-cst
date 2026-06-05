@@ -5,8 +5,8 @@ directory whenever both shapes coexist, so the analyzer mirrors that
 precedence: the trie holds the ``__init__.py`` and any cross-module
 import of ``pkg.foo`` (or of a name re-exported from it) routes to the
 package alone. The eclipsed file is still parsed -- its nodes appear in
-the graph and observe-time entrypoints (``__main__``, plugin
-synthetics) keep working -- but consumer imports never see its decls.
+the graph and observe-time entrypoints (``__main__`` and other plugin
+keep-alives) keep working -- but consumer imports never see its decls.
 """
 
 from __future__ import annotations
@@ -63,13 +63,14 @@ def test_eclipsed_file_keeps_main_block_entrypoint(tmp_path, write_files, make_a
     package_module = next(
         n for n in graph.nodes() if n.fqname == "pkg.foo" and n.path.endswith("/__init__.py")
     )
-    main_synth = next(
-        n for n in graph.nodes() if n.kind == "synthetic" and n.fqname.endswith(":pkg.foo")
-    )
-
-    assert main_synth in reachable, "MainBlockPlugin synthetic must seed reachability"
-    assert helper in reachable, "decls in the eclipsed file are alive when the synth reaches them"
-    assert eclipsed_module in reachable, "eclipsed module node stays alive via the synth"
+    # The per-file main_block plugin stamps ENTRYPOINT on the eclipsed
+    # ``.py`` module node — not the eclipsing package ``__init__.py`` (both
+    # share the ``pkg.foo`` fqname) — so the eclipsed file's main block keeps
+    # its own decls alive.
+    assert eclipsed_module.flags & native.NodeFlags.ENTRYPOINT
+    assert not (package_module.flags & native.NodeFlags.ENTRYPOINT)
+    assert eclipsed_module in reachable, "eclipsed module node stays alive via keep_alive"
+    assert helper in reachable, "decls in the eclipsed file are alive when the module reaches them"
     # The package itself is unreached: nothing imports pkg.foo from outside.
     assert package_module not in reachable
 

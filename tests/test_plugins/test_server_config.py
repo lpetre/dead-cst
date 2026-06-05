@@ -185,7 +185,7 @@ def test_seeds_are_not_tagged_testcase(build_plugin_graph):
     testcase = graph.node_flag("test/testcase")
     assert testcase is not None, "pytest plugin should register the test/testcase flag"
     seeds = [n for n in graph.nodes() if n.flags & NodeFlags.ENTRYPOINT]
-    server_seeds = [s for s in seeds if s.fqname.startswith("<server-config>:")]
+    server_seeds = [s for s in seeds if s.fqname.startswith("gunicorn.conf")]
     assert server_seeds
     for seed in server_seeds:
         assert not (seed.flags & testcase), seed.fqname
@@ -235,7 +235,8 @@ def test_per_file_server_config_cache_invalidates_on_edit(tmp_path):
 
     analysis = Analysis(tmp_path, plugins=[native.NativePlugin.server_config()])
     ctx = analysis.materialize_all()
-    assert any(n.fqname == "<server-config>:gunicorn.conf" for n in ctx.nodes())
+    mod = next(n for n in ctx.nodes() if n.fqname == "gunicorn.conf")
+    assert mod.flags & NodeFlags.ENTRYPOINT
 
     native._reset_server_config_run_count()
     _write(tmp_path / "gunicorn.conf.py", "workers = 4\nbind = '0.0.0.0:8000'\n")

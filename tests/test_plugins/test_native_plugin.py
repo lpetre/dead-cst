@@ -18,9 +18,10 @@ import pytest
 from dead_cst import _native as native
 
 
-def test_native_main_block_emits_entrypoint_marker(build_plugin_graph):
-    """The synthetic ``<__main__>:<module>`` marker still lands in the
-    graph — verify the node is interned and carries ``ENTRYPOINT``."""
+def test_native_main_block_marks_module_entrypoint(build_plugin_graph):
+    """The per-file main_block plugin stamps ``ENTRYPOINT`` directly on
+    the module node of a file with a top-level ``if __name__`` block (via
+    ``keep_alive``) — no separate synthetic marker node."""
     ctx = build_plugin_graph(
         {
             "pkg/__init__.py": "",
@@ -32,9 +33,9 @@ def test_native_main_block_emits_entrypoint_marker(build_plugin_graph):
         },
         [native.NativePlugin.main_block()],
     )
-    markers = [n for n in ctx.nodes() if n.fqname == "<__main__>:pkg.script"]
-    assert len(markers) == 1
-    assert markers[0].flags & native.NodeFlags.ENTRYPOINT
+    mods = [n for n in ctx.nodes() if n.fqname == "pkg.script"]
+    assert len(mods) == 1
+    assert mods[0].flags & native.NodeFlags.ENTRYPOINT
 
 
 def test_native_plugin_name_attribute():
@@ -74,15 +75,14 @@ def test_multiple_native_plugins_in_one_list(build_plugin_graph, reachable_fqnam
 
 
 def test_native_plugin_no_main_block_no_ops(build_plugin_graph):
-    """A project without any ``if __name__ == "__main__":`` block
-    produces no synthetic markers — same shape as the Python
-    equivalent's empty path."""
+    """A project without any ``if __name__ == "__main__":`` block leaves
+    every module un-entrypointed — the plugin emits no ``keep_alive``."""
     ctx = build_plugin_graph(
         {"pkg/__init__.py": "", "pkg/m.py": "def f(): pass\n"},
         [native.NativePlugin.main_block()],
     )
-    main_markers = [n for n in ctx.nodes() if n.fqname.startswith("<__main__>:")]
-    assert main_markers == []
+    entrypoints = [n for n in ctx.nodes() if n.flags & native.NodeFlags.ENTRYPOINT]
+    assert entrypoints == []
 
 
 def test_native_plugin_cannot_be_directly_instantiated():
@@ -112,7 +112,7 @@ def _write(path, src: str) -> None:
 
 def test_per_file_main_block_caches_unchanged_files(tmp_path):
     """Editing one file should re-run the per-file MainBlock plugin for
-    *only* that file on ``re_materialize`` — every other file's marker is
+    *only* that file on ``re_materialize`` — every other file's ops are
     served from the salsa cache."""
     from dead_cst import Analysis
 
@@ -172,15 +172,17 @@ def test_per_file_main_block_cache_invalidates_on_edit(tmp_path):
 
     analysis = Analysis(tmp_path, plugins=[native.NativePlugin.main_block()])
     ctx = analysis.materialize_all()
-    assert any(n.fqname == "<__main__>:pkg.a" for n in ctx.nodes())
+    mod = next(n for n in ctx.nodes() if n.fqname == "pkg.a")
+    assert mod.flags & native.NodeFlags.ENTRYPOINT
 
-    # Remove the main block entirely; the marker should disappear after
-    # re_materialize (cache miss on the edited file).
+    # Remove the main block entirely; the module should lose ENTRYPOINT
+    # after re_materialize (cache miss on the edited file).
     native._reset_main_block_run_count()
     _write(tmp_path / "pkg/a.py", "def main(): pass\n")
     ctx2 = analysis.re_materialize(analysis.materialize_all().detect_changes())
     assert native._main_block_run_count() >= 1  # a.py re-ran
-    assert not any(n.fqname == "<__main__>:pkg.a" for n in ctx2.nodes())
+    mod2 = next(n for n in ctx2.nodes() if n.fqname == "pkg.a")
+    assert not (mod2.flags & native.NodeFlags.ENTRYPOINT)
 
 
 # ---------------------------------------------------------------------------

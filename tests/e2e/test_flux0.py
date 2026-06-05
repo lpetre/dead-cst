@@ -94,17 +94,18 @@ def _ancestor_fqnames(base: Path, target_fqname: str) -> list[str]:
 def test_why_alive_flux0_server_main(flux0_server_src):
     """Level 1: ``main`` is reached via the module's ``if __name__ ...`` block.
 
-    The native ``main_block`` plugin attaches a synthetic
-    ``<__main__>:<module>`` node as a predecessor of every top-level
-    call inside the guard.
+    The native ``main_block`` plugin stamps ``ENTRYPOINT`` on the module
+    node (and any decls inside the guard); ``main`` is then reached from
+    its module via the call inside the guard, so the module node is a
+    predecessor.
     """
     ancestors = _ancestor_fqnames(Path(flux0_server_src), "flux0_server.main.main")
-    assert any(a.startswith("<__main__>:flux0_server.main") for a in ancestors)
+    assert "flux0_server.main" in ancestors
 
 
 def test_why_alive_flux0_cli_main(flux0_cli_src):
     ancestors = _ancestor_fqnames(Path(flux0_cli_src), "flux0_cli.main.main")
-    assert any(a.startswith("<__main__>:flux0_cli.main") for a in ancestors)
+    assert "flux0_cli.main" in ancestors
 
 
 # ---------------------------------------------------------------------------
