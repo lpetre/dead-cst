@@ -56,7 +56,7 @@ use ty_project::Db as ProjectDb;
 use crate::builder::PreparedOp;
 use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
 use crate::flag_registry::FlagRegistry;
-use crate::graph::{EdgeFlags, NodeFlags};
+use crate::graph::EdgeFlags;
 use crate::helpers::{
     collect_modules_imports_local, decorators_match_imports, matched_call_target_any,
     top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
@@ -3276,8 +3276,6 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
 // string targets into reachability. Cross-file by nature, hence project-wide.
 // ---------------------------------------------------------------------------
 
-const DISCORDPY_COG_PREFIX: &str = "<discordpy-cog>:";
-const DISCORDPY_EXTENSION_PREFIX: &str = "<discordpy-extension>:";
 const DISCORD_PROBE_MODULES: [&str; 3] = ["discord", "discord.ext", "discord.ext.commands"];
 const DISCORD_COMMANDS_BOT_KINDS: [&str; 2] = ["Bot", "AutoShardedBot"];
 const DISCORD_CLIENT_KINDS: [&str; 2] = ["Client", "AutoShardedClient"];
@@ -3399,7 +3397,7 @@ impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
         // --- Phase 2a: build bot var map, emit bot entrypoints + handler
         // edges, gate + dedup extension calls. Node attrs (path / simple name)
         // are pre-fetched in bulk so the loops need no random node access. ---
-        let mut pending_extensions: Vec<(String, String)> = Vec::new();
+        let mut pending_extensions: Vec<String> = Vec::new();
 
         // bot_vars_by_file: path -> { simple var name -> var idx }.
         let mut bot_vars_by_file: FxHashMap<String, FxHashMap<String, usize>> =
@@ -3453,41 +3451,30 @@ impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
             if !seen_extensions.insert(ext_fqname.clone()) {
                 continue;
             }
-            pending_extensions.push((path.clone(), ext_fqname.clone()));
+            pending_extensions.push(ext_fqname.clone());
         }
 
-        // --- Phase 2b: Cog entrypoint nodes (one per cog file). ---
+        // --- Phase 2b: keep every cog file's Cog subclasses + setup/teardown
+        // hooks alive (ENTRYPOINT stamped directly on each via keep_alive). ---
         for path in &cog_path_order {
             let mut targets = cogs_by_path[path].clone();
             if let Some(hooks) = hook_funcs_by_path.get(path) {
                 targets.extend(hooks.iter().copied());
             }
-            ops.add_synthetic_node(
-                format!("{DISCORDPY_COG_PREFIX}{}", path_basename(path)),
-                path.clone(),
-                NodeFlags::ENTRYPOINT,
-                targets,
-                Vec::new(),
-            );
+            for t in targets {
+                ops.keep_alive(t);
+            }
         }
 
-        // --- Phase 2c: extension surface fan-out. ---
+        // --- Phase 2c: keep each loaded extension module's surface alive
+        // (ENTRYPOINT stamped directly on each surface node via keep_alive). ---
         if !pending_extensions.is_empty() {
-            let ext_fqnames: Vec<String> =
-                pending_extensions.iter().map(|(_, e)| e.clone()).collect();
-            let surfaces = ctx.module_surfaces(&ext_fqnames);
-            for (owner_path, ext_fqname) in &pending_extensions {
+            let surfaces = ctx.module_surfaces(&pending_extensions);
+            for ext_fqname in &pending_extensions {
                 let targets = surfaces.get(ext_fqname).cloned().unwrap_or_default();
-                if targets.is_empty() {
-                    continue;
+                for t in targets {
+                    ops.keep_alive(t);
                 }
-                ops.add_synthetic_node(
-                    format!("{DISCORDPY_EXTENSION_PREFIX}{ext_fqname}"),
-                    owner_path.clone(),
-                    NodeFlags::ENTRYPOINT,
-                    targets,
-                    Vec::new(),
-                );
             }
         }
 

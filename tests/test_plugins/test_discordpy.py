@@ -152,8 +152,8 @@ def test_discordpy_plugin_keeps_cog_class_alive(build_plugin_graph, reachable_fq
         [native.NativePlugin.discordpy()],
     )
     reached = reachable_fqnames(graph)
-    # Cog class + module-level setup function both kept alive by the
-    # cog-module synthetic entrypoint.
+    # Cog class + module-level setup function are both stamped ENTRYPOINT
+    # directly (keep_alive) for any file holding a Cog subclass.
     assert "cogs.greetings.Greetings" in reached
     assert "cogs.greetings.setup" in reached
 
