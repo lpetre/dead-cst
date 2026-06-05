@@ -21,7 +21,7 @@ from dead_cst import _native as native
 def test_native_main_block_marks_module_entrypoint(build_plugin_graph):
     """The per-file main_block plugin stamps ``ENTRYPOINT`` directly on
     the module node of a file with a top-level ``if __name__`` block (via
-    ``keep_alive``) — no separate synthetic marker node."""
+    ``keep_alive``) — no separate marker node."""
     ctx = build_plugin_graph(
         {
             "pkg/__init__.py": "",

@@ -227,22 +227,10 @@ pub(crate) fn extract_plugin_jobs(
 /// translates to global indices at apply time. Salsa-cached as the
 /// per-file plugin's output, so it must be pure rust + ``salsa::Update``
 /// (no ``File`` handle, no global idx — both would couple the cache to
-/// project-wide assemble order). Mirrors the three project-wide
-/// [`PreparedOp`] variants, restricted to a single file's index space.
+/// project-wide assemble order). Mirrors the project-wide [`PreparedOp`]
+/// variants, restricted to a single file's index space.
 #[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) enum FileLocalOp {
-    /// Mint a synthetic node in this file (`PreparedOp::Node` shape) with an
-    /// out-edge to each file-local index in ``edges_to_local_idx`` and an
-    /// in-edge from each file-local index in ``edges_from_local_idx``.
-    Node {
-        fqname: String,
-        kind: &'static str,
-        flags: u32,
-        /// File-local indices this node points *to* (out-edges).
-        edges_to_local_idx: Vec<u32>,
-        /// File-local indices that point *to* this node (in-edges).
-        edges_from_local_idx: Vec<u32>,
-    },
     /// Reachability edge between two nodes in this file (`PreparedOp::Edge`
     /// shape). Both endpoints are file-local indices.
     Edge {
@@ -277,7 +265,7 @@ impl<'db> FileContext<'db> {
         Self { db, file }
     }
 
-    /// This file's nodes — index 0 is the synthetic module node, the
+    /// This file's nodes — index 0 is the module node, the
     /// rest are top-level decls. Indices line up with [`Self::refs`].
     pub(crate) fn nodes(&self) -> &'db [NodeData] {
         &file_to_nodes(self.db, self.file).nodes
@@ -288,7 +276,7 @@ impl<'db> FileContext<'db> {
         &file_to_nodes(self.db, self.file).nodes[0].fqname
     }
 
-    /// Local index of the synthetic module node (always 0 — kept as a
+    /// Local index of the module node (always 0 — kept as a
     /// named accessor so impls don't hard-code the convention).
     pub(crate) fn module_local_idx(&self) -> u32 {
         0
@@ -1190,7 +1178,7 @@ impl plugin_api::PerFilePlugin for MainBlockPluginImpl {
 pub mod plugin_api {
     use super::{FileContext, FileLocalOp};
     use crate::builder::PreparedOp;
-    use crate::graph::{intern_kind, EdgeFlags, NodeFlags};
+    use crate::graph::{EdgeFlags, NodeFlags};
     use crate::project::FrozenView;
 
     // Re-exported so a per-file plugin can name the raw AST / range types
@@ -1211,9 +1199,9 @@ pub mod plugin_api {
     // [`PluginCtx::node_flag`] / [`edge_flag`]. Pyo3-free.
     pub use crate::flag_registry::FlagSpec;
 
-    /// `NodeFlags::ENTRYPOINT` re-exported for plugin authors: set it on a
-    /// node minted via [`PluginOps::add_synthetic_node`] /
-    /// [`FileOps::add_synthetic_node`] to make that node a reachability seed.
+    /// `NodeFlags::ENTRYPOINT` re-exported for plugin authors. The flag
+    /// [`PluginOps::keep_alive`] / [`FileOps::keep_alive`] stamp on a decl to
+    /// make it a reachability seed; also usable as a `flag_decl` bit.
     /// Single source of truth — tracks the internal bit.
     pub const FLAG_ENTRYPOINT: u32 = NodeFlags::ENTRYPOINT;
 
@@ -1410,13 +1398,15 @@ pub mod plugin_api {
         /// Fully-qualified name (e.g. `pkg.mod.func`).
         pub fqname: String,
         /// One of `function`, `class`, `variable`, `import`, `type_alias`,
-        /// `module`, `synthetic`.
+        /// `module`, `external`.
         pub kind: String,
-        /// Source path the node was declared in (empty for synthetics).
+        /// Source path the node was declared in (empty for some external nodes).
         pub path: String,
-        /// 1-based start line, or 0 for synthetic nodes.
+        /// 1-based start line, or 0 for nodes with no source range
+        /// (`module` / `external`).
         pub start_line: usize,
-        /// 1-based end line, or 0 for synthetic nodes.
+        /// 1-based end line, or 0 for nodes with no source range
+        /// (`module` / `external`).
         pub end_line: usize,
         /// `NodeFlags` bitset (see [`FLAG_ENTRYPOINT`]).
         pub flags: u32,
@@ -1434,13 +1424,15 @@ pub mod plugin_api {
         /// Fully-qualified name.
         pub fqname: &'a str,
         /// One of `function`, `class`, `variable`, `import`, `type_alias`,
-        /// `module`, `synthetic`.
+        /// `module`, `external`.
         pub kind: &'a str,
-        /// Source path (empty for synthetics).
+        /// Source path (empty for some external nodes).
         pub path: &'a str,
-        /// 1-based start line, or 0 for synthetic nodes.
+        /// 1-based start line, or 0 for nodes with no source range
+        /// (`module` / `external`).
         pub start_line: usize,
-        /// 1-based end line, or 0 for synthetic nodes.
+        /// 1-based end line, or 0 for nodes with no source range
+        /// (`module` / `external`).
         pub end_line: usize,
         /// `NodeFlags` bitset (see [`FLAG_ENTRYPOINT`]).
         pub flags: u32,
@@ -1968,9 +1960,8 @@ pub mod plugin_api {
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
     /// plugins emit through named methods instead of constructing internals.
-    /// Exposes the three [`PreparedOp`] variants —
-    /// `Entrypoint` / `Edge` / `Node` — as `keep_alive` / `add_edge` /
-    /// `add_synthetic_node`.
+    /// Exposes the [`PreparedOp`] variants — `Entrypoint` / `FlagDecl` /
+    /// `Edge` — as `keep_alive` / `flag_decl` / `add_edge`.
     pub struct PluginOps {
         sink: Vec<PreparedOp>,
     }
@@ -2010,31 +2001,6 @@ pub mod plugin_api {
                 flags,
             });
         }
-
-        /// Mint a new `kind="synthetic"` node named `fqname`, attributed to
-        /// source `path` (empty for a placeless marker), with `flags` (see
-        /// [`FLAG_ENTRYPOINT`]), an out-edge to each index in `edges_to_idx`,
-        /// and an in-edge from each index in `edges_from_idx`. Emits a
-        /// [`PreparedOp::Node`]; the host bounds-checks every endpoint at apply
-        /// time and rejects a dangling index rather than minting an unconnected
-        /// node.
-        pub fn add_synthetic_node(
-            &mut self,
-            fqname: String,
-            path: String,
-            flags: u32,
-            edges_to_idx: Vec<usize>,
-            edges_from_idx: Vec<usize>,
-        ) {
-            self.sink.push(PreparedOp::Node {
-                fqname,
-                kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
-                path,
-                flags,
-                edges_from_idx,
-                edges_to_idx,
-            });
-        }
     }
 
     // ---- per-file surface --------------------------------------------------
@@ -2061,12 +2027,12 @@ pub mod plugin_api {
     /// against, *not* the project-wide [`NodeView::idx`].
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct FileNodeView {
-        /// File-local index (0 is always the synthetic module node).
+        /// File-local index (0 is always the module node).
         pub local_idx: u32,
         /// Fully-qualified name.
         pub fqname: String,
         /// One of `function`, `class`, `variable`, `import`, `type_alias`,
-        /// `module`, `synthetic`.
+        /// `module`.
         pub kind: String,
         /// Source path the node was declared in.
         pub path: String,
@@ -2119,7 +2085,7 @@ pub mod plugin_api {
             self.inner.module_fqname()
         }
 
-        /// File-local index of the synthetic module node (always 0).
+        /// File-local index of the module node (always 0).
         pub fn module_local_idx(&self) -> u32 {
             self.inner.module_local_idx()
         }
@@ -2207,10 +2173,10 @@ pub mod plugin_api {
         }
     }
 
-    /// File-local op sink for a [`PerFilePlugin`]. Mirrors
-    /// [`PluginOps::add_synthetic_node`] but in this file's *local* index
-    /// space — endpoints are positions in [`PluginFileCtx::nodes`], which
-    /// the host translates to global indices at apply time.
+    /// File-local op sink for a [`PerFilePlugin`]. Emits in this file's
+    /// *local* index space — endpoints are positions in
+    /// [`PluginFileCtx::nodes`], which the host translates to global indices
+    /// at apply time.
     pub struct FileOps {
         sink: Vec<FileLocalOp>,
     }
@@ -2222,27 +2188,6 @@ pub mod plugin_api {
 
         pub(crate) fn into_inner(self) -> Vec<FileLocalOp> {
             self.sink
-        }
-
-        /// Mint a `kind="synthetic"` node named `fqname` with `flags` (see
-        /// [`FLAG_ENTRYPOINT`]), an out-edge to each file-local index in
-        /// `edges_to_local_idx`, and an in-edge from each file-local index
-        /// in `edges_from_local_idx`. References must stay within this
-        /// file — a local index with no node is dropped at apply time.
-        pub fn add_synthetic_node(
-            &mut self,
-            fqname: String,
-            flags: u32,
-            edges_to_local_idx: Vec<u32>,
-            edges_from_local_idx: Vec<u32>,
-        ) {
-            self.sink.push(FileLocalOp::Node {
-                fqname,
-                kind: intern_kind("synthetic").expect("'synthetic' is a valid kind"),
-                flags,
-                edges_to_local_idx,
-                edges_from_local_idx,
-            });
         }
 
         /// Keep the node at file-local index `decl_local_idx` alive by
@@ -2303,36 +2248,6 @@ pub mod plugin_api {
         }
 
         #[test]
-        fn plugin_ops_add_synthetic_node_carries_edges_from() {
-            let mut ops = PluginOps::new();
-            ops.add_synthetic_node(
-                "syn".to_string(),
-                "pkg/mod.py".to_string(),
-                FLAG_ENTRYPOINT,
-                vec![3],
-                vec![4, 5],
-            );
-            let sink = ops.into_inner();
-            let [PreparedOp::Node {
-                fqname,
-                kind,
-                path,
-                flags,
-                edges_from_idx,
-                edges_to_idx,
-            }] = sink.as_slice()
-            else {
-                panic!("expected a single Node op");
-            };
-            assert_eq!(fqname, "syn");
-            assert_eq!(*kind, "synthetic");
-            assert_eq!(path, "pkg/mod.py");
-            assert_eq!(*flags, FLAG_ENTRYPOINT);
-            assert_eq!(edges_to_idx.as_slice(), &[3]);
-            assert_eq!(edges_from_idx.as_slice(), &[4, 5]);
-        }
-
-        #[test]
         fn file_ops_add_edge_carries_flags() {
             let mut ops = FileOps::new();
             ops.add_edge(0, 1, FLAG_DEAD_BRANCH);
@@ -2341,25 +2256,6 @@ pub mod plugin_api {
                 [FileLocalOp::Edge { src_local_idx: 0, dst_local_idx: 1, flags }]
                     if *flags == FLAG_DEAD_BRANCH
             ));
-        }
-
-        #[test]
-        fn file_ops_add_synthetic_node_carries_edges_from() {
-            let mut ops = FileOps::new();
-            ops.add_synthetic_node("syn".to_string(), FLAG_ENTRYPOINT, vec![2], vec![3]);
-            let sink = ops.into_inner();
-            let [FileLocalOp::Node {
-                fqname,
-                edges_to_local_idx,
-                edges_from_local_idx,
-                ..
-            }] = sink.as_slice()
-            else {
-                panic!("expected a single Node op, got {sink:?}");
-            };
-            assert_eq!(fqname, "syn");
-            assert_eq!(edges_to_local_idx.as_slice(), &[2]);
-            assert_eq!(edges_from_local_idx.as_slice(), &[3]);
         }
     }
 }

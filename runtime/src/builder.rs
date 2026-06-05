@@ -137,13 +137,14 @@ pub(crate) struct GraphBuilder {
     ///   so native-extension / protobuf-style stubs stay alive
     ///   artificially even when no consumer references them).
     pub(crate) peer_pyi_to_py: FxHashMap<File, File>,
-    /// `{ synthetic_fqname -> node idx }` for ``[external dist] X`` and
-    /// ``[unresolved] X`` synthetics. Synthetics are deduplicated by
-    /// fqname project-wide: every site that imports ``rustworkx``
-    /// resolves to the same ``[external dist] rustworkx`` node, so
-    /// reachability and the codemod's "this import has no
-    /// dependents" query both work on a single anchor.
-    pub(crate) synthetic_nodes: FxHashMap<String, usize>,
+    /// `{ external_fqname -> node idx }` for the `kind="external"`
+    /// anchors: ``[external dist] X``, ``[external file] X``, and
+    /// ``[unresolved] X``. Deduplicated by fqname project-wide: every
+    /// site that imports ``rustworkx`` resolves to the same
+    /// ``[external dist] rustworkx`` node, so reachability and the
+    /// codemod's "this import has no dependents" query both work on a
+    /// single anchor.
+    pub(crate) external_nodes: FxHashMap<String, usize>,
 }
 
 impl GraphBuilder {
@@ -162,7 +163,7 @@ impl GraphBuilder {
             forward_adj: Vec::with_capacity(expected_nodes),
             reverse_adj: Vec::with_capacity(expected_nodes),
             peer_pyi_to_py: FxHashMap::default(),
-            synthetic_nodes: FxHashMap::default(),
+            external_nodes: FxHashMap::default(),
         }
     }
 
@@ -186,8 +187,8 @@ impl GraphBuilder {
     /// `nodes` is filled with `GraphNode::default()` placeholders that
     /// `place_node` overwrites exactly once each — the per-file
     /// offsets partition `[0, total_nodes)`, so no placeholder
-    /// survives into the finished graph. Synthetic nodes minted later
-    /// via [`intern_node`] append past this region (index
+    /// survives into the finished graph. External nodes minted later
+    /// via [`intern_external`] append past this region (index
     /// `total_nodes` onward).
     pub(crate) fn prefill_payload_region(&mut self, total_nodes: usize) {
         self.nodes.resize_with(total_nodes, GraphNode::default);
@@ -214,42 +215,22 @@ impl GraphBuilder {
         self.nodes[idx] = node;
     }
 
-    /// Get (or mint) the deduplicated synthetic node with the given
-    /// fully qualified name. Synthetics anchor edges to imports the
-    /// project doesn't own — stdlib stays silent, ``[external dist] X``
-    /// covers third-party site-packages, ``[unresolved] X`` covers
-    /// genuinely-missing top-level names. Path is empty (synthetics
-    /// don't correspond to a file in the project tree) and position
-    /// is the (0, 0) sentinel.
-    pub(crate) fn intern_synthetic(&mut self, fqname: String) -> usize {
-        if let Some(&idx) = self.synthetic_nodes.get(&fqname) {
-            return idx;
-        }
-        let idx = self.intern_node(synthetic_node(
-            fqname.clone(),
-            "synthetic",
-            String::new(),
-            0,
-        ));
-        self.synthetic_nodes.insert(fqname, idx);
-        idx
-    }
-
     /// Get (or mint) the deduplicated `kind="external"` node for a
-    /// site-packages import target — ``[external dist] X`` /
-    /// ``[external file] X``. Unlike [`intern_synthetic`] these carry
-    /// the resolved target's site-packages `path` so callers can
-    /// exclude them by path.
-    /// Deduped by fqname project-wide (shares the synthetic dedup map —
-    /// the fqname namespaces are disjoint); the first `path` seen for a
-    /// given fqname wins, so several submodules of one dist collapse to
-    /// a single node.
+    /// non-first-party import target the project doesn't own —
+    /// ``[external dist] X`` covers third-party site-packages,
+    /// ``[external file] X`` a resolved-but-out-of-tree file, and
+    /// ``[unresolved] X`` a genuinely-missing top-level name. The
+    /// resolved target's `path` (empty for ``[unresolved]``, which has
+    /// no file) is carried so callers can exclude these nodes by path;
+    /// position is the (0, 0) sentinel. Deduped by fqname project-wide;
+    /// the first `path` seen for a given fqname wins, so several
+    /// submodules of one dist collapse to a single node.
     pub(crate) fn intern_external(&mut self, fqname: String, path: String) -> usize {
-        if let Some(&idx) = self.synthetic_nodes.get(&fqname) {
+        if let Some(&idx) = self.external_nodes.get(&fqname) {
             return idx;
         }
-        let idx = self.intern_node(synthetic_node(fqname.clone(), "external", path, 0));
-        self.synthetic_nodes.insert(fqname, idx);
+        let idx = self.intern_node(positionless_node(fqname.clone(), "external", path, 0));
+        self.external_nodes.insert(fqname, idx);
         idx
     }
 
@@ -350,10 +331,10 @@ pub(crate) fn bfs(
 }
 
 /// Construct a position-less [`GraphNode`] (start/end zeroed, `imports`
-/// absent) for ops minted at plugin-apply time. The four
-/// caller-supplied fields are the only ones that vary across the
-/// [`PreparedOp::Node`] / [`PreparedOp::Entrypoint`] shapes.
-pub(crate) fn synthetic_node(
+/// absent) for the `kind="external"` anchors minted by
+/// [`GraphBuilder::intern_external`], which stand in for imports the
+/// project doesn't own and have no source range of their own.
+pub(crate) fn positionless_node(
     fqname: String,
     kind: &'static str,
     path: String,
@@ -396,14 +377,6 @@ pub(crate) enum PreparedOp {
     FlagDecl {
         decl_idx: usize,
         flags: u32,
-    },
-    Node {
-        fqname: String,
-        kind: &'static str,
-        path: String,
-        flags: u32,
-        edges_from_idx: Vec<usize>,
-        edges_to_idx: Vec<usize>,
     },
 }
 
@@ -478,52 +451,6 @@ fn apply_prepared(
             outputs.builder.nodes[decl_idx].flags |= flags;
             Ok(())
         }
-        PreparedOp::Node {
-            fqname,
-            kind,
-            path,
-            flags,
-            edges_from_idx,
-            edges_to_idx,
-        } => {
-            // Bounds-check every endpoint *before* minting the new
-            // node so that a bad index doesn't leave an unconnected
-            // synthetic in the graph. The check uses the pre-intern
-            // node count: callers cannot reference an idx that
-            // doesn't yet exist (including the about-to-be-minted
-            // node).
-            let len = outputs.builder.nodes.len();
-            check_idx_slice_in_range(len, &edges_from_idx, "PreparedOp::Node", "edges_from_idx")?;
-            check_idx_slice_in_range(len, &edges_to_idx, "PreparedOp::Node", "edges_to_idx")?;
-            let node_idx = outputs
-                .builder
-                .intern_node(synthetic_node(fqname, kind, path, flags));
-            wire_synthetic_edges(
-                &mut outputs.builder,
-                node_idx,
-                &edges_from_idx,
-                &edges_to_idx,
-            );
-            Ok(())
-        }
-    }
-}
-
-/// Wire a freshly-minted synthetic node into the graph: every entry
-/// of ``edges_from_idx`` becomes ``source -> node``, every entry of
-/// ``edges_to_idx`` becomes ``node -> target``. Endpoints are already
-/// validated indices.
-fn wire_synthetic_edges(
-    builder: &mut GraphBuilder,
-    node_idx: usize,
-    edges_from_idx: &[usize],
-    edges_to_idx: &[usize],
-) {
-    for &src_idx in edges_from_idx {
-        builder.add_edge(src_idx, node_idx, 0);
-    }
-    for &dst_idx in edges_to_idx {
-        builder.add_edge(node_idx, dst_idx, 0);
     }
 }
 
@@ -534,15 +461,6 @@ fn check_idx_in_range(len: usize, idx: usize, op: &str, side: &str) -> PyResult<
         return Err(PyIndexError::new_err(format!(
             "{op}: {side} {idx} out of range (len={len})"
         )));
-    }
-    Ok(())
-}
-
-/// Bounds-check every index in a slice. Returns on the first
-/// out-of-range index with the matching ``IndexError``.
-fn check_idx_slice_in_range(len: usize, idxs: &[usize], op: &str, side: &str) -> PyResult<()> {
-    for &idx in idxs {
-        check_idx_in_range(len, idx, op, side)?;
     }
     Ok(())
 }
@@ -573,7 +491,7 @@ mod tests {
     //!
     //! * `NodeKey` equality / hashing (flags excluded from identity).
     //! * `node_key_of` projection.
-    //! * `synthetic_node` field defaults.
+    //! * `positionless_node` field defaults.
     //! * `bfs` traversal — direction switch + `skip_flags` filtering.
     use super::*;
     use std::collections::hash_map::DefaultHasher;
@@ -655,18 +573,18 @@ mod tests {
         assert!(a != b);
     }
 
-    // -- synthetic_node ---------------------------------------------------
+    // -- positionless_node ------------------------------------------------
 
     #[test]
-    fn synthetic_node_zeroes_positions_and_omits_imports() {
-        let n = synthetic_node(
+    fn positionless_node_zeroes_positions_and_omits_imports() {
+        let n = positionless_node(
             "pkg".to_string(),
-            "synthetic",
+            "external",
             "p.py".to_string(),
             NODE_FLAG_ENTRYPOINT,
         );
         assert_eq!(n.fqname, "pkg");
-        assert_eq!(n.kind, "synthetic");
+        assert_eq!(n.kind, "external");
         assert_eq!(n.path, "p.py");
         assert_eq!(n.start_line, 0);
         assert_eq!(n.start_column, 0);
@@ -677,9 +595,9 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_node_accepts_arbitrary_kind() {
+    fn positionless_node_accepts_arbitrary_kind() {
         // The signature takes a `&'static str` so callers pass already-interned values.
-        let n = synthetic_node(String::from("m"), "module", String::new(), 0);
+        let n = positionless_node(String::from("m"), "module", String::new(), 0);
         assert_eq!(n.kind, "module");
         assert!(n.path.is_empty());
     }
@@ -695,7 +613,7 @@ mod tests {
         assert!(b.edge_set.is_empty());
         assert!(b.forward_adj.is_empty());
         assert!(b.reverse_adj.is_empty());
-        assert!(b.synthetic_nodes.is_empty());
+        assert!(b.external_nodes.is_empty());
         assert!(b.peer_pyi_to_py.is_empty());
     }
 

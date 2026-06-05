@@ -16,7 +16,9 @@ use std::process::Command;
 /// the re-exported `FLAG_INIT_SUBCLASS` edge-flag constant.
 /// 3 → 4: added `PluginOps::flag_decl` / `FileOps::flag_decl` (OR a
 /// registered node flag onto an existing decl, no marker node).
-const PLUGIN_API_EPOCH: u32 = 4;
+/// 4 → 5: removed `PluginOps::add_synthetic_node` / `FileOps::add_synthetic_node`
+/// (plugins no longer mint nodes; the `kind="synthetic"` node kind is gone).
+const PLUGIN_API_EPOCH: u32 = 5;
 
 /// Compose the ABI fingerprint that gates external native-plugin loading.
 /// It changes whenever anything that could break the dylib ABI changes:

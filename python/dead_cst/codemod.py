@@ -94,8 +94,8 @@ def _select_files(
 
     Used by both :func:`remove_code` and :func:`generate_patch`. Symbols
     outside ``base`` (other packages, vendored deps) are dropped, as are
-    nodes whose source file no longer exists. Synthetic nodes are
-    ignored implicitly -- they don't appear in the type ``match``.
+    nodes whose source file no longer exists. Module and external nodes
+    are ignored implicitly -- they don't appear in the type ``match``.
 
     ``NodeFlags.NOTEBOOK`` nodes are dropped: cell-aware writeback into
     the notebook JSON envelope is not implemented today.

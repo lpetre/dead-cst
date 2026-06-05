@@ -473,6 +473,19 @@ two versions.
 
 ### Removed
 
+- **`add_synthetic_node` plugin op and the `kind="synthetic"` node kind
+  (breaking, plugin API).** `PluginOps::add_synthetic_node` /
+  `FileOps::add_synthetic_node` — and the `PreparedOp::Node` /
+  `FileLocalOp::Node` rows they emitted — are removed: plugins no longer mint
+  nodes, and keep code alive with `keep_alive` / `flag_decl` / `add_edge`
+  between existing nodes instead. The engine's `kind="synthetic"` node kind is
+  likewise gone; the `[unresolved] X` import sink it used to carry now folds
+  into `kind="external"` (the sole non-first-party node kind, still carrying its
+  prefix in the fqname). Bumps `PLUGIN_API_EPOCH` to 5.
+- **`DEAD_CST_PASS2_SERIAL` serial Pass-2 kill switch.** The environment-gated
+  serial edge-translation fallback — and the `scripts/bench_pass2.py` A/B
+  harness that compared it against the parallel path — are removed; Pass 2
+  always runs the GIL-free parallel translation.
 - **`NativePlugin.module_dunders()` / `ModuleDundersPlugin` (breaking).** The
   per-file module-dunder plugin is gone; its keep-alive behavior is now
   always-on engine policy (see Changed). The CLI `--plugin module_dunders`

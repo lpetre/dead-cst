@@ -15,7 +15,7 @@ The deeper public surface lives in focused sub-packages:
 * :mod:`dead_cst.graph` -- node and edge data types.
 * :mod:`dead_cst.analyze` -- :class:`Analysis`.
 * :mod:`dead_cst.codemod` -- the LibCST-based source rewriter.
-* :mod:`dead_cst.plugins` -- the synthetic-node prefix constants and
+* :mod:`dead_cst.plugins` -- the external-node prefix constants and
   every built-in plugin.
 
 For multi-package monorepos, the caller is responsible for setting

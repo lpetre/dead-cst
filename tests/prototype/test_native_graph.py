@@ -256,7 +256,7 @@ def test_node_indices_follow_sorted_file_order(project_factory):
         }
     )
     g = proj.build()
-    # Per-file nodes carry the file's path; synthetics (none here) carry "".
+    # Per-file nodes carry the file's path; positionless nodes (none here) carry "".
     paths = [n.path for n in g.nodes if n.path]
     first_seen = list(dict.fromkeys(paths))
     # Each file is one contiguous run of indices (offset placement, no

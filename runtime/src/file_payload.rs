@@ -204,7 +204,6 @@ pub(crate) enum NodeKind {
     Import = 3,
     TypeAlias = 4,
     Module = 5,
-    Synthetic = 6,
     External = 7,
 }
 
@@ -220,7 +219,6 @@ impl NodeKind {
             NodeKind::Import => "import",
             NodeKind::TypeAlias => "type_alias",
             NodeKind::Module => "module",
-            NodeKind::Synthetic => "synthetic",
             NodeKind::External => "external",
         }
     }
@@ -233,7 +231,6 @@ impl NodeKind {
             "import" => NodeKind::Import,
             "type_alias" => NodeKind::TypeAlias,
             "module" => NodeKind::Module,
-            "synthetic" => NodeKind::Synthetic,
             "external" => NodeKind::External,
             _ => return None,
         })
@@ -928,7 +925,7 @@ pub(crate) struct FileEdges<'db> {
     pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
     /// Import-alias nodes in this file whose upstream module did not
     /// resolve. The assembly pass ORs `NodeFlags::UNRESOLVED` into each
-    /// (in place of the old `[unresolved] X` synthetic sink edge).
+    /// (in place of the old `[unresolved] X` sink edge).
     pub(crate) unresolved_aliases: FxHashSet<NodeRef<'db>>,
 }
 

@@ -25,7 +25,6 @@ NodeKind = Literal[
     "import",
     "type_alias",
     "module",
-    "synthetic",
     "external",
 ]
 
@@ -47,12 +46,12 @@ class NodeFlags:
     """Import alias whose upstream module ty could not resolve (a bad
     relative-dots target, a missing dependency, …). Stamped on the local
     ``kind="import"`` node in place of the old ``[unresolved] X``
-    synthetic sink. Metadata only (not a seed); registered
+    sink node. Metadata only (not a seed); registered
     ``engine/unresolved``."""
 
     ENTRYPOINT: int
     """Explicit entrypoint — plugin-emitted seeds, the CLI's ``-e`` flag,
-    ``[project.scripts]`` targets, factory-app synthetics, etc. A seed
+    ``[project.scripts]`` targets, factory-app entrypoints, etc. A seed
     flag (registered ``engine/entrypoint``), so reachability seeds from
     ``ENTRYPOINT``-flagged nodes by default."""
 
@@ -112,7 +111,7 @@ class EdgeFlags:
     """Edge from a base class to a subclass discovered via
     ``__init_subclass__`` (the built-in init-subclass plugin emits one
     ``parent -> subclass`` edge per registered subclass). Keeps the
-    subclass alive whenever the base is, without a synthetic anchor
+    subclass alive whenever the base is, without a separate anchor
     node. Metadata only — the edge participates in default reachability."""
 
 class Import:

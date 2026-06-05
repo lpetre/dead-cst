@@ -24,7 +24,6 @@ from typer.testing import CliRunner
 
 from dead_cst.cli import (
     _crate_key,
-    _dead_real,
     _materialize_dep_closure,
     _rel_path,
     app,
@@ -33,7 +32,7 @@ from dead_cst.cli import (
     setup_logging,
 )
 from dead_cst import _native as native
-from dead_cst.graph import GraphMetadata, SymbolNode, read_graph
+from dead_cst.graph import GraphMetadata, read_graph
 
 
 def _plugin_name(p) -> str:
@@ -74,18 +73,6 @@ def project(tmp_path):
         return tmp_path
 
     return _make
-
-
-def _make_node(fqname: str, kind: str, path: str = "/x.py") -> SymbolNode:
-    return SymbolNode(
-        fqname,
-        kind,
-        path,
-        start_line=1,
-        start_column=0,
-        end_line=1,
-        end_column=1,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -163,20 +150,6 @@ def test_rel_path_under_root_is_relativized():
 def test_rel_path_outside_root_returned_unchanged():
     p = Path("/elsewhere/c.py")
     assert _rel_path(p, Path("/a")) == p
-
-
-def test_dead_real_filters_synthetic_nodes():
-    """Synthetic nodes (entrypoint sentinels, external markers) are
-    excluded from the dead-symbol report so we don't surface them
-    alongside user-visible declarations."""
-    real = _make_node("pkg.f", "function", "/a.py")
-    synth = _make_node("<entrypoint>:pkg.f", "synthetic", "/a.py")
-
-    assert _dead_real([real, synth]) == [real]
-
-
-def test_dead_real_empty_input_returns_empty_list():
-    assert _dead_real([]) == []
 
 
 # ---------------------------------------------------------------------------

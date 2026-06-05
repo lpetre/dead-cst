@@ -1055,7 +1055,7 @@ def test_third_party_import_uses_canonical_dist_name(build_decl_graph):
 
     The distribution's top-level module (``yaml``) and its canonical
     PyPI name (``PyYAML`` → ``pyyaml``) differ. Plugins query by the
-    canonical name so the synthetic must match what
+    canonical name so the external node must match what
     :data:`importlib.metadata`'s ``Name:`` header normalizes to.
     """
     graph = build_decl_graph(
@@ -1105,7 +1105,7 @@ def test_unresolved_import_flags_alias_silently(build_decl_graph, caplog):
         )
 
     assert [r.getMessage() for r in caplog.records] == []
-    # No external/synthetic sink node was minted for the missing import.
+    # No external sink node was minted for the missing import.
     assert not [n for n in graph.nodes() if "unknown_pkg_xyz" in n.fqname and n.kind != "import"]
     # The local import alias is flagged UNRESOLVED.
     aliases = [
@@ -1123,7 +1123,7 @@ def test_module_runtime_dunder_access_is_module_dep(build_decl_graph, assert_edg
     these is a path / string op, not a symbol reference. The visitor truncates
     the access chain at the dunder so the edge stitcher sees a clean module-
     level dependency (no speculative ``decl="__file__"`` that it would warn
-    about, no synthetic node for the missing attribute).
+    about, no node for the missing attribute).
     """
     with caplog.at_level(logging.WARNING, logger="dead_cst._edges"):
         graph = build_decl_graph(
@@ -1140,7 +1140,7 @@ def test_module_runtime_dunder_access_is_module_dep(build_decl_graph, assert_edg
         )
 
     assert [r.getMessage() for r in caplog.records] == []
-    # No synthetic was minted for the missing-dunder lookup.
+    # No node was minted for the missing-dunder lookup.
     assert not [n.fqname for n in graph.nodes() if n.fqname.endswith(".__file__")]
     # The module-level dependency edges remain intact for each user of a dunder
     # (FILE_PATH / NAME / SPEC all edge to ``pkg`` directly).

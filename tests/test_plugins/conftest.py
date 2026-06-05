@@ -14,11 +14,11 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def reachable_fqnames():
-    """``{fqname for n in ctx.reachable() if n.kind != "synthetic"}``."""
+    """``{n.fqname for n in ctx.reachable()}``."""
 
     def _reachable(ctx: "native.ProjectContext") -> set[str]:
         reached = ctx.reachable(seed_flags=ctx.default_seed_mask())
-        return {n.fqname for n in reached if n.kind != "synthetic"}
+        return {n.fqname for n in reached}
 
     return _reachable
 
