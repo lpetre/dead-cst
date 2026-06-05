@@ -393,6 +393,14 @@ example:
   the manifest. Start here.
 - **[`examples/per_file_main_block/`](examples/per_file_main_block/)** — the
   same behaviour as a **per-file** plugin (`per_file()` + `run_on_file`).
+- **[`examples/per_file_decorated/`](examples/per_file_decorated/)** — a
+  **two-plugin** cdylib wiring the per-file → project-wide channel end to end:
+  a per-file scanner emits a fact per Click-decorated command (via the
+  ready-made `decorated_decls` query), and a project-wide reader resolves the
+  shared topic, reads the facts, and stamps a declared `click/command` node
+  flag on each matched decl. The worked example for `declare_node_flags` /
+  `declare_topics` / `emit_fact` / `facts_for_topic` and for a manifest that
+  exports more than one plugin.
 
 ---
 

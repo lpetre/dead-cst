@@ -26,7 +26,9 @@ two versions.
   name to a handle. Facts are an in-memory build-time side channel — not
   graph-mutating and not serialized into the graph file. The
   `ProjectContext.topic_registry()` / `facts_for_topic(name)` getters expose
-  the same data to Python. Bumps `PLUGIN_API_EPOCH` to 6.
+  the same data to Python. Bumps `PLUGIN_API_EPOCH` to 6. See
+  `examples/per_file_decorated/` for a worked per-file-emit → project-wide-read
+  round trip that also stamps a declared node flag.
 - **`plugin_api` epoch in the ABI fingerprint.** The native-plugin ABI
   fingerprint gains a dedicated `api<N>` segment
   (`native_plugins::plugin_api::PLUGIN_API_EPOCH`, bumped in
