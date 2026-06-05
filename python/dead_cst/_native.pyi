@@ -1088,6 +1088,30 @@ class ProjectContext:
         ``None`` when no flag with that name is registered."""
         ...
 
+    # ----- Topic / fact registry --------------------------------------
+    #
+    # Topics are a plugin-only channel for a per-file plugin to publish
+    # facts to its project-wide reader. Plugins declare topics via
+    # ``declare_topics``; the host assigns handles during
+    # :meth:`materialize`. Unlike the flag registries there are no engine
+    # built-ins, and the registry is not serialized into the graph file —
+    # facts are an in-memory build-time side channel.
+
+    def topic_registry(self) -> list[tuple[str, int, str]]:
+        """Every registered topic as ``(name, handle, description)`` tuples
+        in handle (registration) order: the topics registered plugins
+        declared via ``declare_topics`` (empty before :meth:`materialize`)."""
+        ...
+
+    def facts_for_topic(self, name: str) -> list[tuple[str, int | None, str]]:
+        """Every fact published under topic ``name`` across the project, as
+        ``(path, decl_idx, value)`` tuples. ``path`` is the publishing file;
+        ``decl_idx`` is the global node index the fact was pinned to (or
+        ``None``); ``value`` is the plugin-defined payload. Empty for an
+        unknown topic or one nothing published under. Raises if called
+        before :meth:`materialize`."""
+        ...
+
 # ---------- Node-attribute rows ------------------------------------------
 
 class NodeAttrs:

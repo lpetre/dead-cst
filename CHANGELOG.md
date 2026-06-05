@@ -11,6 +11,22 @@ two versions.
 
 ### Added
 
+- **Topic/fact channel for native plugins.** A per-file native plugin can
+  now hand structured facts up to its project-wide reader. A plugin declares
+  topics with `ExternalPlugin::declare_topics() -> Vec<TopicSpec>` (same
+  `engine/`-reserved, idempotent-on-identical-spec registration as the flag
+  registries), emits per-file facts with
+  `FileOps::emit_fact(topic_name, decl_local_idx, value)`, and reads them
+  project-wide through `PluginCtx::topic(name) -> Option<u32>` +
+  `facts_for_topic(handle) -> Vec<Fact>`. Each `Fact` carries the source file
+  path, an optional graph decl index (the file-local decl is translated to a
+  global index, or the fact is dropped if it can't resolve), and a `String`
+  value. Per-file plugins emit by topic *name* (salsa-stable) so the per-file
+  cache stays a pure function of the file; the project-wide side resolves the
+  name to a handle. Facts are an in-memory build-time side channel — not
+  graph-mutating and not serialized into the graph file. The
+  `ProjectContext.topic_registry()` / `facts_for_topic(name)` getters expose
+  the same data to Python. Bumps `PLUGIN_API_EPOCH` to 6.
 - **`plugin_api` epoch in the ABI fingerprint.** The native-plugin ABI
   fingerprint gains a dedicated `api<N>` segment
   (`native_plugins::plugin_api::PLUGIN_API_EPOCH`, bumped in

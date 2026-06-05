@@ -63,6 +63,7 @@ use crate::helpers::{
 };
 use crate::ingest::file_package_name;
 use crate::project::FrozenView;
+use crate::topic_registry::TopicRegistry;
 
 /// Map a curated [`plugin_api::PluginError`] onto a Python exception. The
 /// curated surface stays pyo3-free; this is the single crossing point where a
@@ -141,6 +142,17 @@ impl PluginJob {
     }
 }
 
+/// Output of [`extract_plugin_jobs`]: the registration-order plugin jobs and
+/// their display names, plus the post-declaration node/edge flag registries
+/// and the topic registry, all built in the one GIL-held pass.
+pub(crate) type ExtractedPlugins = (
+    Vec<PluginJob>,
+    Vec<String>,
+    FlagRegistry,
+    FlagRegistry,
+    TopicRegistry,
+);
+
 /// Pull every registered plugin into a `Send` [`PluginJob`] paired with
 /// its display name, in registration order, under the GIL. Doing the
 /// downcast + kind dispatch here (rather than inside the fan-out) keeps
@@ -151,7 +163,7 @@ impl PluginJob {
 pub(crate) fn extract_plugin_jobs(
     py: Python<'_>,
     plugins: &[PyObject],
-) -> PyResult<(Vec<PluginJob>, Vec<String>, FlagRegistry, FlagRegistry)> {
+) -> PyResult<ExtractedPlugins> {
     let mut jobs = Vec::with_capacity(plugins.len());
     let mut names = Vec::with_capacity(plugins.len());
     // Seed both registries with the engine built-ins, then fold in each
@@ -160,6 +172,10 @@ pub(crate) fn extract_plugin_jobs(
     // declaration surfaces here, on the GIL thread, before the parallel run.
     let mut node_reg = FlagRegistry::with_node_builtins();
     let mut edge_reg = FlagRegistry::with_edge_builtins();
+    // Topics carry no engine built-ins (they're a plugin-only channel); each
+    // plugin's declared topics fold in in the same registration-order pass, so
+    // handle allocation is likewise a pure function of plugin order.
+    let mut topic_reg = TopicRegistry::new();
     for plugin in plugins {
         let bound = plugin.bind(py);
         let native = match bound.downcast::<NativePlugin>() {
@@ -182,6 +198,9 @@ pub(crate) fn extract_plugin_jobs(
             for spec in plugin.declare_edge_flags() {
                 edge_reg.register_plugin(spec)?;
             }
+            for spec in plugin.declare_topics() {
+                topic_reg.register_plugin(spec)?;
+            }
         }
         let (job, name) = match &native_ref.kind {
             NativePluginKind::External {
@@ -200,7 +219,7 @@ pub(crate) fn extract_plugin_jobs(
         jobs.push(job);
         names.push(name);
     }
-    Ok((jobs, names, node_reg, edge_reg))
+    Ok((jobs, names, node_reg, edge_reg, topic_reg))
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +265,19 @@ pub(crate) enum FileLocalOp {
     /// shape). ``decl_local_idx`` is a file-local index; unlike
     /// [`FileLocalOp::Entrypoint`] the bits are caller-supplied.
     FlagDecl { decl_local_idx: u32, flags: u32 },
+    /// Publish a fact under a topic **name** (not a registry handle — a handle
+    /// is allocated from the whole plugin set and would couple this file's
+    /// salsa cache to that set). ``decl_local_idx`` optionally pins the fact to
+    /// a file-local decl, translated to a global index at assemble time; a
+    /// fact whose decl fails to translate is dropped. Unlike the other
+    /// variants this does not mutate the graph — it rides the per-file salsa
+    /// cache into [`crate::project::BuildOutputs`] for the topic's project-wide
+    /// reader.
+    Fact {
+        topic: String,
+        decl_local_idx: Option<u32>,
+        value: String,
+    },
 }
 
 /// Read-only, single-file view a [`plugin_api::PerFilePlugin`] is run
@@ -1206,6 +1238,13 @@ pub mod plugin_api {
     // [`PluginCtx::node_flag`] / [`edge_flag`]. Pyo3-free.
     pub use crate::flag_registry::FlagSpec;
 
+    // Topic declaration vocabulary. A plugin returns these from
+    // [`ExternalPlugin::declare_topics`]; the host assigns each a handle and
+    // the plugin resolves a name to its handle via [`PluginCtx::topic`], then
+    // reads the collected [`Fact`]s with [`PluginCtx::facts_for_topic`].
+    // Pyo3-free.
+    pub use crate::topic_registry::TopicSpec;
+
     /// `NodeFlags::ENTRYPOINT` re-exported for plugin authors. The flag
     /// [`PluginOps::keep_alive`] / [`FileOps::keep_alive`] stamp on a decl to
     /// make it a reachability seed; also usable as a `flag_decl` bit.
@@ -1376,6 +1415,20 @@ pub mod plugin_api {
         fn declare_edge_flags(&self) -> Vec<FlagSpec> {
             Vec::new()
         }
+
+        /// Topics this plugin publishes facts under. Each returned
+        /// [`TopicSpec`] is assigned a handle by the host (in registration
+        /// order) before any run; a per-file run emits facts under the topic
+        /// **name** via [`FileOps::emit_fact`], and the project-wide
+        /// [`run`](Self::run) resolves a name to its handle with
+        /// [`PluginCtx::topic`] and reads the collected facts via
+        /// [`PluginCtx::facts_for_topic`]. Declaring the same `owner/name` spec
+        /// from two plugins is idempotent (they share one handle); a
+        /// conflicting re-declaration or an `engine/`-prefixed name fails the
+        /// whole materialize. Default none.
+        fn declare_topics(&self) -> Vec<TopicSpec> {
+            Vec::new()
+        }
     }
 
     /// Per-file capability for an [`ExternalPlugin`]. Invoked once per
@@ -1393,6 +1446,20 @@ pub mod plugin_api {
     pub trait PerFilePlugin: Send + Sync {
         /// Walk `file` and append this file's ops to `ops`.
         fn run_on_file(&self, file: &PluginFileCtx<'_>, ops: &mut FileOps);
+    }
+
+    /// One collected fact, returned by [`PluginCtx::facts_for_topic`] (and the
+    /// Python `ProjectContext.facts_for_topic`). `path` is the file the fact
+    /// was published from; `decl_idx`, when present, is the **global** node
+    /// index the publishing per-file plugin pinned the fact to (its file-local
+    /// index translated at assemble time — a fact whose decl failed to
+    /// translate is dropped, so a `Some` here always names a live node);
+    /// `value` is the plugin-defined payload.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Fact {
+        pub path: String,
+        pub decl_idx: Option<usize>,
+        pub value: String,
     }
 
     /// Owned, plain-data snapshot of one graph node, returned by
@@ -1963,6 +2030,35 @@ pub mod plugin_api {
         pub fn edge_flag(&self, name: &str) -> Option<u8> {
             self.inner.edge_flags.get(name).map(|bit| bit as u8)
         }
+
+        // --- topic registry -------------------------------------------------
+
+        /// The handle a topic named `name` (`owner/name`) was assigned, or
+        /// `None` if no plugin declared it. A plugin resolves its own declared
+        /// topic this way: the host assigned the handle from
+        /// [`ExternalPlugin::declare_topics`] before `run`, so a plugin that
+        /// declared `name` can `.expect()` the lookup, then pass the handle to
+        /// [`Self::facts_for_topic`].
+        pub fn topic(&self, name: &str) -> Option<u32> {
+            self.inner.topics.get(name)
+        }
+
+        /// Every [`Fact`] published under the topic `handle` across the whole
+        /// project — the per-file plugins' [`FileOps::emit_fact`] output,
+        /// collected during graph assembly. Returns an empty vec for an
+        /// out-of-range handle or a topic nothing published under.
+        pub fn facts_for_topic(&self, handle: u32) -> Vec<Fact> {
+            match self.inner.topics.name_of(handle) {
+                Some(name) => self
+                    .inner
+                    .outputs
+                    .topic_facts
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        }
     }
 
     /// Op sink for external plugins. Wraps the internal `PreparedOp` vec so
@@ -2232,6 +2328,28 @@ pub mod plugin_api {
                 src_local_idx,
                 dst_local_idx,
                 flags,
+            });
+        }
+
+        /// Publish a fact under topic `topic` (a name declared in
+        /// [`ExternalPlugin::declare_topics`] — emitted by name, not handle, so
+        /// the per-file salsa cache stays independent of the plugin set).
+        /// `decl_local_idx`, when `Some`, pins the fact to a position in
+        /// [`PluginFileCtx::nodes`], translated to a global node index at
+        /// assemble time (a fact whose decl fails to translate is dropped);
+        /// `None` leaves the fact file-scoped. The project-wide side reads it
+        /// back via [`PluginCtx::facts_for_topic`]. Emits a
+        /// [`FileLocalOp::Fact`].
+        pub fn emit_fact(
+            &mut self,
+            topic: impl Into<String>,
+            decl_local_idx: Option<u32>,
+            value: impl Into<String>,
+        ) {
+            self.sink.push(FileLocalOp::Fact {
+                topic: topic.into(),
+                decl_local_idx,
+                value: value.into(),
             });
         }
     }

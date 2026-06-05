@@ -310,6 +310,79 @@ plugin-set change. Per-file plugins emit the built-in engine flag constants
 (`plugin_api::FLAG_*`) instead; declaring custom flags is a project-wide-plugin
 capability today.
 
+### Topics: per-file facts → project-wide reader
+
+A per-file plugin can't see project-wide state — but it often discovers
+something one file at a time that its project-wide half needs to act on. The
+**topic/fact** channel carries that across: the per-file run *publishes facts*
+under a topic, and the project-wide `run` *reads them all back*.
+
+Declare topics the same way you declare flags, via `declare_topics`:
+
+```rust
+use dead_cst_runtime::native_plugins::plugin_api::TopicSpec;
+
+impl ExternalPlugin for MyPlugin {
+    fn name(&self) -> &str { "MyPlugin" }
+    fn per_file(&self) -> Option<&dyn PerFilePlugin> { Some(self) }
+
+    fn declare_topics(&self) -> Vec<TopicSpec> {
+        vec![TopicSpec {
+            name: "acme/handlers".to_string(),   // owner/name; "engine/" is reserved
+            description: "decls that look like request handlers".to_string(),
+        }]
+    }
+}
+
+impl PerFilePlugin for MyPlugin {
+    fn run_on_file(&self, file: &PluginFileCtx<'_>, ops: &mut FileOps) {
+        for n in file.nodes() {
+            if n.local_idx != 0 && n.fqname.ends_with("_handler") {
+                // emit by topic *name*, optionally pinned to a file-local decl
+                ops.emit_fact("acme/handlers", Some(n.local_idx), n.fqname.to_string());
+            }
+        }
+    }
+}
+```
+
+Then read them in the project-wide `run`:
+
+```rust
+fn run(&self, ctx: &PluginCtx<'_>, ops: &mut PluginOps) -> Result<(), PluginError> {
+    let handle = ctx.topic("acme/handlers").expect("declared in declare_topics");
+    for fact in ctx.facts_for_topic(handle) {
+        // fact: { path: String, decl_idx: Option<usize>, value: String }
+        if let Some(idx) = fact.decl_idx {
+            ops.keep_alive(idx);
+        }
+    }
+    Ok(())
+}
+```
+
+Key points:
+
+- **Facts are emitted by topic *name*, not handle.** Same reason a per-file
+  plugin can't resolve a flag bit: the registry handle is allocated from the
+  whole plugin set, which isn't a file input, so keying the salsa cache on it
+  would serve stale handles after a plugin-set change. The topic *name* is
+  salsa-stable, so the per-file output stays cacheable; the host resolves
+  name → handle on the project-wide side.
+- **`decl_local_idx` is optional and translated.** `Some(local)` pins the fact
+  to a position in `file.nodes()`, which the host maps to a **global** node
+  index at assemble time; a fact whose decl doesn't resolve is dropped (so a
+  `Some` `decl_idx` you read back always names a live node). `None` leaves the
+  fact file-scoped (`path` only).
+- **`engine/` is reserved and registration is idempotent**, exactly like flags:
+  two plugins declaring the same `owner/name` topic share one handle; a
+  conflicting re-declaration fails loudly.
+- **Facts don't mutate the graph and aren't serialized.** They're an in-memory
+  build-time side channel, queried on the live `ProjectContext`
+  (`ctx.facts_for_topic` in Rust; `ProjectContext.topic_registry()` /
+  `ProjectContext.facts_for_topic(name)` from Python). Nothing is written to the
+  `.dcg` file.
+
 Each plugin `cdylib` also exports a **manifest** — a self-contained
 `#[repr(C)]` table listing the plugins it provides and the ABI fingerprint it
 was built against. It's deliberately boring boilerplate; copy it from a worked
