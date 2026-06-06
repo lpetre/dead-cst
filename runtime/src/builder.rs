@@ -255,6 +255,134 @@ impl GraphBuilder {
             }
         }
     }
+
+    /// Bulk-*initialize* the edge storage from a pre-sorted,
+    /// pre-deduplicated triple list — the assemble pass's one big
+    /// batch. Requires an edge-less builder (debug-asserted): with no
+    /// pre-existing edges to merge against, every piece of the edge
+    /// storage is derived from `triples` independently, on concurrent
+    /// rayon tasks. Callers should release the GIL around this.
+    ///
+    /// * `edges` is the triple list itself (moved in, no copy).
+    /// * `edge_set` is folded by a sibling task — still needed, since
+    ///   later `add_edge` / `extend_edges` calls (peer-stub edges, the
+    ///   plugin apply pass) dedup against it.
+    /// * `forward_adj`: `triples` is sorted by `(src, dst, flags)`, so
+    ///   each node's out-list is one contiguous run; [`scatter_adjacency`]
+    ///   partitions the runs into worker chunks and writes each chunk's
+    ///   disjoint `forward_adj[lo..hi]` window in parallel.
+    /// * `reverse_adj`: the same scatter over a copy re-sorted by
+    ///   `(dst, src, flags)`.
+    ///
+    /// The result — including every per-node adjacency order — is
+    /// identical to looping the same triples through [`extend_edges`].
+    pub(crate) fn init_edges_bulk(&mut self, triples: Vec<(usize, usize, u8)>) {
+        debug_assert!(
+            self.edges.is_empty() && self.edge_set.is_empty(),
+            "init_edges_bulk requires an edge-less builder"
+        );
+        debug_assert!(
+            triples.windows(2).all(|w| w[0] < w[1]),
+            "init_edges_bulk requires sorted + deduplicated triples"
+        );
+        if triples.is_empty() {
+            return;
+        }
+        let mut edge_set = std::mem::take(&mut self.edge_set);
+        let forward = self.forward_adj.as_mut_slice();
+        let reverse = self.reverse_adj.as_mut_slice();
+        let triples_ref = &triples;
+        rayon::join(
+            || {
+                edge_set.reserve(triples_ref.len());
+                edge_set.extend(triples_ref.iter().copied());
+            },
+            || {
+                rayon::join(
+                    || {
+                        scatter_adjacency(forward, triples_ref, |&(src, dst, flags)| {
+                            (src, (dst, flags))
+                        })
+                    },
+                    || {
+                        use rayon::prelude::*;
+                        let mut by_dst = triples_ref.clone();
+                        by_dst.par_sort_unstable_by_key(|&(src, dst, flags)| (dst, src, flags));
+                        scatter_adjacency(reverse, &by_dst, |&(src, dst, flags)| {
+                            (dst, (src, flags))
+                        });
+                    },
+                );
+            },
+        );
+        self.edge_set = edge_set;
+        self.edges = triples;
+    }
+}
+
+/// Scatter `rows` — sorted by the key half of `key_entry`'s return —
+/// into `adj`, writing each key's contiguous run as that node's
+/// adjacency list (replacing the empty placeholder `Vec`, so each list
+/// is allocated exactly once at its final size).
+///
+/// This is a partitioned scatter, not a reduction: rows are chunked at
+/// run boundaries (~8 chunks per worker for load balance), so chunk
+/// `i`'s keys are all strictly smaller than chunk `i + 1`'s and each
+/// chunk owns a disjoint `adj[lo..hi]` window carved off with
+/// `split_at_mut` — no locks, no merge pass.
+#[allow(clippy::type_complexity)]
+fn scatter_adjacency(
+    adj: &mut [Vec<(usize, u8)>],
+    rows: &[(usize, usize, u8)],
+    key_entry: fn(&(usize, usize, u8)) -> (usize, (usize, u8)),
+) {
+    use rayon::prelude::*;
+    if rows.is_empty() {
+        return;
+    }
+    let n_chunks = (rayon::current_num_threads() * 8).max(1);
+    let approx = rows.len().div_ceil(n_chunks);
+    // Row ranges aligned to run boundaries: extend each chunk until the
+    // key changes so no run straddles two chunks.
+    let mut chunks: Vec<(usize, usize)> = Vec::with_capacity(n_chunks + 1);
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = (start + approx).min(rows.len());
+        let key = key_entry(&rows[end - 1]).0;
+        while end < rows.len() && key_entry(&rows[end]).0 == key {
+            end += 1;
+        }
+        chunks.push((start, end));
+        start = end;
+    }
+    // Carve a disjoint `adj` window per chunk. Chunk keys are sorted
+    // and chunk-exclusive, so splitting after each chunk's last key
+    // hands every window to exactly one worker.
+    let mut windows: Vec<(usize, &mut [Vec<(usize, u8)>], usize, usize)> =
+        Vec::with_capacity(chunks.len());
+    let mut rest = adj;
+    let mut consumed = 0usize;
+    for &(row_start, row_end) in &chunks {
+        let last_key = key_entry(&rows[row_end - 1]).0;
+        let (head, tail) = rest.split_at_mut(last_key + 1 - consumed);
+        windows.push((consumed, head, row_start, row_end));
+        consumed = last_key + 1;
+        rest = tail;
+    }
+    windows
+        .into_par_iter()
+        .for_each(|(base, window, row_start, row_end)| {
+            let mut i = row_start;
+            while i < row_end {
+                let key = key_entry(&rows[i]).0;
+                let mut j = i + 1;
+                while j < row_end && key_entry(&rows[j]).0 == key {
+                    j += 1;
+                }
+                window[key - base] = rows[i..j].iter().map(|r| key_entry(r).1).collect();
+                i = j;
+            }
+        });
 }
 
 pub(crate) fn not_materialized(op: &str) -> PyErr {
@@ -618,6 +746,80 @@ mod tests {
         let r = bfs(&b, [0], Direction::Forward, 0);
         assert!(r.contains(&0));
         assert_eq!(r.len(), 1);
+    }
+
+    // -- init_edges_bulk ----------------------------------------------------
+
+    /// Deterministic pseudo-random `(src, dst, flags)` triples over
+    /// `n_nodes`, sorted + deduplicated — the exact precondition
+    /// `init_edges_bulk` documents. Plain LCG; no rng dependency.
+    fn make_sorted_triples(n_nodes: usize, n_edges: usize, seed: u64) -> Vec<(usize, usize, u8)> {
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        let mut t: Vec<(usize, usize, u8)> = (0..n_edges)
+            .map(|_| (next() % n_nodes, next() % n_nodes, (next() % 3) as u8))
+            .collect();
+        t.sort_unstable();
+        t.dedup();
+        t
+    }
+
+    /// Assert every edge-side field of two builders matches, including
+    /// per-node adjacency order (the documented bit-for-bit contract).
+    fn assert_same_edges(a: &GraphBuilder, b: &GraphBuilder) {
+        assert_eq!(a.edges, b.edges);
+        assert_eq!(a.edge_set, b.edge_set);
+        assert_eq!(a.forward_adj, b.forward_adj);
+        assert_eq!(a.reverse_adj, b.reverse_adj);
+    }
+
+    #[test]
+    fn init_edges_bulk_matches_extend_edges() {
+        for (n_nodes, n_edges, seed) in [(1, 5, 7), (10, 40, 1), (50, 600, 2), (500, 5000, 3)] {
+            let triples = make_sorted_triples(n_nodes, n_edges, seed);
+            let mut serial = empty_builder_with_n_slots(n_nodes);
+            serial.extend_edges(triples.clone());
+            let mut bulk = empty_builder_with_n_slots(n_nodes);
+            bulk.init_edges_bulk(triples);
+            assert_same_edges(&serial, &bulk);
+        }
+    }
+
+    #[test]
+    fn init_edges_bulk_empty_is_noop() {
+        let mut b = empty_builder_with_n_slots(3);
+        b.init_edges_bulk(Vec::new());
+        assert!(b.edges.is_empty());
+        assert!(b.edge_set.is_empty());
+        assert!(b.forward_adj.iter().all(Vec::is_empty));
+        assert!(b.reverse_adj.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn init_edges_bulk_trailing_isolated_nodes_stay_empty() {
+        // Edges touch only node 0; nodes 1..4 keep their empty lists
+        // (the scatter's final `split_at_mut` window never reaches them).
+        let mut b = empty_builder_with_n_slots(5);
+        b.init_edges_bulk(vec![(0, 0, 0)]);
+        assert_eq!(b.forward_adj[0], vec![(0, 0)]);
+        assert!(b.forward_adj[1..].iter().all(Vec::is_empty));
+        assert!(b.reverse_adj[1..].iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn init_edges_bulk_seeds_edge_set_for_later_extend() {
+        // A later extend_edges (the pass-3 / plugin path) must dedup
+        // against the bulk-initialized edge_set.
+        let mut b = empty_builder_with_n_slots(3);
+        b.init_edges_bulk(vec![(0, 1, 0), (1, 2, 0)]);
+        b.extend_edges(vec![(0, 1, 0), (2, 0, 0)]);
+        assert_eq!(b.edges, vec![(0, 1, 0), (1, 2, 0), (2, 0, 0)]);
+        assert_eq!(b.forward_adj[0], vec![(1, 0)]);
     }
 
     #[test]
