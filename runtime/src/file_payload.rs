@@ -7,20 +7,15 @@
 //! * the per-file walk runs in parallel via salsa's lock-free worker
 //!   coordination (the same machinery that already gives `prewarm_file`
 //!   16k files/sec);
-//! * cross-file calls — e.g. `file_to_edges(A)` looking up a target
-//!   `Definition` in `B` via `file_to_nodes(B)` — are memoized for free
-//!   (`returns(ref)` returns a borrow straight into salsa's storage,
-//!   no clone).
+//! * cross-file calls — e.g. the assembly pass's `resolve_member`
+//!   looking up a target `Definition` in `B` via `file_to_nodes(B)` —
+//!   are memoized for free (`returns(ref)` returns a borrow straight
+//!   into salsa's storage, no clone).
 //!
 //! Pattern cribbed from `function_known_decorators` in
 //! `vendor/ruff/crates/ty_python_semantic/src/types/infer.rs`, which is
-//! the closest analogue (tracked fn, `'db`-lifetimed return, salsa::Update
-//! derive on the carrier struct).
-//!
-//! This module DOES NOT yet replace `ingest_decls` — the existing
-//! pipeline still runs. The function is wired into the crate but has
-//! no callers; landing it first lets us validate the salsa macro
-//! pattern + the `NodeData` shape before the driver swap.
+//! the closest analogue (tracked fn, salsa::Update derive on the
+//! carrier struct).
 
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
@@ -30,7 +25,7 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::HashMap;
-use ty_module_resolver::{resolve_module, ModuleName};
+use ty_module_resolver::resolve_module;
 use ty_project::Db as ProjectDb;
 use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
 use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
@@ -46,10 +41,11 @@ use crate::helpers::{
 use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 
 /// Stable handle for a graph node, used as the public identity across
-/// the fan-out pipeline. Edge endpoints in `file_to_edges` are
-/// `(NodeRef, NodeRef, flags)`; the assembly pass translates each
-/// `NodeRef` to its final `u32` graph index after all per-file
-/// payloads are collected.
+/// the fan-out pipeline. Cross-file resolution outputs
+/// ([`crate::refspec::ResolvedNode`], `walk_exports_chain`) name nodes
+/// by `NodeRef`; the assembly pass translates each `NodeRef` to its
+/// final graph index via `ref_to_global` after all per-file payloads
+/// are collected.
 ///
 /// `NodeRef::Def` covers every binding ty enumerates as a `Definition`,
 /// keyed by an owned [`DeclKey`] (`(File, ScopedPlaceId, name_range)`)
@@ -61,14 +57,15 @@ use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 /// `NodeRef::Module` covers the synthetic `kind="module"` node per
 /// file — `File` is itself a salsa input ingredient, so its handle is
 /// stable and `Hash + Eq + Copy`.
-/// `NodeRef::External` covers the synthetic `[external dist] X` /
-/// `[external file] X` site-packages nodes via a globally-interned
-/// `ExternalKey` — same fqname produces the same key, dedup is free.
+///
+/// Synthetic `[external dist] X` / `[external file] X` nodes have no
+/// `NodeRef`: they only ever appear as resolution *outputs*
+/// ([`crate::refspec::ResolvedNode::External`]) and are interned
+/// directly into the builder by the assembly pass.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
-pub(crate) enum NodeRef<'db> {
+pub(crate) enum NodeRef {
     Def(DeclKey),
     Module(File),
-    External(ExternalKey<'db>),
     /// The kept `*<module>` node for a `from <module> import *` statement.
     /// Keyed on `(file, <star-token range>)` rather than a ty def: the
     /// per-name `StarImport` defs back the individual `STAR_REEXPORT`
@@ -95,35 +92,6 @@ pub(crate) fn def_key<'db>(
         range_key(def.kind(db).target_range(parsed)),
     )
 }
-
-/// Globally-interned synthetic external node identity. Same `fqname`
-/// → same key → same final graph node, regardless of which file
-/// emitted the edge.
-///
-/// Only site-packages targets mint an `ExternalKey`; the fqname
-/// conventions:
-///
-/// * `[external dist] X` — module resolves to a site-packages dist;
-///   `X` is the PEP 503 canonical dist name (via `external_fqname_for`).
-/// * `[external file] X` — a site-packages file with no owning dist;
-///   `X` is the top-level module name.
-///
-/// `file` is the resolved target's site-packages `File`, carried so the
-/// assembled `kind="external"` node can re-derive its path (for codemod
-/// / scoping exclusion) without re-resolving. Several keys may share an
-/// fqname with different files — e.g. two submodules of one dist;
-/// assembly dedups by fqname and keeps the first (path-sorted) file.
-/// Stdlib targets and genuinely-unresolved imports mint no `ExternalKey`:
-/// stdlib stays silent, and an unresolved import's alias node carries
-/// `NodeFlags::UNRESOLVED`.
-#[salsa::interned(debug)]
-pub(crate) struct ExternalKey<'db> {
-    pub(crate) fqname: String,
-    pub(crate) file: File,
-}
-
-// Salsa tracks the interned heap separately; report 0 from GetSize.
-impl get_size2::GetSize for ExternalKey<'_> {}
 
 /// Project-wide PEP 503 distribution lookup, salsa-tracked so it's
 /// memoized + accessible from per-file salsa-tracked queries. Wraps
@@ -212,8 +180,7 @@ pub(crate) enum NodeKind {
 }
 
 impl NodeKind {
-    // Used by the assembly pass that converts `NodeData → Py<SymbolNode>`
-    // once `file_to_edges` lands and the driver is swapped.
+    // Used by the assembly pass that converts `NodeData → Py<SymbolNode>`.
     #[allow(dead_code)]
     pub(crate) fn as_static_str(self) -> &'static str {
         match self {
@@ -244,7 +211,7 @@ impl NodeKind {
 /// Per-alias import metadata. Same fields as the python-facing
 /// `Import` pyclass, but without the `Py` envelope so it can live
 /// inside `NodeData`.
-#[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
 pub(crate) struct ImportPayload {
     pub(crate) module: String,
     pub(crate) decl: Option<String>,
@@ -294,10 +261,10 @@ pub(crate) struct ImportPayload {
 ///   in `nodes` and are excluded from `exports_by_name` so cross-module
 ///   `from mod import f` resolves to the impl only.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
-pub(crate) struct FileNodes<'db> {
+pub(crate) struct FileNodes {
     pub(crate) nodes: Box<[NodeData]>,
-    pub(crate) refs: Box<[NodeRef<'db>]>,
-    pub(crate) ref_to_local: FxHashMap<NodeRef<'db>, u32>,
+    pub(crate) refs: Box<[NodeRef]>,
+    pub(crate) ref_to_local: FxHashMap<NodeRef, u32>,
     pub(crate) exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>>,
     pub(crate) star_reexports: FxHashMap<String, String>,
     pub(crate) class_bases: Vec<ClassBaseEntry>,
@@ -390,7 +357,7 @@ fn is_overload_decorator(
 /// in place. The flag set is otherwise the same as today's
 /// `ingest_decls`.
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
-pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNodes<'db> {
+pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     let parsed = parsed_module(db, file).load(db);
     let source = source_text(db, file);
     let line_index = line_index(db, file);
@@ -402,12 +369,12 @@ pub(crate) fn file_to_nodes<'db>(db: &'db dyn ProjectDb, file: File) -> FileNode
     let (msl, msc, mel, mec) = position(&line_index, &source, parsed.syntax().range);
 
     let mut nodes: Vec<NodeData> = Vec::new();
-    let mut refs: Vec<NodeRef<'db>> = Vec::new();
-    let mut ref_to_local: FxHashMap<NodeRef<'db>, u32> = FxHashMap::default();
+    let mut refs: Vec<NodeRef> = Vec::new();
+    let mut ref_to_local: FxHashMap<NodeRef, u32> = FxHashMap::default();
 
     // Index 0: the synthetic module node. Anchors reachability for
-    // every per-file decl via the `decl → module` edge `file_to_edges`
-    // will emit.
+    // every per-file decl via the `decl → module` anchor edge the
+    // assembly pass synthesizes.
     nodes.push(NodeData {
         fqname: module_fqname.clone(),
         kind: NodeKind::Module,
@@ -780,13 +747,13 @@ fn build_class_bases(
 /// star alias for `g`; we resolve B → file, look up `g` there, and
 /// recurse. Stops on a decl, on a non-star import, on a missed
 /// lookup (yields nothing past it), or on a cycle.
-pub(crate) fn walk_exports_chain<'db>(
-    db: &'db dyn ProjectDb,
+pub(crate) fn walk_exports_chain(
+    db: &dyn ProjectDb,
     target_file: File,
     symbol_name: &str,
-) -> Vec<NodeRef<'db>> {
+) -> Vec<NodeRef> {
     let mut seen: std::collections::HashSet<(File, String)> = std::collections::HashSet::new();
-    let mut out: Vec<NodeRef<'db>> = Vec::new();
+    let mut out: Vec<NodeRef> = Vec::new();
     let mut stack: Vec<(File, String)> = vec![(target_file, symbol_name.to_string())];
     while let Some(key) = stack.pop() {
         if !seen.insert(key.clone()) {
@@ -855,299 +822,30 @@ pub(crate) fn import_payload_for_pure<'db>(
 }
 
 // ---------------------------------------------------------------------------
-// file_to_edges
+// (file_to_edges removed)
+//
+// The old `file_to_edges` query — import-alias upstream edges, decl →
+// module anchors, overload anchors, the module-hierarchy edge — was
+// folded into the combined `file_to_refspecs` walk
+// (`crate::file_ref_edges`) and the assembly pass:
+//
+// * import-alias upstream resolution is now a `Member(Binding)`
+//   [`crate::refspec::RefSpec`] resolved project-wide at assembly
+//   (`crate::refspec::resolve_binding` carries the `_handle_fromlist`
+//   namespace-vs-submodule disambiguation and the unresolved-alias
+//   flagging that lived here);
+// * decl → module anchors, overload anchors, and the submodule →
+//   parent-package hierarchy edge are synthesized by the assembly
+//   pass straight from `FileNodes` / [`parent_module_file`], since
+//   they're fully derivable and would only bloat the payload.
 // ---------------------------------------------------------------------------
-
-/// Salsa-tracked output of [`file_to_edges`]. One entry per
-/// `(src, dst, flags)` edge originating in this file. `FxHashSet` so
-/// duplicate emissions within the file (a name used twice resolving
-/// to the same target) collapse to a single entry — matching today's
-/// `builder.edge_set` behavior.
-///
-/// Edges in this set are *unresolved-to-graph-idx*: endpoints are
-/// `NodeRef<'db>` handles, not `u32` graph indices. The assembly pass
-/// translates each `NodeRef` to its final `u32` after all per-file
-/// payloads are collected.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
-pub(crate) struct FileEdges<'db> {
-    pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
-    /// Import-alias nodes in this file whose upstream module did not
-    /// resolve. The assembly pass ORs `NodeFlags::UNRESOLVED` into each
-    /// (in place of the old `[unresolved] X` sink edge).
-    pub(crate) unresolved_aliases: FxHashSet<NodeRef<'db>>,
-}
-
-/// Per-file edge emission. Salsa-tracked so the per-file walk
-/// parallelizes via salsa's worker coordination, and cross-file
-/// lookups (`file_to_nodes(target_file)`) are memoized for free.
-///
-/// Emits today:
-///
-/// * `Def → Module(file)` for every per-file decl — the reachability
-///   anchor that wires a file's decls to its module node.
-/// * `Module(file) → Module(parent_file)` when the file has a parent
-///   package whose `__init__.py` resolves into the project. Mirrors
-///   today's `emit_module_hierarchy`.
-/// * `Def(alias) → Module(target_file)` and (for from-imports)
-///   `Def(alias) → Def(target_decl)` for each import binding whose
-///   upstream resolves to a project file. The `target_decl` lookup
-///   goes through `file_to_nodes(target_file).exports_by_name`,
-///   which is the "for free" salsa memoization this whole
-///   refactor is built around.
-///
-/// Deliberately deferred (each is a self-contained follow-up):
-///
-/// * **External nodes.** `[external dist] X` / `[stdlib] X` /
-///   `[unresolved] X` need `NodeRef::External` + a `#[salsa::interned]`
-///   key. Imports that resolve outside the project are currently
-///   *skipped*, not redirected to external nodes.
-/// * **Attribute-chain edges.** `import a.b.c; a.b.c.f()` today
-///   emits parallel edges to every chain segment. This cut emits
-///   only the alias → `a` edge.
-/// * **Per-statement sibling-to-submodule edges.** `from .submod
-///   import X` in an `__init__.py` mints both an `X` alias and a
-///   `submod` submodule alias; today the X alias gets a sibling
-///   edge to the submodule alias so they stay alive together.
-/// * **Reference edges (Phase 3's `RefCollector` work).** `use →
-///   alias` and `use → upstream` from every Name reference in every
-///   owned expression. This is the biggest deferred chunk — the
-///   refactor of the ~1k-line `RefCollector` into a per-file
-///   producer is its own follow-up.
-/// * **Dynamic import edges** (`__import__('x')` /
-///   `importlib.import_module('x')`).
-/// * **Dead-branch edge flag.** Edges originating inside `if False:`
-///   / post-`return` blocks need `EdgeFlags::DEAD_BRANCH` set; needs
-///   `dead_ranges` on the payload.
-#[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
-pub(crate) fn file_to_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileEdges<'db> {
-    let self_nodes = file_to_nodes(db, file);
-    let module_ref = NodeRef::Module(file);
-    let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)> = FxHashSet::default();
-    let mut unresolved_aliases: FxHashSet<NodeRef<'db>> = FxHashSet::default();
-
-    // 1. Decl → module anchor edges. Every per-file def points at the
-    //    module node so reachability seeded from the module covers all
-    //    its decls. `refs[0]` is the module itself; skip it.
-    for &node_ref in self_nodes.refs.iter().skip(1) {
-        edges.insert((node_ref, module_ref, 0));
-    }
-
-    // 1a. `impl → stub` anchor edges for in-file `@typing.overload`
-    //     groups. Lets reachability propagate from a live impl to its
-    //     stubs and lets the codemod drop a dead impl's stubs in the
-    //     same pass. (`NodeData::is_overload` on the stub additionally
-    //     excludes it from cross-module `from mod import f` lookups.)
-    for &(impl_local, stub_local) in self_nodes.overload_anchors.iter() {
-        let impl_ref = self_nodes.refs[impl_local as usize];
-        let stub_ref = self_nodes.refs[stub_local as usize];
-        edges.insert((impl_ref, stub_ref, 0));
-    }
-
-    // 2. Submodule → parent module hierarchy edge. Mirrors today's
-    //    `emit_module_hierarchy`. Skipped when the parent doesn't
-    //    resolve into the project (top-level package, or sibling
-    //    outside the project root).
-    if let Some(parent_file) = parent_module_file(db, file) {
-        edges.insert((module_ref, NodeRef::Module(parent_file), 0));
-    }
-
-    // 3. Import alias edges. Walk each kind="import" Definition in
-    //    this file's global scope, resolve its upstream module via
-    //    `resolve_module`, and emit:
-    //
-    //    * `Def(alias) → Module(target_file)` always (for `import M`
-    //       and for the module-side reachability anchor of `from M
-    //       import x`).
-    //    * `Def(alias) → Def(target_decl)` for from-imports whose
-    //      `decl_name` resolves in the target's `exports_by_name`.
-    //
-    //    * `Def(alias) → External(key)` for site-packages targets.
-    //
-    //    Stdlib and genuinely-unresolved targets emit no edge here
-    //    (stdlib stays silent; unresolved aliases are flagged instead).
-    let index = semantic_index(db, file);
-    let global = FileScopeId::global();
-    let use_def_map = index.use_def_map(global);
-    let parsed = parsed_module(db, file).load(db);
-
-    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
-        let DefinitionState::Defined(def) = state else {
-            continue;
-        };
-        if def.file(db) != file || def.file_scope(db) != global {
-            continue;
-        }
-        let mut alias_ref = NodeRef::Def(def_key(db, def, &parsed));
-        // Skip Definitions that file_to_nodes didn't mint (non-symbol
-        // places, unsupported kinds). Keeps the edge set internally
-        // consistent with the node set.
-        if !self_nodes.ref_to_local.contains_key(&alias_ref) {
-            continue;
-        }
-
-        let kind = def.kind(db);
-        if !kind.is_import() {
-            continue;
-        }
-
-        let (target_module_str, decl_name): (String, Option<String>) = match kind {
-            DefinitionKind::Import(k) => {
-                // `import a.b.c` binds `a` locally. Resolving `a.b.c`
-                // here would target the deepest module; ty's runtime
-                // semantics bind only `a`. We resolve to `a` for the
-                // first-cut module-level edge. Full chain edges
-                // (parallel edges to `a.b` and `a.b.c`) are deferred.
-                let alias = k.alias(&parsed);
-                (alias.name.id.as_str().to_string(), None)
-            }
-            DefinitionKind::ImportFrom(k) => {
-                let module = from_module_string(db, file, k.import(&parsed));
-                let alias = k.alias(&parsed);
-                (module, Some(alias.name.id.as_str().to_string()))
-            }
-            DefinitionKind::ImportFromSubmodule(k) => {
-                // ImportFromSubmodule binds a submodule attribute on
-                // the containing package as a side effect of a
-                // `from X import …` statement inside __init__.py.
-                // The bound NAME (k.module) is the attribute, but the
-                // TARGET module is the from-clause itself — for
-                // `from pkg._internal import *` in pkg/__init__.py
-                // the side-effect attribute `_internal` on pkg
-                // points at the file `pkg._internal`, not at
-                // `pkg._internal._internal`. The from-clause module
-                // is what resolves.
-                let target = from_module_string(db, file, k.import(&parsed));
-                (target, None)
-            }
-            DefinitionKind::StarImport(k) => {
-                // `from X import *`. Each per-name `STAR_REEXPORT` node
-                // edges into the kept statement-level `*X` node, which in
-                // turn carries the module-level edge (`*X → Module(X)`).
-                // Rebind `alias_ref` to that `*X` node so the generic
-                // resolution below (stdlib / external / unresolved
-                // handling) emits the upstream edge from `*X`, not from
-                // the per-name node. Uses of star-bound names land on the
-                // per-name node (ty's use-def chain distinguishes them);
-                // `from <here> import name` lookups resolve per-name via
-                // walk_exports_chain.
-                let module = from_module_string(db, file, k.import(&parsed));
-                let star_ref = NodeRef::StarStmt(file, range_key(kind.target_range(&parsed)));
-                edges.insert((alias_ref, star_ref, 0));
-                alias_ref = star_ref;
-                (module, None)
-            }
-            _ => continue,
-        };
-
-        if target_module_str.is_empty() {
-            continue;
-        }
-
-        // Submodule disambiguation: `from p import functions` where
-        // `p.functions` is itself a submodule should point at the
-        // submodule file, not at `p` with a decl lookup. BUT: per
-        // CPython's `_handle_fromlist`, namespace bindings WIN over
-        // submodule lookups when both exist (e.g. `q = 42` in
-        // p/__init__.py with a sibling p/q.py — the int binds, not
-        // the submodule). Check namespace first; only switch to
-        // submodule when the namespace doesn't already export decl.
-        let (target_module_str, decl_name) = if let Some(decl) = &decl_name {
-            let candidate = format!("{target_module_str}.{decl}");
-            if crate::ingest::module_name_resolves(&candidate, file, db) {
-                let namespace_has_decl = ModuleName::new(&target_module_str)
-                    .and_then(|mn| resolve_module(db, file, &mn))
-                    .and_then(|m| m.file(db))
-                    .map(|f| {
-                        let nodes = file_to_nodes(db, f);
-                        nodes.exports_by_name.contains_key(decl)
-                    })
-                    .unwrap_or(false);
-                if namespace_has_decl {
-                    (target_module_str, Some(decl.clone()))
-                } else {
-                    (candidate, None)
-                }
-            } else {
-                (target_module_str, Some(decl.clone()))
-            }
-        } else {
-            (target_module_str, decl_name)
-        };
-        // Bad module name (relative-dots overflow, etc.), a module that
-        // doesn't resolve, or a resolved module with no backing file:
-        // flag the alias `NodeFlags::UNRESOLVED` (the assembly pass ORs
-        // it in) rather than minting an `[unresolved] X` sink.
-        let Some(target_module_name) = ModuleName::new(&target_module_str) else {
-            unresolved_aliases.insert(alias_ref);
-            continue;
-        };
-        let Some(target_module) = resolve_module(db, file, &target_module_name) else {
-            unresolved_aliases.insert(alias_ref);
-            continue;
-        };
-        let Some(target_file) = target_module.file(db) else {
-            unresolved_aliases.insert(alias_ref);
-            continue;
-        };
-        let top_level = target_module_str
-            .split('.')
-            .next()
-            .unwrap_or(&target_module_str);
-        // Stdlib targets emit no node: an unused stdlib import is still
-        // caught dead via its alias's zero in-edge count, so a stdlib
-        // endpoint would be pure noise.
-        if target_module
-            .search_path(db)
-            .is_some_and(|sp| sp.is_standard_library())
-        {
-            continue;
-        }
-        // Non-first-party (site-packages) → External node keyed on the
-        // PEP 503 dist name (or top-level module name) with the resolved
-        // target file (its path is re-derived at assembly).
-        if target_module
-            .search_path(db)
-            .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
-        {
-            let fqname = external_fqname_for(db, target_file, top_level);
-            let key = ExternalKey::new(db, fqname, target_file);
-            edges.insert((alias_ref, NodeRef::External(key), 0));
-            continue;
-        }
-        // Self-imports (re-importing from the same file) don't
-        // produce meaningful cross-file edges — skip to avoid the
-        // trivial alias → self-module cycle.
-        if target_file == file {
-            continue;
-        }
-
-        // Module-level edge.
-        edges.insert((alias_ref, NodeRef::Module(target_file), 0));
-
-        // Named-decl edge for from-imports. Walks the star-reexport
-        // chain so `from A import g` where A re-exports from B lands
-        // on B's real `g` rather than A's star alias node. salsa
-        // memoizes each file's payload on the way through, so the
-        // chain walk is hashmap lookups + a `seen` set.
-        if let Some(decl_name) = decl_name {
-            for target_ref in walk_exports_chain(db, target_file, &decl_name) {
-                edges.insert((alias_ref, target_ref, 0));
-            }
-        }
-    }
-
-    FileEdges {
-        edges,
-        unresolved_aliases,
-    }
-}
 
 /// Resolve a file's parent module to its `File` handle, when the
 /// parent's `__init__.py` is itself in the project. Mirrors today's
 /// `emit_module_hierarchy::parent_module_edge`. Returns `None` for
 /// top-level packages (no parent) and for parents that live outside
 /// the project (the cross-file hierarchy edge has nowhere to land).
-fn parent_module_file(db: &dyn ProjectDb, file: File) -> Option<File> {
+pub(crate) fn parent_module_file(db: &dyn ProjectDb, file: File) -> Option<File> {
     let module = crate::helpers::canonical_module_for_file(db, file)?;
     let parent_name = module.name(db).parent()?;
     let parent_module = resolve_module(db, file, &parent_name)?;

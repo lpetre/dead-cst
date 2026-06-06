@@ -32,12 +32,14 @@ use crate::file_extraction::{
     file_extraction, imports_local_from_facts, match_callee_chain, match_callee_descriptor,
     CallSiteFact, FileExtraction,
 };
-use crate::file_payload::{file_to_edges, file_to_nodes, FileEdges, FileNodes, NodeKind, NodeRef};
-use crate::file_ref_edges::{file_to_ref_edges, FileRefEdges};
+use crate::file_payload::{
+    file_to_nodes, parent_module_file, ClassBaseSpec, FileNodes, NodeKind, NodeRef,
+};
+use crate::file_ref_edges::{file_to_refspecs, FileRefSpecs};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
-    file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_base_spec,
+    file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_member_def,
     CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT, NODE_FLAG_UNRESOLVED,
 };
 use crate::ingest::emit_visitor_warning;
@@ -46,8 +48,12 @@ use crate::progress::{
     PHASE_PLUGINS, PHASE_POPULATE,
 };
 use crate::query::_path_re_matches;
+use crate::refspec::{
+    resolve_dynamic, resolve_member, DynamicRef, MemberRef, MemberRole, ResolvedNode, Target,
+};
 use crate::topic_registry::TopicRegistry;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 /// A ty-backed analysis project with explicitly-injected configuration.
 #[pyclass(unsendable)]
@@ -320,10 +326,10 @@ pub(crate) fn build_project_graph(
     // separate parallel pass was a no-op at every corpus size we
     // measured. See PR #226 follow-up for the A/B data.)
 
-    // Parallel pre-populate: run file_to_nodes, file_to_edges, and
-    // file_to_ref_edges as #[salsa::tracked] queries across all
+    // Parallel pre-populate: run file_to_nodes and file_to_refspecs
+    // as #[salsa::tracked] queries across all
     // project files. Workers are pure-rust (GIL released via
-    // py.allow_threads). Each file's three queries are attached on
+    // py.allow_threads). Each file's queries are attached on
     // whatever rayon worker thread picks them up — work-stealing
     // distributes load across cores; salsa-tracked machinery owns
     // the lock-free coordination between workers. The salsa cache
@@ -419,8 +425,7 @@ pub(crate) fn build_project_graph(
                                     file_to_nodes(local_db, file).nodes.len(),
                                     Ordering::Relaxed,
                                 );
-                                let _ = file_to_edges(local_db, file);
-                                let _ = file_to_ref_edges(local_db, file);
+                                let _ = file_to_refspecs(local_db, file);
                                 // Owned per-file facts for the project-wide
                                 // plugin queries. Warmed here, while the AST
                                 // is live, so the queries below run as cache
@@ -532,7 +537,7 @@ pub(crate) fn build_project_graph(
     let ClassHierarchyIndices {
         children_by_node,
         external_base_children,
-    } = build_class_hierarchy_indices(db, &project_files, &class_by_selection);
+    } = build_class_hierarchy_indices(py, db, &project_files, &class_by_selection);
     let t_hierarchy_elapsed = t_hierarchy.elapsed();
     if timing {
         eprintln!(
@@ -619,8 +624,8 @@ struct AssembledGraph {
 }
 
 /// Fan-in pass that converts the salsa-tracked per-file payloads
-/// (`file_to_nodes` / `file_to_edges` / `file_to_ref_edges`) into a
-/// fully-populated `GraphBuilder`.
+/// (`file_to_nodes` / `file_to_refspecs`) into a fully-populated
+/// `GraphBuilder`.
 ///
 /// Three sub-passes:
 ///
@@ -635,18 +640,22 @@ struct AssembledGraph {
 ///    for `.pyi` decls whose runtime twin doesn't expose the same
 ///    name.
 ///
-/// 2. **Edge translation** — walk each file's `FileEdges` and
-///    `FileRefEdges`, translate every `NodeRef` to its `usize`
-///    index via the map. Synthetic External nodes get lazily
-///    minted as encountered. Edges whose endpoint isn't recognised
-///    (e.g. a Definition in a non-project file that ty's resolver
-///    reached but we didn't enumerate) silently drop.
+/// 2. **Spec resolution + edge translation** — resolve the
+///    project-wide unique `Member` / `Dynamic` refs on rayon
+///    workers (memoized per `(ref, anchor directory)`), then
+///    translate each file's `RefSpec`s to `(usize, usize, u8)`
+///    triples. Synthetic External nodes mint during the memo fold.
+///    Edges whose endpoint isn't recognised (e.g. a Definition in a
+///    non-project file that ty's resolver reached but we didn't
+///    enumerate) silently drop. Structural edges (decl → module
+///    anchors, overload anchors, module hierarchy) are synthesized
+///    here straight from the node payloads.
 ///
 /// 3. **Peer .pyi/.py edges** — for each peer pair, walk both
 ///    files' `exports_by_name` and emit `pyi_decl -> py_decl`
 ///    edges for any name present in both.
 ///
-/// Warnings buffered in each `FileRefEdges.warnings` are flushed to
+/// Warnings buffered in each `FileRefSpecs.warnings` are flushed to
 /// the `dead_cst._visitor` Python logger at the end — once per
 /// warning, on the main thread, with the GIL we already hold.
 #[allow(clippy::too_many_arguments)]
@@ -686,7 +695,7 @@ fn assemble_graph<'db>(
         FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
     let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
         FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
-    let mut ref_to_global: FxHashMap<NodeRef<'db>, usize> =
+    let mut ref_to_global: FxHashMap<NodeRef, usize> =
         FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
     let mut local_to_global: FxHashMap<(File, u32), usize> =
         FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
@@ -723,14 +732,14 @@ fn assemble_graph<'db>(
         /// `[base, base + payload.nodes.len())`; each local ref lands
         /// at `base + local_idx`.
         base: usize,
-        payload: &'db FileNodes<'db>,
+        payload: &'db FileNodes,
         path_str: String,
         is_stub: bool,
         /// Stub-only ENTRYPOINT context: if this is a .pyi without a
         /// .py twin (`None`), every decl needs ENTRYPOINT. If it has a
         /// twin, only decls whose name isn't in the twin's exports
         /// need it.
-        twin_payload: Option<&'db FileNodes<'db>>,
+        twin_payload: Option<&'db FileNodes>,
     }
     let mut mints: Vec<FileMint<'db>> = Vec::with_capacity(project_files.len());
     for (file_pos, &file) in project_files.iter().enumerate() {
@@ -885,15 +894,6 @@ fn assemble_graph<'db>(
                                                 // `local_to_global` folds already
                                                 // wired it up.
                                             }
-                                            NodeRef::External(_) => {
-                                                // External NodeRefs never appear in
-                                                // FileNodes.refs; they're only
-                                                // emitted as edge endpoints. This
-                                                // branch is unreachable in practice
-                                                // but kept exhaustive so a future
-                                                // variant addition fails loudly
-                                                // instead of silently dropping.
-                                            }
                                         }
                                     }
                                 }
@@ -925,127 +925,249 @@ fn assemble_graph<'db>(
         eprintln!("[dead-cst-timing] pass1={:?}", t_pass1_start.elapsed());
     }
 
-    // Pass 2: edge translation.
+    // Pass 2: reference-spec resolution + edge translation.
     //
-    // The pipeline is three sub-phases, designed so the heavy
-    // FxHashMap-probe loop runs without the GIL on rayon workers:
+    // The per-file payloads are file-local `RefSpec`s (see
+    // `crate::refspec`), so this pass owns ALL cross-file resolution.
+    // Four sub-phases:
     //
-    //   2a. Serial fetch of every file's salsa-tracked `FileEdges` /
-    //       `FileRefEdges`. Salsa returns `&'db` refs valid for the
-    //       whole assemble call; we stash them in a `Vec`.
-    //   2b. Serial pre-mint of every `NodeRef::External` endpoint
-    //       referenced by any payload. This pulls the fqname out of
-    //       salsa under the GIL and interns the external node so
-    //       the parallel phase only has to read `ref_to_global`.
-    //   2c. `Python::allow_threads` + `par_iter().flat_map(...)` to
-    //       translate every `(NodeRef, NodeRef, flags)` triple into
-    //       `(usize, usize, u8)` via two `ref_to_global` probes.
-    //       Drops endpoints whose owning file wasn't enumerated.
+    //   2a. Serial fetch of every file's salsa-tracked `FileRefSpecs`
+    //       payload, plus the per-file anchor-directory ids that key
+    //       the resolution memo. ty's `resolve_module` is anchor-
+    //       sensitive only through its desperate-resolution fallback,
+    //       which depends on the importing file's ancestor directories
+    //       — so files sharing a directory share memo entries.
+    //   2b. Gather the project-wide unique `(member, dir)` /
+    //       `(dynamic, dir)` resolution keys (sorted, for determinism)
+    //       and resolve them on rayon workers, each against its own
+    //       salsa db snapshot — parallel salsa reads, the same pattern
+    //       the populate fan-out uses. Hot imports repeated across a
+    //       directory (or project-wide, one entry per directory)
+    //       resolve once, not once per use site.
+    //   2c. Serial fold of the resolution results into idx-level memo
+    //       maps: translate each `ResolvedNode` through
+    //       `ref_to_global`, interning External nodes on first
+    //       encounter (sorted-key order keeps their indices
+    //       deterministic), and stamp `NodeFlags::UNRESOLVED` on
+    //       aliases whose `Binding` resolution failed (in place of the
+    //       old `[unresolved] X` sink node).
+    //   2d. `Python::allow_threads` + parallel per-file translation of
+    //       every `RefSpec` into `(usize, usize, u8)` triples — pure
+    //       hashmap probes against the memo maps, no salsa access —
+    //       chained with the structural edges synthesized from the
+    //       node payloads (decl → module anchors, overload impl → stub
+    //       anchors, submodule → parent-package hierarchy). Sort +
+    //       dedup + bulk-init the edge storage via `init_edges_bulk`.
     //
-    // After the parallel phase, sort + dedup the triple list and
-    // bulk-initialize the edge storage via `init_edges_bulk` — the
-    // builder has no edges yet, so the adjacency lists are scattered
-    // from the sorted triples on rayon workers instead of looping
-    // `extend_edges`'s serial per-edge probe.
-    //
-    // Skipped endpoints reference Definitions in non-project files.
+    // Dropped triples reference Definitions in non-project files.
 
     let t_pass2_start = std::time::Instant::now();
 
     // 2a: serial fetch. Hold borrows for the whole pass.
-    let mut edge_payloads: Vec<&FileEdges<'db>> = Vec::with_capacity(project_files.len());
-    let mut ref_edge_payloads: Vec<&FileRefEdges<'db>> = Vec::with_capacity(project_files.len());
+    let mut spec_payloads: Vec<&FileRefSpecs> = Vec::with_capacity(project_files.len());
     for &file in project_files {
-        edge_payloads.push(file_to_edges(db, file));
-        ref_edge_payloads.push(file_to_ref_edges(db, file));
+        spec_payloads.push(file_to_refspecs(db, file));
     }
 
-    // Stamp `NodeFlags::UNRESOLVED` on every import alias whose upstream
-    // module didn't resolve — the flag rides the alias node directly,
-    // in place of the old `[unresolved] X` sink node. Pass 1 has
-    // fully populated `ref_to_global`, so every in-project alias
-    // resolves; a ref with no global node is skipped.
-    for payload in &edge_payloads {
-        for r in &payload.unresolved_aliases {
-            if let Some(&idx) = ref_to_global.get(r) {
-                builder.nodes[idx].flags |= NODE_FLAG_UNRESOLVED;
+    // Per-file anchor-directory ids. `mints` is path-sorted, so the
+    // first file seen for a directory is deterministic; that file is
+    // the directory's representative resolution anchor.
+    let mut dir_to_id: FxHashMap<&str, u32> = FxHashMap::default();
+    let mut dir_anchors: Vec<File> = Vec::new();
+    let mut dir_ids: Vec<u32> = Vec::with_capacity(project_files.len());
+    for mint in &mints {
+        let dir = match mint.path_str.rsplit_once(['/', '\\']) {
+            Some((dir, _)) => dir,
+            None => "",
+        };
+        let id = *dir_to_id.entry(dir).or_insert_with(|| {
+            dir_anchors.push(mint.file);
+            (dir_anchors.len() - 1) as u32
+        });
+        dir_ids.push(id);
+    }
+
+    // 2b: gather unique resolution keys. Keys borrow straight out of
+    // the payloads (alive for the whole pass), so gathering is
+    // clone-free.
+    let mut member_work: Vec<(&MemberRef, u32)> = {
+        let mut seen: FxHashSet<(&MemberRef, u32)> = FxHashSet::default();
+        for (pos, payload) in spec_payloads.iter().enumerate() {
+            for spec in payload.specs.iter() {
+                if let Target::Member(m) = &spec.target {
+                    seen.insert((m, dir_ids[pos]));
+                }
+            }
+        }
+        seen.into_iter().collect()
+    };
+    member_work.sort_unstable();
+    let mut dynamic_work: Vec<(&DynamicRef, u32)> = {
+        let mut seen: FxHashSet<(&DynamicRef, u32)> = FxHashSet::default();
+        for (pos, payload) in spec_payloads.iter().enumerate() {
+            for spec in payload.specs.iter() {
+                if let Target::Dynamic(d) = &spec.target {
+                    seen.insert((d, dir_ids[pos]));
+                }
+            }
+        }
+        seen.into_iter().collect()
+    };
+    dynamic_work.sort_unstable();
+
+    let dir_anchors_ref = &dir_anchors;
+    let member_results: Vec<crate::refspec::ResolvedMember> =
+        resolve_chunked(py, db, &member_work, |ldb, &(m, dir)| {
+            resolve_member(ldb, dir_anchors_ref[dir as usize], m)
+        });
+    let dynamic_results: Vec<SmallVec<[ResolvedNode; 4]>> =
+        resolve_chunked(py, db, &dynamic_work, |ldb, &(d, dir)| {
+            resolve_dynamic(ldb, dir_anchors_ref[dir as usize], d)
+        });
+
+    // 2c: serial fold into idx-level memos. External nodes intern on
+    // first encounter, in sorted-key order — deterministic indices.
+    struct MemberSlot {
+        idxs: SmallVec<[usize; 4]>,
+        unresolved: bool,
+        start_file: Option<File>,
+    }
+    let mut member_memo: FxHashMap<(&MemberRef, u32), MemberSlot> =
+        FxHashMap::with_capacity_and_hasher(member_work.len(), Default::default());
+    for (&(m, dir), res) in member_work.iter().zip(&member_results) {
+        let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
+        for node in &res.targets {
+            if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
+                idxs.push(idx);
+            }
+        }
+        member_memo.insert(
+            (m, dir),
+            MemberSlot {
+                idxs,
+                unresolved: res.unresolved,
+                start_file: res.start_file,
+            },
+        );
+    }
+    let mut dynamic_memo: FxHashMap<(&DynamicRef, u32), SmallVec<[usize; 4]>> =
+        FxHashMap::with_capacity_and_hasher(dynamic_work.len(), Default::default());
+    for (&(d, dir), nodes) in dynamic_work.iter().zip(&dynamic_results) {
+        let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
+        for node in nodes {
+            if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
+                idxs.push(idx);
+            }
+        }
+        dynamic_memo.insert((d, dir), idxs);
+    }
+
+    // Stamp `NodeFlags::UNRESOLVED` on every import alias whose
+    // upstream module didn't resolve — the flag rides the alias node
+    // directly. Only `Binding`-role refs are eligible (one flag per
+    // alias; a use through it resolves or drops silently).
+    for (pos, payload) in spec_payloads.iter().enumerate() {
+        let dir = dir_ids[pos];
+        let base = node_offsets[pos];
+        for spec in payload.specs.iter() {
+            let Target::Member(m) = &spec.target else {
+                continue;
+            };
+            if !matches!(m.role, MemberRole::Binding) {
+                continue;
+            }
+            if member_memo.get(&(m, dir)).is_some_and(|s| s.unresolved) {
+                builder.nodes[base + spec.src as usize].flags |= NODE_FLAG_UNRESOLVED;
             }
         }
     }
 
-    // 2b: pre-mint External nodes. Walk both payload streams once and
-    // intern every `External` endpoint we haven't seen. Externals dedup
-    // by fqname project-wide, so this is at most `O(distinct externals)`
-    // GIL-bound interns.
-    let mut external_keys: FxHashSet<NodeRef<'db>> = FxHashSet::default();
-    for payload in &edge_payloads {
-        for &(src, dst, _) in &payload.edges {
-            if matches!(src, NodeRef::External(_)) && !ref_to_global.contains_key(&src) {
-                external_keys.insert(src);
-            }
-            if matches!(dst, NodeRef::External(_)) && !ref_to_global.contains_key(&dst) {
-                external_keys.insert(dst);
+    // Structural edges synthesized straight from the node payloads —
+    // deliberately not part of the RefSpec payload since they're fully
+    // derivable: decl → module anchors (every per-file node points at
+    // its module node, `refs[0]`), overload impl → stub anchors, and
+    // the submodule → parent-package hierarchy edge (skipped when the
+    // parent doesn't resolve into the project).
+    let mut structural: Vec<(usize, usize, u8)> = Vec::with_capacity(total_nodes);
+    for mint in &mints {
+        for local in 1..mint.payload.nodes.len() {
+            structural.push((mint.base + local, mint.base, 0));
+        }
+        for &(impl_local, stub_local) in mint.payload.overload_anchors.iter() {
+            structural.push((
+                mint.base + impl_local as usize,
+                mint.base + stub_local as usize,
+                0,
+            ));
+        }
+        if let Some(parent_file) = parent_module_file(db, mint.file) {
+            if let Some(&parent_idx) = module_nodes_by_file.get(&parent_file) {
+                structural.push((mint.base, parent_idx, 0));
             }
         }
-    }
-    for payload in &ref_edge_payloads {
-        for &(src, dst, _) in &payload.edges {
-            if matches!(src, NodeRef::External(_)) && !ref_to_global.contains_key(&src) {
-                external_keys.insert(src);
-            }
-            if matches!(dst, NodeRef::External(_)) && !ref_to_global.contains_key(&dst) {
-                external_keys.insert(dst);
-            }
-        }
-    }
-    // Mint the External nodes in a deterministic order.
-    // `external_keys` is an FxHashSet whose iteration order tracks
-    // the salsa id layout and so varies run-to-run; minting in that
-    // order would hand the externals run-dependent graph indices.
-    // Sort by (fqname, path) — `intern_external` dedups on fqname, so
-    // the first path after the sort wins deterministically, and every
-    // External lands at the same index every run.
-    let mut externals: Vec<(String, String, File, NodeRef<'db>)> = external_keys
-        .into_iter()
-        .filter_map(|r| match r {
-            NodeRef::External(key) => {
-                let file = key.file(db);
-                Some((key.fqname(db).clone(), file_path_string(db, file), file, r))
-            }
-            _ => None,
-        })
-        .collect();
-    externals.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    for (fqname, path, file, r) in externals {
-        let idx = builder.intern_external(fqname, path, file);
-        ref_to_global.insert(r, idx);
     }
 
-    // 2c: parallel translation. `ref_to_global` is owned + read-
-    // only from here; no GIL needed. We release the GIL with
-    // `Python::allow_threads` so rayon workers don't contend with
-    // anyone else holding it. The closure is pure-Rust HashMap
-    // probes, no salsa DB access, no Py allocations.
-    let ref_to_global_ref = &ref_to_global;
-    let edge_payloads_ref = &edge_payloads;
-    let ref_edge_payloads_ref = &ref_edge_payloads;
-    let mut triples: Vec<(usize, usize, u8)> = py.allow_threads(|| {
+    // 2d: parallel translation. The memo maps are owned + read-only
+    // from here; no GIL needed, no salsa access — pure hashmap probes.
+    let member_memo_ref = &member_memo;
+    let dynamic_memo_ref = &dynamic_memo;
+    let spec_payloads_ref = &spec_payloads;
+    let dir_ids_ref = &dir_ids;
+    let mut triples: Vec<(usize, usize, u8)> = py.allow_threads(move || {
         use rayon::prelude::*;
-        let from_edges = edge_payloads_ref.par_iter().flat_map_iter(|payload| {
-            payload.edges.iter().filter_map(|&(src, dst, flags)| {
-                let src_idx = *ref_to_global_ref.get(&src)?;
-                let dst_idx = *ref_to_global_ref.get(&dst)?;
-                Some((src_idx, dst_idx, flags))
-            })
-        });
-        let from_refs = ref_edge_payloads_ref.par_iter().flat_map_iter(|payload| {
-            payload.edges.iter().filter_map(|&(src, dst, flags)| {
-                let src_idx = *ref_to_global_ref.get(&src)?;
-                let dst_idx = *ref_to_global_ref.get(&dst)?;
-                Some((src_idx, dst_idx, flags))
-            })
-        });
-        let mut t: Vec<(usize, usize, u8)> = from_edges.chain(from_refs).collect();
+        let from_specs =
+            spec_payloads_ref
+                .par_iter()
+                .enumerate()
+                .flat_map_iter(|(pos, payload)| {
+                    let base = node_offsets[pos];
+                    let dir = dir_ids_ref[pos];
+                    let file = project_files[pos];
+                    payload.specs.iter().flat_map(move |spec| {
+                        let src_idx = base + spec.src as usize;
+                        let flags = spec.flags;
+                        let mut out: SmallVec<[(usize, usize, u8); 4]> = SmallVec::new();
+                        match &spec.target {
+                            Target::Local(dst_local) => {
+                                if *dst_local != spec.src {
+                                    out.push((src_idx, base + *dst_local as usize, flags));
+                                }
+                            }
+                            Target::Member(m) => {
+                                if let Some(slot) = member_memo_ref.get(&(m, dir)) {
+                                    // Self-import suppression: a Binding ref
+                                    // whose upstream resolves to the importing
+                                    // file itself emits nothing — the whole
+                                    // emission, decl edges included (mirrors
+                                    // the old `target_file == file` skip,
+                                    // which must apply per importing file,
+                                    // not per memo entry).
+                                    let self_import = matches!(m.role, MemberRole::Binding)
+                                        && slot.start_file == Some(file);
+                                    if !self_import {
+                                        for &idx in &slot.idxs {
+                                            if idx != src_idx {
+                                                out.push((src_idx, idx, flags));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Target::Dynamic(d) => {
+                                if let Some(idxs) = dynamic_memo_ref.get(&(d, dir)) {
+                                    for &idx in idxs {
+                                        if idx != src_idx {
+                                            out.push((src_idx, idx, flags));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        out
+                    })
+                });
+        let mut t: Vec<(usize, usize, u8)> = from_specs.collect();
+        t.extend(structural);
         t.par_sort_unstable();
         t.dedup();
         t
@@ -1054,12 +1176,12 @@ fn assemble_graph<'db>(
     // Bulk-initialize the edge storage from the translated triples.
     // The builder is edge-less here (pass 1 mints only nodes), so the
     // adjacency fills run as a parallel scatter; the GIL is released
-    // for the same reason as 2c.
+    // for the same reason as 2d.
     let bulk_triples = std::mem::take(&mut triples);
     py.allow_threads(|| builder.init_edges_bulk(bulk_triples));
 
-    // Warnings are still serial — they live on `FileRefEdges` only.
-    for payload in &ref_edge_payloads {
+    // Warnings are still serial — they live on `FileRefSpecs` only.
+    for payload in &spec_payloads {
         all_warnings.extend(payload.warnings.iter().cloned());
     }
 
@@ -1128,6 +1250,62 @@ fn assemble_graph<'db>(
         decl_by_name_range,
         topic_facts,
     })
+}
+
+/// Translate one `'static` resolution output node to its global graph
+/// index. `Module` / `Def` / `StarStmt` probe `ref_to_global` (built
+/// in pass 1; a miss means the owning file wasn't enumerated — drop).
+/// `External` interns into the builder, which dedups by fqname, so the
+/// first (sorted-key-order) encounter pins the node deterministically.
+fn translate_resolved(
+    db: &ProjectDatabase,
+    builder: &mut GraphBuilder,
+    ref_to_global: &FxHashMap<NodeRef, usize>,
+    node: &ResolvedNode,
+) -> Option<usize> {
+    match node {
+        ResolvedNode::Module(f) => ref_to_global.get(&NodeRef::Module(*f)).copied(),
+        ResolvedNode::Def(k) => ref_to_global.get(&NodeRef::Def(*k)).copied(),
+        ResolvedNode::StarStmt(f, rk) => ref_to_global.get(&NodeRef::StarStmt(*f, *rk)).copied(),
+        ResolvedNode::External { fqname, file } => {
+            Some(builder.intern_external(fqname.clone(), file_path_string(db, *file), *file))
+        }
+    }
+}
+
+/// Run `f` over `work` on rayon workers, each contiguous chunk against
+/// its own salsa db snapshot. Snapshots are cloned on the calling
+/// thread before the fan-out (a salsa clone must not race a worker
+/// mid-query — the same hazard the populate fan-out documents), then
+/// moved onto the workers with the GIL released. Results come back in
+/// `work` order, so sorted inputs give deterministic outputs
+/// regardless of scheduling.
+fn resolve_chunked<'w, T: Sync, R: Send>(
+    py: Python<'_>,
+    db: &ProjectDatabase,
+    work: &'w [T],
+    f: impl Fn(&ProjectDatabase, &'w T) -> R + Send + Sync,
+) -> Vec<R> {
+    use rayon::prelude::*;
+    if work.is_empty() {
+        return Vec::new();
+    }
+    let num_workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    let chunk_size = work.len().div_ceil(num_workers).max(1);
+    let chunks: Vec<&'w [T]> = work.chunks(chunk_size).collect();
+    let dbs: Vec<ProjectDatabase> = (0..chunks.len()).map(|_| db.clone()).collect();
+    let nested: Vec<Vec<R>> = py.allow_threads(move || {
+        dbs.into_par_iter()
+            .zip(chunks.into_par_iter())
+            .map(|(local_db, chunk)| {
+                use salsa::Database as _;
+                local_db.attach(|ldb| chunk.iter().map(|item| f(ldb, item)).collect())
+            })
+            .collect()
+    });
+    nested.into_iter().flatten().collect()
 }
 
 /// Fold every registered per-file native plugin's file-local ops into
@@ -1293,12 +1471,11 @@ pub(crate) struct ClassHierarchyIndices {
 /// `LocalClass(range)` for a same-file class or a `ModuleMember{module,
 /// name}` symbolic reference — deliberately *not* resolved at store time
 /// so the per-file payload stays salsa-invalidation-local (see
-/// `build_class_bases`). Assembly resolves each spec here, through
-/// [`crate::helpers::resolve_base_spec`], to the `(File, name_range)` key
-/// of the class's name token; `resolve_base_spec` chases `ModuleMember`
-/// rows via [`crate::helpers::resolve_member_def`] (ty's module resolver +
-/// re-export / assignment-alias following). Dispatch is then a single
-/// hashmap probe per resolved base:
+/// `build_class_bases`). Assembly resolves each spec here, to the
+/// `(File, name_range)` key of the class's name token; `ModuleMember`
+/// rows chase through [`crate::helpers::resolve_member_def`] (ty's
+/// module resolver + re-export / assignment-alias following). Dispatch
+/// is then a single hashmap probe per resolved base:
 ///
 /// * the key hits `class_by_selection` → it's a project class; record a
 ///   `children_by_node` edge to that parent (every value in the map is a
@@ -1311,7 +1488,17 @@ pub(crate) struct ClassHierarchyIndices {
 /// (direct, aliased, re-exported, sibling-module) collapses to the same
 /// `(File, name_range)` key by construction — the query side
 /// ([`crate::helpers::locate_class_seed`]) lands on the identical key.
+///
+/// The `ModuleMember` resolutions are memoized project-wide on
+/// `(module, name, anchor directory)` — the same key scheme as the
+/// assemble pass's RefSpec memo (`resolve_member_def` is
+/// anchor-sensitive only through ty's desperate-resolution fallback,
+/// which depends on ancestor directories) — and resolved on rayon
+/// workers. A base every file subclasses (`pydantic.BaseModel`,
+/// `unittest.TestCase`) resolves once per directory instead of once
+/// per class.
 fn build_class_hierarchy_indices(
+    py: Python<'_>,
     db: &ProjectDatabase,
     project_files: &[File],
     class_by_selection: &FxHashMap<(File, (u32, u32)), usize>,
@@ -1320,15 +1507,80 @@ fn build_class_hierarchy_indices(
     let mut external_base_children: FxHashMap<(File, (u32, u32)), Vec<usize>> =
         FxHashMap::default();
 
+    // Serial prefetch: per-file payloads (cache reads after the
+    // populate fan-out) + anchor-directory ids.
+    let payloads: Vec<&FileNodes> = project_files
+        .iter()
+        .map(|&f| file_to_nodes(db, f))
+        .collect();
+    let mut dir_to_id: FxHashMap<String, u32> = FxHashMap::default();
+    let mut dir_anchors: Vec<File> = Vec::new();
+    let mut dir_ids: Vec<u32> = Vec::with_capacity(project_files.len());
     for &file in project_files {
-        let payload = file_to_nodes(db, file);
+        let path = file_path_string(db, file);
+        let dir = match path.rsplit_once(['/', '\\']) {
+            Some((d, _)) => d.to_string(),
+            None => String::new(),
+        };
+        let id = *dir_to_id.entry(dir).or_insert_with(|| {
+            dir_anchors.push(file);
+            (dir_anchors.len() - 1) as u32
+        });
+        dir_ids.push(id);
+    }
+
+    // Gather the unique `(module, name, dir)` member keys (sorted, for
+    // deterministic worker output order) and resolve them in parallel.
+    let mut work: Vec<(&str, &str, u32)> = {
+        let mut seen: FxHashSet<(&str, &str, u32)> = FxHashSet::default();
+        for (pos, payload) in payloads.iter().enumerate() {
+            for (_cls_rk, bases) in &payload.class_bases {
+                for base in bases.iter() {
+                    if let ClassBaseSpec::ModuleMember { module, name } = base {
+                        seen.insert((module.as_str(), name.as_str(), dir_ids[pos]));
+                    }
+                }
+            }
+        }
+        seen.into_iter().collect()
+    };
+    work.sort_unstable();
+
+    /// `(module, name, anchor-dir)` member key → resolved base decl.
+    type BaseMemo<'k> = FxHashMap<(&'k str, &'k str, u32), Option<(File, TextRange)>>;
+    let dir_anchors_ref = &dir_anchors;
+    let results: Vec<Option<(File, TextRange)>> =
+        resolve_chunked(py, db, &work, |ldb, &(module, name, dir)| {
+            resolve_member_def(ldb, module, name, dir_anchors_ref[dir as usize], 0)
+        });
+    let mut memo: BaseMemo<'_> =
+        FxHashMap::with_capacity_and_hasher(work.len(), Default::default());
+    for (&key, res) in work.iter().zip(&results) {
+        memo.insert(key, *res);
+    }
+
+    // Scatter: dispatch each class's resolved bases against
+    // `class_by_selection` (project parent) or `external_base_children`
+    // (external parent). `LocalClass` specs resolve inline — the spec
+    // range IS the `(File, name_range)` key.
+    for (pos, payload) in payloads.iter().enumerate() {
+        let file = project_files[pos];
+        let dir = dir_ids[pos];
         for (cls_rk, bases) in &payload.class_bases {
             let Some(&child_idx) = class_by_selection.get(&(file, *cls_rk)) else {
                 continue;
             };
-            for base in bases {
-                let Some((base_file, base_range)) = resolve_base_spec(db, base, file, file, 0)
-                else {
+            for base in bases.iter() {
+                let resolved = match base {
+                    ClassBaseSpec::LocalClass((start, end)) => {
+                        Some((file, TextRange::new((*start).into(), (*end).into())))
+                    }
+                    ClassBaseSpec::ModuleMember { module, name } => memo
+                        .get(&(module.as_str(), name.as_str(), dir))
+                        .copied()
+                        .flatten(),
+                };
+                let Some((base_file, base_range)) = resolved else {
                     continue;
                 };
                 let base_rk = range_key(base_range);
@@ -1433,8 +1685,8 @@ pub(crate) fn build_fqname_indices(
             // `@typing.overload`-decorated stubs of an in-file overload group
             // are excluded from the fqname trie so cross-module `from mod
             // import f` resolves to the impl only. Reachability still anchors
-            // them via the explicit `impl → stub` edge emitted in
-            // `file_to_edges`.
+            // them via the explicit `impl → stub` anchor edge the
+            // assembly pass synthesizes.
             if node.is_overload {
                 return acc;
             }

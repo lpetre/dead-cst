@@ -1,45 +1,33 @@
-//! Per-file reference-edge collection. The Phase 3 port: walks the
-//! AST inside every owned expression and emits `use → reaching-def`
-//! edges keyed on `NodeRef` instead of `usize`.
+//! Per-file reference-spec collection: the combined walk that replaced
+//! the old `file_to_edges` / `file_to_ref_edges` pair.
 //!
-//! Status: **first-cut skeleton.** Emits the codemod-invariant
-//! `use → local-alias` edge for every `ExprName` reference whose
-//! reaching def is a local graph node. Sufficient to validate the
-//! salsa-tracked pattern + per-file ref walk shape against the
-//! existing `collect_reference_edges`.
+//! [`file_to_refspecs`] walks the AST inside every owned expression
+//! plus the file's import bindings, and emits a flat, sorted
+//! [`RefSpec`] list expressed entirely in local terms (local node
+//! indices, symbolic [`MemberRef`] / [`DynamicRef`] descriptors). The
+//! query is **file-local by construction**: its salsa dependencies are
+//! this file's parse, semantic index, and `file_to_nodes` payload plus
+//! search-path configuration — never another file's contents. Editing
+//! an imported file no longer invalidates the importer's walk; only
+//! the (much cheaper) assembly-time resolution re-runs.
 //!
-//! Deliberately deferred to follow-ups, each documented in-place
-//! when the corresponding code path is stubbed:
+//! Cross-file resolution — module resolver probes, upstream
+//! `exports_by_name` lookups, star-reexport chain walks, external
+//! classification — happens in the assembly pass via
+//! [`crate::refspec::resolve_member`] / [`crate::refspec::resolve_dynamic`],
+//! memoized project-wide.
 //!
-//! * **Parallel upstream reachability edges** (emit_upstream). For
-//!   `from foo import bar; bar()`, today's pipeline emits
-//!   `owner → alias` AND `owner → foo.bar` AND `owner → foo`. This
-//!   cut emits only the first.
-//! * **Attribute-chain edges.** `mod.bar.f()` collapses to a
-//!   bare-name use of `mod` here (the root); the chain segments
-//!   (`bar`, `f`) are not walked through the alias's resolution.
-//! * **Nested-context imports.** `import X` / `from X import y`
-//!   inside a function or class body emit no edges in this cut
-//!   (they go to dead-letter for now).
-//! * **String annotations.** Skipped entirely; `enter_string_annotation`
-//!   triggers ty type-inference and is the largest per-file salsa
-//!   cost we want to deliberately structure around.
-//! * **Dynamic imports.** `__import__(...)` / `importlib.import_module(...)`
-//!   walked as regular call expressions.
-//! * **Dead-branch flag.** Edges originating inside statically-dead
-//!   regions (`if False:`, post-`return`, …) emit no
-//!   `EdgeFlags::DEAD_BRANCH` flag.
-//! * **`__all__` edges.** Skipped.
-//!
-//! Each of those is its own follow-up commit on PR #226.
+//! Structural edges that are fully derivable from `file_to_nodes`
+//! payloads (decl → module anchors, overload impl → stub anchors, the
+//! submodule → parent-package hierarchy edge) are *not* emitted here;
+//! the assembly pass synthesizes them directly so the payload carries
+//! only real information.
 
 use ruff_db::files::File;
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
 use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use rustc_hash::FxHashSet;
-use ty_module_resolver::{resolve_module, ModuleName};
 use ty_project::Db as ProjectDb;
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{DefinitionKind, DefinitionState, TargetKind};
@@ -49,9 +37,10 @@ use ty_python_core::{semantic_index, SemanticIndex};
 use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
-    def_key, file_to_nodes, import_payload_for_pure as import_payload_for, ExternalKey, FileNodes,
+    def_key, file_to_nodes, import_payload_for_pure as import_payload_for, FileNodes,
     ImportPayload, NodeData, NodeKind, NodeRef,
 };
+use crate::refspec::{DynamicRef, MemberRef, MemberRole, RefSpec, Target};
 
 /// Outcome of resolving a `Name` use to its reaching definition.
 ///
@@ -61,47 +50,47 @@ use crate::file_payload::{
 /// import binding in a non-global scope, so no graph node was
 /// minted, and the use's parallel upstream edges flow from the
 /// enclosing top-level owner instead.
-enum Resolution<'db> {
-    Alias(NodeRef<'db>),
+enum Resolution {
+    Alias(u32),
     NestedImport {
         spec: ImportPayload,
         bound_name: String,
     },
 }
 use crate::helpers::{
-    detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, EDGE_FLAG_DEAD_BRANCH,
-    EDGE_FLAG_DYNAMIC_IMPORT,
+    detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, range_key,
+    EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
 };
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
-    module_name_resolves, paired_unpack_rhs, parse_dynamic_args, resolve_dynamic_target,
+    paired_unpack_rhs, parse_dynamic_args, resolve_dynamic_target,
     stmt_creates_top_level_definition, target_is_dunder_all, DynamicParseResult,
 };
 
-/// Salsa-tracked output of [`file_to_ref_edges`]. Set semantics so
-/// duplicate emissions (a name used twice resolving to the same
-/// target) collapse to a single entry. Edges are unresolved
-/// (`NodeRef` endpoints, not `u32` graph indices) — the assembly
-/// pass translates at the end.
+/// Salsa-tracked output of [`file_to_refspecs`]. `specs` is sorted +
+/// deduped, so the payload is deterministic and `Eq`-backdating
+/// compares plain content. The whole struct is `'static` — no
+/// `NodeRef` endpoints, no interned keys — so salsa id reshuffles
+/// across revisions can't defeat backdating.
 ///
 /// `warnings` are visitor messages (e.g. "Skipping dynamic import …")
 /// buffered per-file in pure rust. The driver flushes them to the
 /// `dead_cst._visitor` Python logger from the main thread once all
-/// per-file workers have finished — keeps `file_to_ref_edges` itself
+/// per-file workers have finished — keeps `file_to_refspecs` itself
 /// GIL-free so workers run inside `py.allow_threads` cleanly.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
-pub(crate) struct FileRefEdges<'db> {
-    pub(crate) edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
-    pub(crate) warnings: Vec<String>,
+pub(crate) struct FileRefSpecs {
+    pub(crate) specs: Box<[RefSpec]>,
+    pub(crate) warnings: Box<[String]>,
 }
 
-/// Per-file reference-edge collection. Salsa-tracked so the AST
-/// walk parallelizes via salsa's worker coordination, and cross-file
-/// lookups into [`file_to_nodes`] are memoized.
+/// Per-file reference-spec collection. Salsa-tracked so the AST walk
+/// parallelizes via salsa's worker coordination. See the module docs
+/// for the file-locality contract.
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
-pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> FileRefEdges<'db> {
+pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
     let self_nodes = file_to_nodes(db, file);
-    let mut edges: FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)> = FxHashSet::default();
+    let mut specs: Vec<RefSpec> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
     let parsed = parsed_module(db, file).load(db);
@@ -122,13 +111,13 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             continue;
         }
         let owner_ref = NodeRef::Def(def_key(db, def, &parsed));
-        if !self_nodes.ref_to_local.contains_key(&owner_ref) {
+        let Some(&owner_local) = self_nodes.ref_to_local.get(&owner_ref) else {
             continue;
-        }
+        };
 
         let kind = def.kind(db);
         let mut walker = RefWalker {
-            owner: owner_ref,
+            owner_local,
             file,
             db,
             parsed: &parsed,
@@ -137,7 +126,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             model: &model,
             dead_ranges: &dead_ranges,
             tc_ranges: &tc_ranges,
-            edges: &mut edges,
+            specs: &mut specs,
             warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
@@ -149,15 +138,14 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
 
     // (b) Module-level non-definition statements (top-level expression
     //     statements, `for`/`while`/`if` at module scope, …) attribute
-    //     to the module node. The per-decl pass above intentionally
-    //     skips these via `stmt_creates_top_level_definition`.
-    let module_ref = NodeRef::Module(file);
+    //     to the module node (local index 0). The per-decl pass above
+    //     intentionally skips these via `stmt_creates_top_level_definition`.
     for stmt in &parsed.syntax().body {
         if stmt_creates_top_level_definition(stmt) {
             continue;
         }
         let mut walker = RefWalker {
-            owner: module_ref,
+            owner_local: 0,
             file,
             db,
             parsed: &parsed,
@@ -166,7 +154,7 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             model: &model,
             dead_ranges: &dead_ranges,
             tc_ranges: &tc_ranges,
-            edges: &mut edges,
+            specs: &mut specs,
             warnings: &mut warnings,
             nested_context: false,
             current_flags: 0,
@@ -190,21 +178,138 @@ pub(crate) fn file_to_ref_edges<'db>(db: &'db dyn ProjectDb, file: File) -> File
             .imports
             .as_ref()
             .is_some_and(|imp| imp.module == "__future__");
-        if is_dunder_decl || is_future_import {
-            let dst = self_nodes.refs[local_idx];
-            if dst != module_ref {
-                edges.insert((module_ref, dst, 0));
-            }
+        if (is_dunder_decl || is_future_import) && local_idx != 0 {
+            specs.push(RefSpec {
+                src: 0,
+                target: Target::Local(local_idx as u32),
+                flags: 0,
+            });
         }
     }
 
-    FileRefEdges { edges, warnings }
+    // (d) Import-alias binding specs. Walk each kind="import"
+    //     Definition in this file's global scope and emit one
+    //     `Member(Binding)` spec carrying the per-kind `(module, decl)`
+    //     resolution input. The assembly pass resolves it to
+    //     `alias → Module(target)` (+ `alias → target decl` for
+    //     from-imports), classifies stdlib / external / unresolved
+    //     targets, and applies the `_handle_fromlist`
+    //     namespace-vs-submodule disambiguation — all cross-file work
+    //     lives there, not here.
+    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
+        let DefinitionState::Defined(def) = state else {
+            continue;
+        };
+        if def.file(db) != file || def.file_scope(db) != global {
+            continue;
+        }
+        let alias_ref = NodeRef::Def(def_key(db, def, &parsed));
+        // Skip Definitions that file_to_nodes didn't mint (non-symbol
+        // places, unsupported kinds). Keeps the spec set internally
+        // consistent with the node set.
+        let Some(&alias_local) = self_nodes.ref_to_local.get(&alias_ref) else {
+            continue;
+        };
+
+        let kind = def.kind(db);
+        if !kind.is_import() {
+            continue;
+        }
+
+        let mut src_local = alias_local;
+        let (target_module_str, decl_name, is_star): (String, Option<String>, bool) = match kind {
+            DefinitionKind::Import(k) => {
+                // `import a.b.c` binds `a` locally, but the *statement*
+                // loads the deepest module; the binding spec resolves
+                // the full dotted path.
+                let alias = k.alias(&parsed);
+                (alias.name.id.as_str().to_string(), None, false)
+            }
+            DefinitionKind::ImportFrom(k) => {
+                let module = from_module_string(db, file, k.import(&parsed));
+                let alias = k.alias(&parsed);
+                (module, Some(alias.name.id.as_str().to_string()), false)
+            }
+            DefinitionKind::ImportFromSubmodule(k) => {
+                // ImportFromSubmodule binds a submodule attribute on
+                // the containing package as a side effect of a
+                // `from X import …` statement inside __init__.py.
+                // The bound NAME (k.module) is the attribute, but the
+                // TARGET module is the from-clause itself — for
+                // `from pkg._internal import *` in pkg/__init__.py
+                // the side-effect attribute `_internal` on pkg
+                // points at the file `pkg._internal`, not at
+                // `pkg._internal._internal`. The from-clause module
+                // is what resolves.
+                let target = from_module_string(db, file, k.import(&parsed));
+                (target, None, false)
+            }
+            DefinitionKind::StarImport(k) => {
+                // `from X import *`. Each per-name `STAR_REEXPORT` node
+                // edges into the kept statement-level `*X` node, which in
+                // turn carries the module-level upstream spec. Rebind
+                // `src_local` to that `*X` node so the binding spec
+                // (stdlib / external / unresolved handling included)
+                // resolves from `*X`, not from the per-name node. Uses
+                // of star-bound names land on the per-name node (ty's
+                // use-def chain distinguishes them); `from <here>
+                // import name` lookups resolve per-name via
+                // walk_exports_chain.
+                let module = from_module_string(db, file, k.import(&parsed));
+                let star_ref = NodeRef::StarStmt(file, range_key(kind.target_range(&parsed)));
+                if let Some(&star_local) = self_nodes.ref_to_local.get(&star_ref) {
+                    if star_local != alias_local {
+                        specs.push(RefSpec {
+                            src: alias_local,
+                            target: Target::Local(star_local),
+                            flags: 0,
+                        });
+                    }
+                    src_local = star_local;
+                }
+                (module, None, true)
+            }
+            _ => continue,
+        };
+
+        if target_module_str.is_empty() {
+            continue;
+        }
+
+        specs.push(RefSpec {
+            src: src_local,
+            target: Target::Member(MemberRef {
+                role: MemberRole::Binding,
+                spec: ImportPayload {
+                    module: target_module_str,
+                    decl: decl_name,
+                    star: is_star,
+                },
+                bound_name: String::new(),
+                chain: Vec::new(),
+            }),
+            flags: 0,
+        });
+    }
+
+    // Sorted + deduped so the payload is deterministic regardless of
+    // emission order, identical re-emissions collapse (a name used
+    // twice resolving to the same target), and `Eq` backdating is a
+    // cheap content compare.
+    specs.sort_unstable();
+    specs.dedup();
+
+    FileRefSpecs {
+        specs: specs.into_boxed_slice(),
+        warnings: warnings.into_boxed_slice(),
+    }
 }
 
-/// Per-owner walker. Mirrors today's `RefCollector` but with
-/// `NodeRef`-typed edges and a reduced feature set (see module docs).
+/// Per-owner walker. Mirrors the libcst pipeline's `RefCollector` but
+/// emits local-terms [`RefSpec`]s instead of resolved edges.
 struct RefWalker<'a, 'db> {
-    owner: NodeRef<'db>,
+    /// Local index (into `self_nodes.refs`) of the owning node.
+    owner_local: u32,
     file: File,
     /// The project db. We can't go through `self.model.db()` for
     /// `file_to_nodes` calls because that returns `&dyn
@@ -214,11 +319,11 @@ struct RefWalker<'a, 'db> {
     #[allow(dead_code)]
     parsed: &'a ParsedModuleRef,
     index: &'a SemanticIndex<'db>,
-    self_nodes: &'a FileNodes<'db>,
+    self_nodes: &'a FileNodes,
     model: &'a SemanticModel<'db>,
     /// Statically-dead source regions for this file. Uses originating
     /// inside any of these get `EDGE_FLAG_DEAD_BRANCH` stamped on
-    /// every edge they emit.
+    /// every spec they emit.
     dead_ranges: &'a [TextRange],
     /// Statement ranges inside `if TYPE_CHECKING:` blocks. A use whose
     /// flow-resolved binding falls inside one of these has had its
@@ -226,7 +331,7 @@ struct RefWalker<'a, 'db> {
     /// `TYPE_CHECKING` as `True`); `find_local_bindings` recovers it
     /// from the scope-wide reachable bindings.
     tc_ranges: &'a [TextRange],
-    edges: &'a mut FxHashSet<(NodeRef<'db>, NodeRef<'db>, u8)>,
+    specs: &'a mut Vec<RefSpec>,
     /// Per-file warnings buffer. Workers push pure-rust strings; the
     /// driver flushes them to Python logging from the main thread.
     warnings: &'a mut Vec<String>,
@@ -243,18 +348,43 @@ struct RefWalker<'a, 'db> {
     /// skip the position-sensitive `scoped_use_id` lookup that would
     /// otherwise panic.
     in_string_annotation: bool,
-    /// Flags stamped on each edge emitted by the current reference
+    /// Flags stamped on each spec emitted by the current reference
     /// (set by `emit_name_use` / nested-import handlers from
     /// `flags_for_range` on the reference's source position;
     /// reset to 0 after the reference completes).
     current_flags: u8,
 }
 
-impl<'a, 'db> RefWalker<'a, 'db> {
-    fn emit_edge(&mut self, dst: NodeRef<'db>) {
-        if dst != self.owner {
-            self.edges.insert((self.owner, dst, self.current_flags));
+impl<'db> RefWalker<'_, 'db> {
+    /// Emit a `use → local node` spec (the codemod-invariant alias
+    /// edge, `__all__` edges, …).
+    fn emit_local(&mut self, dst_local: u32) {
+        if dst_local != self.owner_local {
+            self.specs.push(RefSpec {
+                src: self.owner_local,
+                target: Target::Local(dst_local),
+                flags: self.current_flags,
+            });
         }
+    }
+
+    /// Emit an unresolved `Use`-role member spec (the parallel
+    /// upstream-reachability edges past an import alias). The
+    /// assembly pass resolves it via `resolve_member`.
+    fn emit_member_use(&mut self, spec: &ImportPayload, bound_name: &str, extra_chain: &[&str]) {
+        if spec.module.is_empty() {
+            return;
+        }
+        self.specs.push(RefSpec {
+            src: self.owner_local,
+            target: Target::Member(MemberRef {
+                role: MemberRole::Use,
+                spec: spec.clone(),
+                bound_name: bound_name.to_string(),
+                chain: extra_chain.iter().map(|s| s.to_string()).collect(),
+            }),
+            flags: self.current_flags,
+        });
     }
 
     /// Returns `EDGE_FLAG_DEAD_BRANCH` if `range` is contained in any
@@ -267,14 +397,6 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         }
     }
 
-    /// Emit an edge from `self.owner` to a real External node carrying
-    /// the resolved upstream path: `[external dist] X` / `[external file] X`
-    /// for site-packages (via `external_fqname_for`'s PEP 503 lookup).
-    fn emit_external_node(&mut self, fqname: String, target_file: File) {
-        let key = ExternalKey::new(self.db, fqname, target_file);
-        self.emit_edge(NodeRef::External(key));
-    }
-
     /// True when `range` falls inside a recorded type-checking block
     /// (see [`detect_type_checking_ranges`]).
     fn range_in_tc_block(&self, range: TextRange) -> bool {
@@ -282,17 +404,11 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     }
 
     /// Resolve a `Name` use to the reaching local Definition(s) via
-    /// ty's flow-sensitive use-def chain. Returns `NodeRef::Def` for
-    /// each reaching def whose graph node lives in this file.
-    ///
-    /// Differs from today's `find_local_bindings`:
-    ///
-    /// * No `Resolution::NestedImport` variant — nested-context
-    ///   imports are deferred. Bindings without a graph node are
-    ///   silently dropped.
-    /// * No `in_string_annotation` plumbing — string annotations
-    ///   aren't entered yet.
-    fn find_local_bindings(&self, name: &ExprName, extra_chain: &[&str]) -> Vec<Resolution<'db>> {
+    /// ty's flow-sensitive use-def chain. Returns the local index for
+    /// each reaching def whose graph node lives in this file, or a
+    /// `NestedImport` descriptor for import bindings in non-global
+    /// scopes (which have no node of their own).
+    fn find_local_bindings(&self, name: &ExprName, extra_chain: &[&str]) -> Vec<Resolution> {
         let db = self.model.db();
         // For names from a string-annotation sub-AST, ty doesn't know
         // their scope (we parsed them ourselves rather than going
@@ -339,7 +455,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             // `True`, so in that case the *runtime* binding has been
             // narrowed away — `find_local_bindings` recovers it below.
             let mut resolved_in_tc = false;
-            let mut results: Vec<Resolution<'db>> = Vec::new();
+            let mut results: Vec<Resolution> = Vec::new();
             for binding in bindings {
                 let Some(def) = binding.binding.definition() else {
                     continue;
@@ -352,14 +468,14 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                     resolved_in_tc = true;
                 }
                 let candidate = NodeRef::Def(def_key(self.db, def, self.parsed));
-                if self.self_nodes.ref_to_local.contains_key(&candidate) {
-                    results.push(Resolution::Alias(candidate));
+                if let Some(&local) = self.self_nodes.ref_to_local.get(&candidate) {
+                    results.push(Resolution::Alias(local));
                     continue;
                 }
                 // Nested-context import: ty sees an import binding in
                 // a non-global scope, so no graph node was minted. The
                 // use's parallel upstream edges flow from the
-                // enclosing top-level owner via emit_upstream; we
+                // enclosing top-level owner via emit_member_use; we
                 // package the spec + bound name into a NestedImport
                 // resolution so emit_name_use can drive that.
                 let kind = def.kind(db);
@@ -410,7 +526,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                         };
                         if results
                             .iter()
-                            .any(|r| matches!(r, Resolution::Alias(d) if *d == candidate))
+                            .any(|r| matches!(r, Resolution::Alias(d) if *d == idx))
                         {
                             continue;
                         }
@@ -423,7 +539,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                                 extra_chain,
                             );
                         if recovers_runtime_binding || on_access_chain {
-                            results.push(Resolution::Alias(candidate));
+                            results.push(Resolution::Alias(idx));
                         }
                     }
                 }
@@ -439,8 +555,8 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                     continue;
                 }
                 let candidate = NodeRef::Def(def_key(self.db, def, self.parsed));
-                if self.self_nodes.ref_to_local.contains_key(&candidate) {
-                    results.push(Resolution::Alias(candidate));
+                if let Some(&local) = self.self_nodes.ref_to_local.get(&candidate) {
+                    results.push(Resolution::Alias(local));
                 }
             }
             if !results.is_empty() {
@@ -460,30 +576,20 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.current_flags = self.flags_for_range(name.range());
         for resolution in self.find_local_bindings(name, extra_chain) {
             match resolution {
-                Resolution::Alias(dst) => {
-                    self.emit_edge(dst);
-                    // If the resolved alias is an import, emit
-                    // parallel reachability edges through it
-                    // (Principle 2).
-                    let import_spec: Option<ImportPayload> = self
-                        .self_nodes
-                        .ref_to_local
-                        .get(&dst)
-                        .copied()
-                        .and_then(|idx| {
-                            let node_data = &self.self_nodes.nodes[idx as usize];
-                            if matches!(node_data.kind, NodeKind::Import) {
-                                node_data.imports.clone()
-                            } else {
-                                None
-                            }
-                        });
-                    if let Some(spec) = import_spec {
-                        self.emit_upstream(&spec, name.id.as_str(), extra_chain);
+                Resolution::Alias(dst_local) => {
+                    self.emit_local(dst_local);
+                    // If the resolved alias is an import, emit a
+                    // parallel `Use` member spec through it
+                    // (Principle 2) — resolved at assembly.
+                    let node_data = &self.self_nodes.nodes[dst_local as usize];
+                    if matches!(node_data.kind, NodeKind::Import) {
+                        if let Some(spec) = node_data.imports.clone() {
+                            self.emit_member_use(&spec, name.id.as_str(), extra_chain);
+                        }
                     }
                 }
                 Resolution::NestedImport { spec, bound_name } => {
-                    self.emit_upstream(&spec, &bound_name, extra_chain);
+                    self.emit_member_use(&spec, &bound_name, extra_chain);
                 }
             }
         }
@@ -491,9 +597,8 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     }
 
     /// `import X[.Y.Z][ as A]` inside a function/class body. No alias
-    /// node is minted (binding lives in non-global scope); emit
-    /// parallel upstream edges from `self.owner` directly. Mirrors
-    /// `ingest::RefCollector::emit_nested_import` (lines 2044–2061).
+    /// node is minted (binding lives in non-global scope); emit a
+    /// `Use` member spec from `self.owner_local` directly.
     fn emit_nested_import(&mut self, stmt: &ruff_python_ast::StmtImport) {
         self.current_flags = self.flags_for_range(stmt.range);
         for alias in &stmt.names {
@@ -508,17 +613,18 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 decl: None,
                 star: false,
             };
-            self.emit_upstream(&spec, bound_name, &synthetic_chain);
+            self.emit_member_use(&spec, bound_name, &synthetic_chain);
         }
         self.current_flags = 0;
     }
 
     /// `from X import name` inside a function/class body. Resolves the
     /// from-clause through ty (so relative imports get level dots
-    /// converted to absolute), then walks each alias and emits the
-    /// upstream edges. A nested `from X import *` is a SyntaxError
-    /// ("import * only allowed at module level") so it cannot occur in
-    /// runnable Python — it is skipped rather than fanned out.
+    /// converted to absolute — a self-property, still file-local),
+    /// then walks each alias and emits the `Use` member specs. A
+    /// nested `from X import *` is a SyntaxError ("import * only
+    /// allowed at module level") so it cannot occur in runnable
+    /// Python — it is skipped rather than fanned out.
     fn emit_nested_import_from(&mut self, stmt: &ruff_python_ast::StmtImportFrom) {
         let module_str = from_module_string(self.model.db(), self.file, stmt);
         if module_str.is_empty() {
@@ -541,7 +647,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 decl: Some(name.to_string()),
                 star: false,
             };
-            self.emit_upstream(&spec, bound_name, &[]);
+            self.emit_member_use(&spec, bound_name, &[]);
         }
         self.current_flags = 0;
     }
@@ -588,11 +694,16 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         self.in_string_annotation = prev;
     }
 
-    /// Recognize and emit edges for a dynamic-import call. Returns
+    /// Recognize and emit a spec for a dynamic-import call. Returns
     /// `true` if the call was a dynamic-import shape (so the visitor
     /// doesn't fall through to walk its arguments as ordinary names).
-    /// Mirrors today's `RefCollector::try_emit_dynamic_import` +
-    /// `emit_dynamic_edges` + `emit_resolved_module`.
+    ///
+    /// `resolve_dynamic_target` runs here, at walk time: it is pure
+    /// string manipulation whose only context is the owning file's
+    /// package name (a self-property), so the emitted [`DynamicRef`]
+    /// carries an already-absolutized dotted target and its error
+    /// messages stay in the file-local warnings buffer. The actual
+    /// cross-file resolution happens at assembly via `resolve_dynamic`.
     fn try_emit_dynamic_import(&mut self, call: &ruff_python_ast::ExprCall) -> bool {
         let Some(kind) = detect_dynamic_call(&call.func) else {
             return false;
@@ -607,7 +718,18 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 let file_pkg = file_package_name(self.model.db(), self.file);
                 let pkg = explicit_package.or(file_pkg.as_deref());
                 match resolve_dynamic_target(kind, &name, explicit_level, pkg) {
-                    Ok(target) => self.emit_dynamic_edges(&target, &fromlist),
+                    Ok(target) => self.specs.push(RefSpec {
+                        src: self.owner_local,
+                        target: Target::Dynamic(DynamicRef {
+                            target,
+                            fromlist: fromlist
+                                .iter()
+                                .filter(|e| !e.is_empty())
+                                .map(|e| e.to_string())
+                                .collect(),
+                        }),
+                        flags: self.current_flags | EDGE_FLAG_DYNAMIC_IMPORT,
+                    }),
                     Err(message) => self.warnings.push(message),
                 }
                 true
@@ -620,78 +742,9 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         }
     }
 
-    /// Emit `owner → target` plus per-fromlist-entry edges for a
-    /// dynamic import, each tagged with `EDGE_FLAG_DYNAMIC_IMPORT`.
-    fn emit_dynamic_edges(&mut self, target: &str, fromlist: &[&str]) {
-        let saved = self.current_flags;
-        self.current_flags |= EDGE_FLAG_DYNAMIC_IMPORT;
-        if fromlist.is_empty() {
-            self.emit_resolved_module(target);
-        } else {
-            self.emit_resolved_module(target);
-            for entry in fromlist {
-                if entry.is_empty() {
-                    continue;
-                }
-                let candidate = format!("{target}.{entry}");
-                if module_name_resolves(&candidate, self.file, self.model.db()) {
-                    self.emit_resolved_module(&candidate);
-                    continue;
-                }
-                // Treat as decl-style: resolve target to file, look up
-                // entry in its exports_by_name.
-                let target_file = ModuleName::new(target)
-                    .and_then(|n| resolve_module(self.db, self.file, &n))
-                    .and_then(|m| m.file(self.db));
-                if let Some(target_file) = target_file {
-                    let target_nodes = file_to_nodes(self.db, target_file);
-                    if let Some(locals) = target_nodes.exports_by_name.get(*entry) {
-                        for &local_idx in locals {
-                            self.emit_edge(target_nodes.refs[local_idx as usize]);
-                        }
-                    }
-                }
-            }
-        }
-        self.current_flags = saved;
-    }
-
-    /// Emit a single edge to the resolved module's NodeRef. First-party
-    /// modules route to a `Module` ref; site-packages modules become real
-    /// `External` nodes carrying the upstream path; stdlib and
-    /// genuinely-unresolved targets emit nothing.
-    fn emit_resolved_module(&mut self, dotted: &str) {
-        let top_level = dotted.split('.').next().unwrap_or(dotted);
-        let Some(mn) = ModuleName::new(dotted) else {
-            return;
-        };
-        let Some(module) = resolve_module(self.db, self.file, &mn) else {
-            return;
-        };
-        let Some(target_file) = module.file(self.db) else {
-            return;
-        };
-        if module
-            .search_path(self.db)
-            .is_some_and(|sp| sp.is_standard_library())
-        {
-            return;
-        }
-        if module
-            .search_path(self.db)
-            .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
-        {
-            let fqname = crate::file_payload::external_fqname_for(self.db, target_file, top_level);
-            self.emit_external_node(fqname, target_file);
-            return;
-        }
-        self.emit_edge(NodeRef::Module(target_file));
-    }
-
     /// `__all__ = ["foo", "bar"]`: each string literal resolves to a
-    /// module-scope binding; emit edges to each one. Mirrors today's
-    /// `emit_dunder_all_edges`. Computed-`__all__` shapes (concat,
-    /// `list(...)`) silently skip.
+    /// module-scope binding; emit local edges to each one.
+    /// Computed-`__all__` shapes (concat, `list(...)`) silently skip.
     fn emit_dunder_all_edges(&mut self, value: &Expr) {
         let elements = match value {
             Expr::List(l) => &l.elts,
@@ -700,23 +753,22 @@ impl<'a, 'db> RefWalker<'a, 'db> {
         };
         for elem in elements {
             if let Expr::StringLiteral(s) = elem {
-                if let Some(dst) = self.lookup_module_scope_name(s.value.to_str()) {
-                    self.emit_edge(dst);
+                if let Some(dst_local) = self.lookup_module_scope_name(s.value.to_str()) {
+                    self.emit_local(dst_local);
                 }
             }
         }
     }
 
-    /// Resolve a bare name to its module-scope live binding's NodeRef.
-    /// Used by [`emit_dunder_all_edges`]; mirrors today's
-    /// `RefCollector::lookup_module_scope_name`.
-    fn lookup_module_scope_name(&self, name: &str) -> Option<NodeRef<'db>> {
+    /// Resolve a bare name to its module-scope live binding's local
+    /// index. Used by [`emit_dunder_all_edges`].
+    fn lookup_module_scope_name(&self, name: &str) -> Option<u32> {
         let global = FileScopeId::global();
         let place_table = self.index.place_table(global);
         let symbol_id = place_table.symbol_id(name)?;
         if let Some(locals) = self.self_nodes.exports_by_name.get(name) {
             if let Some(&local_idx) = locals.first() {
-                return Some(self.self_nodes.refs[local_idx as usize]);
+                return Some(local_idx);
             }
         }
         // Fallback: walk end-of-scope bindings (matches today's
@@ -730,165 +782,18 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 continue;
             }
             let candidate = NodeRef::Def(def_key(self.db, def, self.parsed));
-            if self.self_nodes.ref_to_local.contains_key(&candidate) {
-                return Some(candidate);
+            if let Some(&local) = self.self_nodes.ref_to_local.get(&candidate) {
+                return Some(local);
             }
         }
         None
     }
-
-    /// Emit parallel reachability edges past a local import alias.
-    /// First-party targets walk the submodule chain; site-packages
-    /// targets emit a single `NodeRef::External` edge and stop; stdlib
-    /// and genuinely-unresolved targets silently drop.
-    ///
-    /// Mirrors today's `ingest::RefCollector::emit_upstream` (lines
-    /// 1880–2032): classify the loading target, walk the submodule
-    /// chain, emit edges to the deepest module reached plus any
-    /// terminal decl.
-    fn emit_upstream(&mut self, spec: &ImportPayload, bound_name: &str, extra_chain: &[&str]) {
-        if spec.module.is_empty() {
-            return;
-        }
-        let db = self.model.db();
-        let module_first_seg = spec.module.split('.').next().unwrap_or("").to_string();
-
-        let mut adjusted_chain: Vec<&str> = extra_chain.to_vec();
-        let loading_target: String;
-        let mut decl_tail: Option<String> = None;
-
-        if spec.star {
-            let candidate = format!("{}.{}", spec.module, bound_name);
-            if module_name_resolves(&candidate, self.file, db) {
-                loading_target = candidate;
-            } else {
-                loading_target = spec.module.clone();
-                decl_tail = Some(bound_name.to_string());
-            }
-        } else {
-            match &spec.decl {
-                Some(decl) => {
-                    let candidate = format!("{}.{}", spec.module, decl);
-                    if module_name_resolves(&candidate, self.file, db) {
-                        loading_target = candidate;
-                    } else {
-                        loading_target = spec.module.clone();
-                        decl_tail = Some(decl.clone());
-                    }
-                }
-                None => {
-                    let no_asname = bound_name == module_first_seg;
-                    if no_asname && spec.module != module_first_seg {
-                        let loading_extras: Vec<&str> = spec.module.split('.').skip(1).collect();
-                        let n = loading_extras.len();
-                        let prefix_matches = adjusted_chain.len() >= n
-                            && adjusted_chain
-                                .iter()
-                                .take(n)
-                                .zip(&loading_extras)
-                                .all(|(a, b)| *a == *b);
-                        if prefix_matches {
-                            adjusted_chain.drain(..n);
-                            loading_target = spec.module.clone();
-                        } else {
-                            loading_target = module_first_seg;
-                        }
-                    } else {
-                        loading_target = spec.module.clone();
-                    }
-                }
-            }
-        }
-
-        // Classify the loading target. Site-packages targets emit a
-        // single edge to a globally-interned External node carrying the
-        // upstream path and stop (no submodule chain walk through them,
-        // since they don't have file_to_nodes payloads to look up
-        // against). Stdlib and genuinely-unresolved targets emit nothing.
-        let top_level = loading_target.split('.').next().unwrap_or(&loading_target);
-        let Some(start_mn) = ModuleName::new(&loading_target) else {
-            return;
-        };
-        let Some(start_module) = resolve_module(db, self.file, &start_mn) else {
-            return;
-        };
-        let Some(start_file) = start_module.file(db) else {
-            return;
-        };
-        if start_module
-            .search_path(db)
-            .is_some_and(|sp| sp.is_standard_library())
-        {
-            return;
-        }
-        // Non-first-party (site-packages / external paths). Mint an
-        // External node keyed by PEP 503 canonical dist name via
-        // project_dist_lookup; falls back to `[external file] X` for
-        // orphan site-packages files.
-        if start_module
-            .search_path(db)
-            .is_some_and(|sp| !sp.is_first_party() && sp.is_site_packages())
-        {
-            let fqname = crate::file_payload::external_fqname_for(self.db, start_file, top_level);
-            self.emit_external_node(fqname, start_file);
-            return;
-        }
-
-        // Decl-style alias: emit edge to the upstream module and the
-        // decl inside it. Attribute access past a decl is field access
-        // on the decl's value, which we don't model.
-        if let Some(decl_name) = decl_tail {
-            // Use sites land on whatever's in exports_by_name
-            // (including star-reexport aliases). Don't walk through
-            // star aliases here — the from-import binding side uses
-            // walk_exports_chain to skip past stars; this is the
-            // *use* side, which should reach the star alias itself.
-            self.emit_edge(NodeRef::Module(start_file));
-            let target_nodes = file_to_nodes(self.db, start_file);
-            if let Some(locals) = target_nodes.exports_by_name.get(&decl_name) {
-                for &local_idx in locals {
-                    self.emit_edge(target_nodes.refs[local_idx as usize]);
-                }
-            }
-            return;
-        }
-
-        // Module-style alias: walk the chain submodule-by-submodule,
-        // emit one module edge (deepest reached) plus at most one
-        // terminal decl edge.
-        let mut current_file = start_file;
-        let mut current_path = loading_target.clone();
-        let mut terminal_decl_refs: Vec<NodeRef<'db>> = Vec::new();
-        for seg in &adjusted_chain {
-            let candidate = format!("{current_path}.{seg}");
-            let submodule_file = ModuleName::new(&candidate)
-                .and_then(|mn| resolve_module(db, self.file, &mn))
-                .and_then(|m| m.file(db));
-            if let Some(sub_file) = submodule_file {
-                current_file = sub_file;
-                current_path = candidate;
-                continue;
-            }
-            // Not a submodule — check for decl in current_file's exports.
-            let target_nodes = file_to_nodes(self.db, current_file);
-            if let Some(locals) = target_nodes.exports_by_name.get(*seg) {
-                for &local_idx in locals {
-                    terminal_decl_refs.push(target_nodes.refs[local_idx as usize]);
-                }
-            }
-            break;
-        }
-        self.emit_edge(NodeRef::Module(current_file));
-        for r in terminal_decl_refs {
-            self.emit_edge(r);
-        }
-    }
 }
 
-impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
+impl<'ast> Visitor<'ast> for RefWalker<'_, '_> {
     fn visit_expr(&mut self, expr: &'ast Expr) {
         // Inside an annotation context, route string literals through
-        // ty's `enter_string_annotation` so `List["Foo"]`-style refs
+        // the deferred-annotation parse so `List["Foo"]`-style refs
         // resolve. Gating on `in_annotation` avoids paying the
         // scope-type-inference cost for every dict-key / log-message /
         // docstring literal.
@@ -903,8 +808,9 @@ impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
             return;
         }
         // Collapse attribute chains rooted at a `Name`. The chain
-        // segments past the root become `extra_chain` so emit_upstream
-        // can walk submodule segments past an aliased module.
+        // segments past the root become `extra_chain` so the `Use`
+        // member spec can walk submodule segments past an aliased
+        // module at resolution time.
         if matches!(expr, Expr::Attribute(_)) {
             if let Some((root, segments)) = collapse_attribute_chain(expr) {
                 self.emit_name_use(root, &segments);
@@ -914,9 +820,9 @@ impl<'ast, 'db> Visitor<'ast> for RefWalker<'_, 'db> {
         // Recognize dynamic-import calls before falling through to a
         // normal Call walk. Matches today's RefCollector::visit_expr
         // sequencing — receiver gets its own emit_name_use, args walk
-        // normally, but the literal name/fromlist are handled by
-        // emit_dynamic_edges so they don't get attributed as string
-        // refs to something else.
+        // normally, but the literal name/fromlist are handled by the
+        // Dynamic spec so they don't get attributed as string refs to
+        // something else.
         if let Expr::Call(call) = expr {
             if self.try_emit_dynamic_import(call) {
                 if let Expr::Attribute(attr) = &*call.func {
@@ -999,11 +905,6 @@ fn plain_import_matches_chain(node: &NodeData, root: &str, extra_chain: &[&str])
 
 /// Walk every value-bearing AST node a Definition owns. Mirrors
 /// `ingest::walk_owned` but takes the new `RefWalker` collector.
-///
-/// TODO(file_to_ref_edges follow-up): port the `__all__` special case
-/// (currently the assignment value is walked as a generic expression,
-/// which is wrong — names listed inside `__all__` should resolve as
-/// module-scope binding lookups, not the strings themselves).
 fn walk_owned<'a, 'db>(
     kind: &DefinitionKind<'db>,
     parsed: &'a ParsedModuleRef,

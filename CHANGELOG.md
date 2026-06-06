@@ -255,6 +255,27 @@ two versions.
 
 ### Changed
 
+- **File-local reference specs; cross-file resolution moved to assembly.**
+  The two per-file salsa edge queries (`file_to_edges` / `file_to_ref_edges`)
+  are consolidated into one combined walk (`file_to_refspecs`) that emits
+  unresolved, file-local `RefSpec` rows — local node indices plus symbolic
+  `Member` / `Dynamic` descriptors — instead of resolved cross-file edges.
+  The walk query now has zero cross-file salsa dependencies, so editing one
+  file no longer invalidates any importer's (expensive) AST/use-def walk;
+  only the assembly-time resolution re-runs. Resolution itself is memoized
+  project-wide per `(ref, anchor directory)` and runs on rayon workers, so a
+  hot import repeated across thousands of use sites resolves once per
+  directory rather than once per use. The class-base fan-in
+  (`build_class_hierarchy_indices`) reuses the same memoized parallel
+  machinery (previously it re-resolved every base spelling once per class,
+  serially). Member resolution carries an explicit `Binding`/`Use` role:
+  binding-side edges keep skipping past star-reexport aliases to the real
+  decl while use-side edges keep landing on the star alias itself, and only
+  binding failures stamp `NodeFlags::UNRESOLVED`. Graph output is unchanged
+  (same nodes, edges, and flags); structural edges (decl → module anchors,
+  overload anchors, module hierarchy) are now synthesized at assembly
+  straight from the node payloads.
+
 - **Parallel edge-storage init and fqname-index map-reduce.** Two more serial
   build chunks now run on rayon workers with the GIL released. The assemble
   pass's bulk edge insert (`GraphBuilder::init_edges_bulk`) derives `edges`,

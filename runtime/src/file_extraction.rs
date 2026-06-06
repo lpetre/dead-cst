@@ -12,8 +12,7 @@
 //! parsed module behind this query sound.
 //!
 //! Sibling of [`crate::file_payload::file_to_nodes`] /
-//! [`crate::file_payload::file_to_edges`] /
-//! [`crate::file_ref_edges::file_to_ref_edges`]; unlike `file_to_nodes`
+//! [`crate::file_ref_edges::file_to_refspecs`]; unlike `file_to_nodes`
 //! (the cross-file lookup primitive) this query is never called
 //! cross-file, so it carries no `'db` lifetime and absorbs facts freely.
 
