@@ -1236,6 +1236,29 @@ def test_star_reexport_mints_per_name_and_statement_nodes(build_decl_graph):
     assert per_name == {"pkg.g", "pkg.h"}
 
 
+def test_circular_star_reexport_keeps_binding_self_loop(build_decl_graph):
+    """A circular star re-export keeps the binding-side self-loop.
+
+    ``a.py: from pkg.b import g`` / ``b.py: from pkg.a import *`` — the
+    alias's chain walk hops through b's star re-export and lands back on
+    a's own ``g`` alias. The resulting ``pkg.a.g -> pkg.a.g`` self-edge
+    is deliberately kept: the binding side has never filtered
+    self-edges (only use-site emission skips ``dst == owner``), and
+    edge inventories must stay stable across pipeline refactors.
+    Reachability is unaffected either way.
+    """
+    graph = build_decl_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/a.py": "from pkg.b import g",
+            "pkg/b.py": "from pkg.a import *",
+        }
+    )
+    nodes = graph.nodes()
+    self_loops = {nodes[u].fqname for u, v, _ in graph.edges() if u == v}
+    assert "pkg.a.g" in self_loops, self_loops
+
+
 def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):
     """Importing a submodule from a dep base resolves through the dep's exported trie.
 
