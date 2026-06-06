@@ -34,7 +34,7 @@ use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{DefinitionKind, DefinitionState, TargetKind};
 use ty_python_core::place::PlaceExprRef;
 use ty_python_core::scope::FileScopeId;
-use ty_python_core::{semantic_index, SemanticIndex};
+use ty_python_core::{semantic_index, SemanticIndexRef};
 use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
@@ -97,7 +97,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
     let parsed = parsed_module(db, file).load(db);
     let dead_ranges = detect_dead_ranges(&parsed);
     let tc_ranges = detect_type_checking_ranges(&parsed);
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
     let model = SemanticModel::new(db, file);
@@ -122,7 +122,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
             file,
             db,
             parsed: &parsed,
-            index,
+            index: &index,
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
@@ -150,7 +150,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
             file,
             db,
             parsed: &parsed,
-            index,
+            index: &index,
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
@@ -324,7 +324,7 @@ struct RefWalker<'a, 'db> {
     db: &'db dyn ProjectDb,
     #[allow(dead_code)]
     parsed: &'a ParsedModuleRef,
-    index: &'a SemanticIndex<'db>,
+    index: &'a SemanticIndexRef<'db>,
     self_nodes: &'a FileNodes,
     model: &'a SemanticModel<'db>,
     /// Statically-dead source regions for this file. Uses originating

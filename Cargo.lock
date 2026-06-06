@@ -2312,6 +2312,7 @@ dependencies = [
 name = "ty_python_core"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
  "bitflags",
  "bitvec",
  "get-size2",

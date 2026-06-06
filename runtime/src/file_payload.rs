@@ -395,7 +395,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     refs.push(NodeRef::Module(file));
     ref_to_local.insert(NodeRef::Module(file), 0);
 
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
     let global = FileScopeId::global();
     let place_table = index.place_table(global);
     let use_def_map = index.use_def_map(global);

@@ -445,16 +445,22 @@ pub(crate) fn build_project_graph(
                                 }
                                 // Every per-file AST consumer for this file has
                                 // now run and memoized its result, so drop the
-                                // parsed AST rather than let it sit resident
-                                // through assembly and the project-wide plugin
-                                // pass — that's the memory win. Assembly, fqname,
-                                // and the class hierarchy read only the cached
+                                // parsed AST *and* the semantic index's per-scope
+                                // analysis data (place tables, use-def maps, AST
+                                // ids) rather than let them sit resident through
+                                // assembly and the project-wide plugin pass —
+                                // that's the memory win, and the index data is
+                                // the larger share of it. Assembly, fqname, and
+                                // the class hierarchy read only the cached
                                 // payloads (`class_bases`, `external_base_children`,
-                                // `children_by_node`), never the AST, so the
-                                // all-ASTs-resident peak never forms. Subclass
-                                // resolution can still pull an individual file's AST
-                                // back on demand to relocate a class seed; that rare
-                                // reload is re-cleared right after the plugin pass.
+                                // `children_by_node`), never the AST or index, so
+                                // the all-files-resident peak never forms. Subclass
+                                // resolution can still pull an individual file's
+                                // AST/index back on demand to relocate a class
+                                // seed — `SemanticIndex::load` lazily rebuilds in
+                                // ingredient-reuse mode — and that rare reload is
+                                // re-cleared right after the plugin pass.
+                                ty_python_core::semantic_index(local_db, file).clear();
                                 parsed_module(local_db, file).clear();
                             });
                             db_tx.send(local_db).expect("channel open");
@@ -2542,10 +2548,10 @@ impl ProjectContext {
         // The plugin pass can still reload individual files on demand:
         // subclass resolution's `locate_class_seed` resolves an external base
         // through ty (`resolve_member_def` → the module resolver + use-def
-        // chain), which loads the target module's `parsed_module` to look up
-        // the member's binding, repopulating those files' salsa
-        // `parsed_module` slots. Clear them
-        // again so the post-build resident set stays at the lean
+        // chain), which loads the target module's `parsed_module` and
+        // rebuilds its semantic index's per-scope data to look up the
+        // member's binding, repopulating those files' salsa slots. Clear
+        // them again so the post-build resident set stays at the lean
         // post-populate level instead of creeping back up — the same memory
         // win `build_project_graph`'s populate phase secures.
         {
@@ -2553,6 +2559,7 @@ impl ProjectContext {
             let outputs_ref = this.outputs.read();
             if let Some(outputs) = outputs_ref.as_ref() {
                 for &file in &outputs.project_files {
+                    ty_python_core::semantic_index(&this.db, file).clear();
                     parsed_module(&this.db, file).clear();
                 }
             }
