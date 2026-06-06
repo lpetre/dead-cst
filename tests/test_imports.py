@@ -1236,27 +1236,140 @@ def test_star_reexport_mints_per_name_and_statement_nodes(build_decl_graph):
     assert per_name == {"pkg.g", "pkg.h"}
 
 
-def test_circular_star_reexport_keeps_binding_self_loop(build_decl_graph):
-    """A circular star re-export keeps the binding-side self-loop.
+@pytest.mark.parametrize(
+    ("files", "expected_self_loops"),
+    [
+        pytest.param(
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "from pkg.b import g",
+                "pkg/b.py": "from pkg.a import *",
+            },
+            {"pkg.a.g"},
+            id="binding-circular-star",
+        ),
+        pytest.param(
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "from pkg.b import g",
+                "pkg/b.py": "from pkg.c import *",
+                "pkg/c.py": "from pkg.a import *",
+            },
+            {"pkg.a.g"},
+            id="binding-two-hop-circular-star",
+        ),
+        pytest.param(
+            # The chain walk stops on a non-star import, so mutual
+            # from-imports form a 2-cycle (a.g -> b.g -> a.g), never a
+            # self-loop.
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "from pkg.b import g",
+                "pkg/b.py": "from pkg.a import g",
+            },
+            set(),
+            id="binding-mutual-from-imports",
+        ),
+        pytest.param(
+            # Self-imports suppress the whole binding emission (module
+            # and decl edges included), so no self-loop can form.
+            {
+                "pkg/__init__.py": "x = 1\nfrom pkg import x as y\n",
+            },
+            set(),
+            id="binding-self-import-suppressed",
+        ),
+        pytest.param(
+            # `as h` re-keys the alias: b's star re-export binds `h`,
+            # so the chain walk for `g` finds nothing in b and the
+            # cycle never closes.
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "from pkg.b import g as h",
+                "pkg/b.py": "from pkg.a import *",
+            },
+            set(),
+            id="binding-aliased-circular-star",
+        ),
+        pytest.param(
+            # A real upstream decl terminates the chain walk — the
+            # star hop is pass-through, not circular.
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "from pkg.b import g",
+                "pkg/b.py": "from pkg.c import *",
+                "pkg/c.py": "def g(): pass",
+            },
+            set(),
+            id="binding-star-chain-real-decl",
+        ),
+        pytest.param(
+            # Use side: a module-level use of the module's own alias
+            # resolves to the module node itself and is filtered
+            # (`dst == owner`); the binding side independently
+            # suppresses the self-import.
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "import pkg.a\nprint(pkg.a)\n",
+            },
+            set(),
+            id="use-module-self-import",
+        ),
+        pytest.param(
+            # Use side: a nested-context self-import used inside the
+            # very decl it resolves back to (`g` importing and
+            # returning itself) is filtered; only the
+            # `g -> Module(pkg.a)` reachability edge survives.
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "def g():\n    from pkg.a import g as gg\n    return gg\n",
+            },
+            set(),
+            id="use-nested-self-import",
+        ),
+        pytest.param(
+            # A module-level use of the circularly-star-bound name
+            # adds use edges (module -> alias, module -> upstream) but
+            # no new self-loops — the binding self-loop is the only
+            # one.
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "from pkg.b import g\ng()\n",
+                "pkg/b.py": "from pkg.a import *",
+            },
+            {"pkg.a.g"},
+            id="use-on-circular-star-binding",
+        ),
+        pytest.param(
+            # Same, with the use on the star-importing side: b's use
+            # of its star-bound `g` lands back on a's alias (a
+            # cross-file edge, not a self-loop).
+            {
+                "pkg/__init__.py": "",
+                "pkg/a.py": "from pkg.b import g",
+                "pkg/b.py": "from pkg.a import *\nVALUE = g\n",
+            },
+            {"pkg.a.g"},
+            id="use-downstream-of-circular-star",
+        ),
+    ],
+)
+def test_self_loop_edges(build_decl_graph, files, expected_self_loops):
+    """Self-loop parity, binding side vs use side.
 
-    ``a.py: from pkg.b import g`` / ``b.py: from pkg.a import *`` — the
-    alias's chain walk hops through b's star re-export and lands back on
-    a's own ``g`` alias. The resulting ``pkg.a.g -> pkg.a.g`` self-edge
-    is deliberately kept: the binding side has never filtered
-    self-edges (only use-site emission skips ``dst == owner``), and
-    edge inventories must stay stable across pipeline refactors.
-    Reachability is unaffected either way.
+    The binding side (an import alias's own upstream edges) has never
+    filtered self-edges: a circular star re-export can land
+    `walk_exports_chain` back on the alias itself, and that self-loop
+    is kept. The use side (name uses flowing through an alias) mirrors
+    the old ``emit_edge`` ``dst != owner`` skip and never produces one.
+    Reachability is unaffected either way, but edge inventories must
+    stay stable across pipeline refactors — every expectation here is
+    pinned against the pre-RefSpec pipeline's output.
     """
-    graph = build_decl_graph(
-        {
-            "pkg/__init__.py": "",
-            "pkg/a.py": "from pkg.b import g",
-            "pkg/b.py": "from pkg.a import *",
-        }
-    )
+    graph = build_decl_graph(files)
     nodes = graph.nodes()
     self_loops = {nodes[u].fqname for u, v, _ in graph.edges() if u == v}
-    assert "pkg.a.g" in self_loops, self_loops
+    assert self_loops == expected_self_loops
 
 
 def test_cross_dep_submodule_import(tmp_path, make_analysis, assert_edges):

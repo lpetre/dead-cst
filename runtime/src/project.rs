@@ -775,17 +775,12 @@ fn assemble_graph<'db>(
         });
     }
 
-    // Pass 0: resolution gather. Runs before pass 1 so the resolve
-    // fan-out can share pass 1's rayon section: the resolves touch
-    // only salsa snapshots — never the builder — so they overlap the
-    // node fill instead of serializing after it.
-    //
-    // Every `Member` / `Dynamic` spec row is interned HERE, exactly
-    // once, into a dense id (`spec_ids[pos][i]` parallels
-    // `spec_payloads[pos].specs`), so the downstream passes —
-    // unresolved stamping, edge translation — index a Vec instead of
-    // re-hashing string-keyed rows. At tens-of-millions-of-rows scale
-    // the repeated row hashing dominated assemble time.
+    // Pass 0: serial-only resolution prep — fetch the spec payloads
+    // (salsa cache reads that borrow from the main db handle, so they
+    // can't move off this thread), derive the per-file anchor-directory
+    // ids, and pre-clone the snapshot pool. Everything row-shaped (the
+    // unique-key interning, the class-base gather) runs inside pass 1's
+    // resolve arm instead, overlapped with the node fill.
     let t_pass0_start = std::time::Instant::now();
     let mut spec_payloads: Vec<&FileRefSpecs> = Vec::with_capacity(project_files.len());
     for &file in project_files {
@@ -813,72 +808,13 @@ fn assemble_graph<'db>(
         dir_ids.push(id);
     }
 
-    // Unique-key interning, in encounter order (deterministic: the
-    // file list and each payload's specs are sorted). External mint
-    // order does not depend on this order — the External pre-mint
-    // sorts by (fqname, path) itself. Hot imports repeated across a
-    // directory (or project-wide, one entry per directory) resolve
-    // once, not once per use site.
-    const LOCAL_SPEC: u32 = u32::MAX;
-    let mut member_keys: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
-    let mut member_work: Vec<(File, &MemberRef)> = Vec::new();
-    let mut dynamic_keys: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
-    let mut dynamic_work: Vec<(File, &DynamicRef)> = Vec::new();
-    let mut spec_ids: Vec<Box<[u32]>> = Vec::with_capacity(project_files.len());
-    for (pos, payload) in spec_payloads.iter().enumerate() {
-        let dir = dir_ids[pos];
-        let anchor = dir_anchors[dir as usize];
-        let mut ids: Vec<u32> = Vec::with_capacity(payload.specs.len());
-        for spec in payload.specs.iter() {
-            let id = match &spec.target {
-                Target::Local(_) => LOCAL_SPEC,
-                Target::Member(m) => *member_keys.entry((m, dir)).or_insert_with(|| {
-                    member_work.push((anchor, m));
-                    (member_work.len() - 1) as u32
-                }),
-                Target::Dynamic(d) => *dynamic_keys.entry((d, dir)).or_insert_with(|| {
-                    dynamic_work.push((anchor, d));
-                    (dynamic_work.len() - 1) as u32
-                }),
-            };
-            ids.push(id);
-        }
-        spec_ids.push(ids.into_boxed_slice());
-    }
-    drop(member_keys);
-    drop(dynamic_keys);
-
-    // Class-base member gather: the unique `(module, name, dir)` rows
-    // the post-assembly class-hierarchy fan-in needs resolved. Joining
-    // them into this pass's resolve arm overlaps them with the node
-    // fill; `class_keys` is kept to build the owned memo handed back
-    // through `AssembledGraph`.
-    let mut class_keys: FxHashMap<(&str, &str, u32), u32> = FxHashMap::default();
-    let mut class_work: Vec<(File, &str, &str)> = Vec::new();
-    for (pos, mint) in mints.iter().enumerate() {
-        let dir = dir_ids[pos];
-        let anchor = dir_anchors[dir as usize];
-        for (_cls_rk, bases) in &mint.payload.class_bases {
-            for base in bases.iter() {
-                if let ClassBaseSpec::ModuleMember { module, name } = base {
-                    class_keys
-                        .entry((module.as_str(), name.as_str(), dir))
-                        .or_insert_with(|| {
-                            class_work.push((anchor, module.as_str(), name.as_str()));
-                            (class_work.len() - 1) as u32
-                        });
-                }
-            }
-        }
-    }
-
-    // Per-chunk salsa snapshots, cloned here on the main thread (a
-    // salsa clone must not race a worker mid-query — the populate
-    // fan-out documents the same hazard).
-    let member_job = prepare_job(db, &member_work);
-    let dynamic_job = prepare_job(db, &dynamic_work);
-    let parent_job = prepare_job(db, project_files);
-    let class_job = prepare_job(db, &class_work);
+    // Snapshot pool for the resolve fan-out, cloned here on the main
+    // thread (a salsa clone must not race a worker mid-query — the
+    // populate fan-out documents the same hazard). A recycled pool
+    // rather than per-chunk clones because the chunk counts aren't
+    // known until the gather runs (on a worker, overlapped with the
+    // node fill).
+    let pool = DbPool::new(db);
 
     if std::env::var_os("DEAD_CST_TIMING").is_some() {
         eprintln!("[dead-cst-timing] pass0={:?}", t_pass0_start.elapsed());
@@ -897,35 +833,137 @@ fn assemble_graph<'db>(
         rest = tail;
     }
 
-    // The resolve arm: every cross-file resolution family — member
-    // refs, dynamic refs, the parent-module sweep, class bases — run
-    // concurrently with the node fill on the same rayon pool. Touches
-    // only salsa snapshots, never the builder, so it composes with
-    // pass 1's mutable folds. (The pass1 timing line therefore covers
-    // the resolves too.)
-    let resolve_arm = move || {
+    /// Everything the resolve arm hands back across the pass-1 join.
+    /// All `'static` row data — no payload borrows escape the arm.
+    struct ResolveOutputs {
+        member_results: Vec<crate::refspec::ResolvedMember>,
+        dynamic_results: Vec<SmallVec<[ResolvedNode; 4]>>,
+        parent_results: Vec<Option<File>>,
+        spec_ids: Vec<Box<[u32]>>,
+        class_base_memo: ClassBaseMemo,
+        gather_time: std::time::Duration,
+        resolve_time: std::time::Duration,
+    }
+
+    // The resolve arm: the row-shaped gather plus every cross-file
+    // resolution family — member refs, dynamic refs, the parent-module
+    // sweep, class bases — run concurrently with the node fill on the
+    // same rayon pool. Touches only salsa snapshots (via the pool),
+    // never the builder, so it composes with pass 1's mutable folds.
+    let spec_payloads_ref = &spec_payloads;
+    let dir_ids_ref = &dir_ids;
+    let dir_anchors_ref = &dir_anchors;
+    let mints_for_arm = &mints;
+    let resolve_arm = move || -> ResolveOutputs {
+        // Gather: intern every `Member` / `Dynamic` spec row, exactly
+        // once, into a dense id (`spec_ids[pos][i]` parallels
+        // `spec_payloads[pos].specs`), so the downstream passes —
+        // unresolved stamping, edge translation — index a Vec instead
+        // of re-hashing string-keyed rows. At tens-of-millions-of-rows
+        // scale the repeated row hashing dominated assemble time.
+        // Encounter order is deterministic (the file list and each
+        // payload's specs are sorted); External mint order does not
+        // depend on it — the External pre-mint sorts by (fqname, path)
+        // itself. Hot imports repeated across a directory (or
+        // project-wide, one entry per directory) resolve once, not
+        // once per use site.
+        let t_gather = std::time::Instant::now();
+        const LOCAL_SPEC: u32 = u32::MAX;
+        let mut member_keys: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
+        let mut member_work: Vec<(File, &MemberRef)> = Vec::new();
+        let mut dynamic_keys: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
+        let mut dynamic_work: Vec<(File, &DynamicRef)> = Vec::new();
+        let mut spec_ids: Vec<Box<[u32]>> = Vec::with_capacity(spec_payloads_ref.len());
+        for (pos, payload) in spec_payloads_ref.iter().enumerate() {
+            let dir = dir_ids_ref[pos];
+            let anchor = dir_anchors_ref[dir as usize];
+            let mut ids: Vec<u32> = Vec::with_capacity(payload.specs.len());
+            for spec in payload.specs.iter() {
+                let id = match &spec.target {
+                    Target::Local(_) => LOCAL_SPEC,
+                    Target::Member(m) => *member_keys.entry((m, dir)).or_insert_with(|| {
+                        member_work.push((anchor, m));
+                        (member_work.len() - 1) as u32
+                    }),
+                    Target::Dynamic(d) => *dynamic_keys.entry((d, dir)).or_insert_with(|| {
+                        dynamic_work.push((anchor, d));
+                        (dynamic_work.len() - 1) as u32
+                    }),
+                };
+                ids.push(id);
+            }
+            spec_ids.push(ids.into_boxed_slice());
+        }
+        drop(member_keys);
+        drop(dynamic_keys);
+
+        // Class-base member gather: the unique `(module, name, dir)`
+        // rows the post-assembly class-hierarchy fan-in needs resolved.
+        let mut class_keys: FxHashMap<(&str, &str, u32), u32> = FxHashMap::default();
+        let mut class_work: Vec<(File, &str, &str)> = Vec::new();
+        for (pos, mint) in mints_for_arm.iter().enumerate() {
+            let dir = dir_ids_ref[pos];
+            let anchor = dir_anchors_ref[dir as usize];
+            for (_cls_rk, bases) in &mint.payload.class_bases {
+                for base in bases.iter() {
+                    if let ClassBaseSpec::ModuleMember { module, name } = base {
+                        class_keys
+                            .entry((module.as_str(), name.as_str(), dir))
+                            .or_insert_with(|| {
+                                class_work.push((anchor, module.as_str(), name.as_str()));
+                                (class_work.len() - 1) as u32
+                            });
+                    }
+                }
+            }
+        }
+        let gather_time = t_gather.elapsed();
+
+        let t_resolve = std::time::Instant::now();
         let member_results: Vec<crate::refspec::ResolvedMember> =
-            run_job(member_job, |ldb, &(anchor, m)| {
+            run_job(&pool, &member_work, |ldb, &(anchor, m)| {
                 resolve_member(ldb, anchor, m)
             });
         let dynamic_results: Vec<SmallVec<[ResolvedNode; 4]>> =
-            run_job(dynamic_job, |ldb, &(anchor, d)| {
+            run_job(&pool, &dynamic_work, |ldb, &(anchor, d)| {
                 resolve_dynamic(ldb, anchor, d)
             });
-        let parent_results: Vec<Option<File>> =
-            run_job(parent_job, |ldb, &file| parent_module_file(ldb, file));
+        let parent_results: Vec<Option<File>> = run_job(&pool, project_files, |ldb, &file| {
+            parent_module_file(ldb, file)
+        });
         let class_results: Vec<Option<(File, TextRange)>> =
-            run_job(class_job, |ldb, &(anchor, module, name)| {
+            run_job(&pool, &class_work, |ldb, &(anchor, module, name)| {
                 resolve_member_def(ldb, module, name, anchor, 0)
             });
-        (
+
+        // Owned `(module, name, dir)` → resolved-base memo for the
+        // post-assembly class-hierarchy fan-in (scatter-only; the
+        // resolves just ran, overlapped with the node fill).
+        let mut class_base_memo: ClassBaseMemo =
+            FxHashMap::with_capacity_and_hasher(class_work.len(), Default::default());
+        for ((module, name, dir), id) in &class_keys {
+            class_base_memo.insert(
+                (
+                    CompactString::from(*module),
+                    CompactString::from(*name),
+                    *dir,
+                ),
+                class_results[*id as usize],
+            );
+        }
+
+        ResolveOutputs {
             member_results,
             dynamic_results,
             parent_results,
-            class_results,
-        )
+            spec_ids,
+            class_base_memo,
+            gather_time,
+            resolve_time: t_resolve.elapsed(),
+        }
     };
 
+    // 1b: parallel node fill + concurrent index folds.
     // 1b: parallel node fill + concurrent index folds.
     let mints_ref = &mints;
     let counters_ref: &ProgressCounters = counters;
@@ -935,149 +973,142 @@ fn assemble_graph<'db>(
     let module_nodes_mut = &mut module_nodes_by_file;
     let class_by_selection_mut = &mut class_by_selection;
     let decl_by_name_range_mut = &mut decl_by_name_range;
-    let ((key_rows, ()), (member_results, dynamic_results, parent_results, class_results)) = py
-        .allow_threads(move || {
-            use rayon::prelude::*;
-            rayon::join(
-                || {
-                    rayon::join(
-                        move || -> PyResult<Vec<Vec<(NodeKey, usize)>>> {
-                            mints_ref
-                                .par_iter()
-                                .zip_eq(file_slices)
-                                .map(|(mint, slots)| {
-                                    let mut keys: Vec<(NodeKey, usize)> =
-                                        Vec::with_capacity(mint.payload.nodes.len());
-                                    for (local_idx, node_data) in
-                                        mint.payload.nodes.iter().enumerate()
-                                    {
-                                        let node_ref = mint.payload.refs[local_idx];
+    let ((key_rows, ()), resolve_outputs) = py.allow_threads(move || {
+        use rayon::prelude::*;
+        rayon::join(
+            || {
+                rayon::join(
+                    move || -> PyResult<Vec<Vec<(NodeKey, usize)>>> {
+                        mints_ref
+                            .par_iter()
+                            .zip_eq(file_slices)
+                            .map(|(mint, slots)| {
+                                let mut keys: Vec<(NodeKey, usize)> =
+                                    Vec::with_capacity(mint.payload.nodes.len());
+                                for (local_idx, node_data) in mint.payload.nodes.iter().enumerate()
+                                {
+                                    let node_ref = mint.payload.refs[local_idx];
 
-                                        // Apply stub-only ENTRYPOINT flag if needed.
-                                        let mut flags = node_data.flags;
-                                        if mint.is_stub && matches!(node_ref, NodeRef::Def(_)) {
-                                            let has_runtime = match mint.twin_payload {
-                                                Some(py_payload) => {
-                                                    let name = node_data
-                                                        .fqname
-                                                        .rsplit('.')
-                                                        .next()
-                                                        .unwrap_or("");
-                                                    py_payload.exports_by_name.contains_key(name)
-                                                }
-                                                None => false,
-                                            };
-                                            if !has_runtime {
-                                                flags |= NODE_FLAG_ENTRYPOINT;
+                                    // Apply stub-only ENTRYPOINT flag if needed.
+                                    let mut flags = node_data.flags;
+                                    if mint.is_stub && matches!(node_ref, NodeRef::Def(_)) {
+                                        let has_runtime = match mint.twin_payload {
+                                            Some(py_payload) => {
+                                                let name = node_data
+                                                    .fqname
+                                                    .rsplit('.')
+                                                    .next()
+                                                    .unwrap_or("");
+                                                py_payload.exports_by_name.contains_key(name)
                                             }
-                                        }
-
-                                        let node = GraphNode {
-                                            fqname: node_data.fqname.to_string(),
-                                            kind: intern_kind(node_data.kind.as_static_str())?,
-                                            // Every node in this file's payload shares
-                                            // the file, so its path is the per-file
-                                            // `path_str` — re-derived once per file
-                                            // instead of stored per `NodeData`.
-                                            path: mint.path_str.clone(),
-                                            start_line: node_data.start_line,
-                                            start_column: node_data.start_column,
-                                            end_line: node_data.end_line,
-                                            end_column: node_data.end_column,
-                                            flags,
-                                            is_overload: node_data.is_overload,
-                                            imports: node_data.imports.clone(),
+                                            None => false,
                                         };
-                                        keys.push((node.key(mint.file), mint.base + local_idx));
-                                        slots[local_idx] = node;
-                                    }
-                                    counters_ref.assemble_inc();
-                                    Ok(keys)
-                                })
-                                .collect()
-                        },
-                        move || {
-                            // Each index fold is a serial insert loop over `Copy`
-                            // keys — cheap enough per map that one task per map
-                            // (rather than per-file sharding + merge) hides them
-                            // behind the node fill.
-                            rayon::join(
-                                move || {
-                                    for mint in mints_ref {
-                                        for (local_idx, &node_ref) in
-                                            mint.payload.refs.iter().enumerate()
-                                        {
-                                            ref_to_global_mut
-                                                .insert(node_ref, mint.base + local_idx);
+                                        if !has_runtime {
+                                            flags |= NODE_FLAG_ENTRYPOINT;
                                         }
                                     }
-                                },
-                                move || {
-                                    rayon::join(
-                                        move || {
-                                            for mint in mints_ref {
-                                                for local_idx in 0..mint.payload.refs.len() {
-                                                    local_to_global_mut.insert(
-                                                        (mint.file, local_idx as u32),
-                                                        mint.base + local_idx,
-                                                    );
-                                                }
+
+                                    let node = GraphNode {
+                                        fqname: node_data.fqname.to_string(),
+                                        kind: intern_kind(node_data.kind.as_static_str())?,
+                                        // Every node in this file's payload shares
+                                        // the file, so its path is the per-file
+                                        // `path_str` — re-derived once per file
+                                        // instead of stored per `NodeData`.
+                                        path: mint.path_str.clone(),
+                                        start_line: node_data.start_line,
+                                        start_column: node_data.start_column,
+                                        end_line: node_data.end_line,
+                                        end_column: node_data.end_column,
+                                        flags,
+                                        is_overload: node_data.is_overload,
+                                        imports: node_data.imports.clone(),
+                                    };
+                                    keys.push((node.key(mint.file), mint.base + local_idx));
+                                    slots[local_idx] = node;
+                                }
+                                counters_ref.assemble_inc();
+                                Ok(keys)
+                            })
+                            .collect()
+                    },
+                    move || {
+                        // Each index fold is a serial insert loop over `Copy`
+                        // keys — cheap enough per map that one task per map
+                        // (rather than per-file sharding + merge) hides them
+                        // behind the node fill.
+                        rayon::join(
+                            move || {
+                                for mint in mints_ref {
+                                    for (local_idx, &node_ref) in
+                                        mint.payload.refs.iter().enumerate()
+                                    {
+                                        ref_to_global_mut.insert(node_ref, mint.base + local_idx);
+                                    }
+                                }
+                            },
+                            move || {
+                                rayon::join(
+                                    move || {
+                                        for mint in mints_ref {
+                                            for local_idx in 0..mint.payload.refs.len() {
+                                                local_to_global_mut.insert(
+                                                    (mint.file, local_idx as u32),
+                                                    mint.base + local_idx,
+                                                );
                                             }
-                                        },
-                                        move || {
-                                            for mint in mints_ref {
-                                                for (local_idx, &node_ref) in
-                                                    mint.payload.refs.iter().enumerate()
-                                                {
-                                                    let global_idx = mint.base + local_idx;
-                                                    match node_ref {
-                                                        NodeRef::Module(_) => {
-                                                            module_nodes_mut
-                                                                .insert(mint.file, global_idx);
-                                                        }
-                                                        NodeRef::Def(d) => {
-                                                            // `d` is already the `(file,
-                                                            // place_id, name_range)` triple
-                                                            // `global_index` keys on.
-                                                            global_index_mut.insert(d, global_idx);
-                                                            let node_data =
-                                                                &mint.payload.nodes[local_idx];
-                                                            let rk = node_data.name_range;
-                                                            if matches!(
-                                                                node_data.kind,
-                                                                NodeKind::Class
-                                                            ) {
-                                                                class_by_selection_mut.insert(
-                                                                    (mint.file, rk),
-                                                                    global_idx,
-                                                                );
-                                                            }
-                                                            decl_by_name_range_mut.insert(
+                                        }
+                                    },
+                                    move || {
+                                        for mint in mints_ref {
+                                            for (local_idx, &node_ref) in
+                                                mint.payload.refs.iter().enumerate()
+                                            {
+                                                let global_idx = mint.base + local_idx;
+                                                match node_ref {
+                                                    NodeRef::Module(_) => {
+                                                        module_nodes_mut
+                                                            .insert(mint.file, global_idx);
+                                                    }
+                                                    NodeRef::Def(d) => {
+                                                        // `d` is already the `(file,
+                                                        // place_id, name_range)` triple
+                                                        // `global_index` keys on.
+                                                        global_index_mut.insert(d, global_idx);
+                                                        let node_data =
+                                                            &mint.payload.nodes[local_idx];
+                                                        let rk = node_data.name_range;
+                                                        if matches!(node_data.kind, NodeKind::Class)
+                                                        {
+                                                            class_by_selection_mut.insert(
                                                                 (mint.file, rk),
                                                                 global_idx,
                                                             );
                                                         }
-                                                        NodeRef::StarStmt(_, _) => {
-                                                            // The kept `*<src>` star-statement
-                                                            // node. Not a real decl, so it
-                                                            // contributes nothing to the decl
-                                                            // indices; the `ref_to_global` /
-                                                            // `local_to_global` folds already
-                                                            // wired it up.
-                                                        }
+                                                        decl_by_name_range_mut
+                                                            .insert((mint.file, rk), global_idx);
+                                                    }
+                                                    NodeRef::StarStmt(_, _) => {
+                                                        // The kept `*<src>` star-statement
+                                                        // node. Not a real decl, so it
+                                                        // contributes nothing to the decl
+                                                        // indices; the `ref_to_global` /
+                                                        // `local_to_global` folds already
+                                                        // wired it up.
                                                     }
                                                 }
                                             }
-                                        },
-                                    );
-                                },
-                            );
-                        },
-                    )
-                },
-                resolve_arm,
-            )
-        });
+                                        }
+                                    },
+                                );
+                            },
+                        );
+                    },
+                )
+            },
+            resolve_arm,
+        )
+    });
 
     // 1c: fold the parallel fill's key rows into `node_index`. Payload
     // nodes are position-distinct (`CLAUDE.md` principle 3), so no two
@@ -1095,8 +1126,26 @@ fn assemble_graph<'db>(
         }
     }
 
+    let ResolveOutputs {
+        member_results,
+        dynamic_results,
+        parent_results,
+        spec_ids,
+        class_base_memo,
+        gather_time,
+        resolve_time,
+    } = resolve_outputs;
+
     if std::env::var_os("DEAD_CST_TIMING").is_some() {
-        eprintln!("[dead-cst-timing] pass1={:?}", t_pass1_start.elapsed());
+        // pass1 is the wall time of the whole join: node mint + index
+        // folds on one arm, the gather + resolves on the other.
+        // gather/resolve are the resolve arm's internal split.
+        eprintln!(
+            "[dead-cst-timing] pass1={:?} (resolve arm: gather={:?} resolve={:?})",
+            t_pass1_start.elapsed(),
+            gather_time,
+            resolve_time,
+        );
     }
 
     // Pass 2: edge translation. All cross-file resolution already ran
@@ -1355,22 +1404,6 @@ fn assemble_graph<'db>(
         emit_visitor_warning(py, msg);
     }
 
-    // Owned `(module, name, dir)` → resolved-base memo for the
-    // post-assembly class-hierarchy fan-in (scatter-only now — the
-    // resolves already ran in pass 1's resolve arm).
-    let mut class_base_memo: ClassBaseMemo =
-        FxHashMap::with_capacity_and_hasher(class_work.len(), Default::default());
-    for ((module, name, dir), id) in &class_keys {
-        class_base_memo.insert(
-            (
-                CompactString::from(*module),
-                CompactString::from(*name),
-                *dir,
-            ),
-            class_results[*id as usize],
-        );
-    }
-
     Ok(AssembledGraph {
         builder,
         global_index,
@@ -1404,47 +1437,67 @@ fn translate_resolved(
     }
 }
 
-/// One pre-chunked family of cross-file resolution work, with one
-/// salsa snapshot per chunk. Prepared on the main thread by
-/// [`prepare_job`] (a salsa clone must not race a worker mid-query —
-/// the populate fan-out documents the same hazard), executed by
-/// [`run_job`] inside an already-parallel rayon section.
-struct ChunkedJob<'w, T> {
-    chunks: Vec<&'w [T]>,
-    dbs: Vec<ProjectDatabase>,
+/// Fixed pool of salsa snapshots for the resolve fan-out, cloned on
+/// the main thread up front (a salsa clone must not race a worker
+/// mid-query — the populate fan-out documents the same hazard) and
+/// recycled through a bounded channel. A pool rather than per-chunk
+/// clones because the resolve arm's chunk counts aren't known until
+/// its gather runs, on a rayon worker.
+///
+/// Sized to the executing rayon pool, so at most `num_workers` chunk
+/// tasks run at once and a `recv` can never starve: every checked-out
+/// snapshot belongs to a task that is actively running on some thread
+/// and will send it back.
+struct DbPool {
+    tx: crossbeam_channel::Sender<ProjectDatabase>,
+    rx: crossbeam_channel::Receiver<ProjectDatabase>,
+    num_workers: usize,
 }
 
-/// Chunk `work` 16× finer than the worker count: resolution cost is
-/// skewed (one package's imports cluster in encounter order), so
-/// fine-grained chunks let rayon's work-stealing even out the tail
-/// instead of one worker dragging a fat chunk — and the small families
-/// (class bases, parent modules) still spread across every core.
-fn prepare_job<'w, T>(db: &ProjectDatabase, work: &'w [T]) -> ChunkedJob<'w, T> {
-    let num_workers = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(4);
-    let chunk_size = work.len().div_ceil(num_workers * 16).max(1);
-    let chunks: Vec<&'w [T]> = work.chunks(chunk_size).collect();
-    let dbs: Vec<ProjectDatabase> = (0..chunks.len()).map(|_| db.clone()).collect();
-    ChunkedJob { chunks, dbs }
+impl DbPool {
+    fn new(db: &ProjectDatabase) -> Self {
+        let num_workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        let (tx, rx) = crossbeam_channel::bounded::<ProjectDatabase>(num_workers);
+        for _ in 0..num_workers {
+            tx.send(db.clone()).expect("channel open");
+        }
+        DbPool {
+            tx,
+            rx,
+            num_workers,
+        }
+    }
 }
 
-/// Run `f` over a prepared job on the current rayon pool. Results come
-/// back in `work` order, so deterministic inputs give deterministic
-/// outputs regardless of scheduling. Pure rust — composes inside
-/// `py.allow_threads` / a rayon join arm.
+/// Run `f` over `work` on the current rayon pool, drawing snapshots
+/// from the pool per chunk. Chunked 16× finer than the worker count:
+/// resolution cost is skewed (one package's imports cluster in
+/// encounter order), so fine-grained chunks let work-stealing even out
+/// the tail, and the small families (class bases, parent modules)
+/// still spread across every core. Results come back in `work` order,
+/// so deterministic inputs give deterministic outputs regardless of
+/// scheduling. Pure rust — composes inside `py.allow_threads` / a
+/// rayon join arm.
 fn run_job<T: Sync, R: Send>(
-    job: ChunkedJob<'_, T>,
+    pool: &DbPool,
+    work: &[T],
     f: impl Fn(&ProjectDatabase, &T) -> R + Send + Sync,
 ) -> Vec<R> {
     use rayon::prelude::*;
-    let nested: Vec<Vec<R>> = job
-        .dbs
-        .into_par_iter()
-        .zip(job.chunks.into_par_iter())
-        .map(|(local_db, chunk)| {
+    if work.is_empty() {
+        return Vec::new();
+    }
+    let chunk_size = work.len().div_ceil(pool.num_workers * 16).max(1);
+    let nested: Vec<Vec<R>> = work
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let local_db = pool.rx.recv().expect("snapshot available");
             use salsa::Database as _;
-            local_db.attach(|ldb| chunk.iter().map(|item| f(ldb, item)).collect())
+            let out = local_db.attach(|ldb| chunk.iter().map(|item| f(ldb, item)).collect());
+            pool.tx.send(local_db).expect("channel open");
+            out
         })
         .collect();
     nested.into_iter().flatten().collect()
