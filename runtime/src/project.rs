@@ -1025,8 +1025,29 @@ fn assemble_graph<'db>(
             resolve_dynamic(ldb, dir_anchors_ref[dir as usize], d)
         });
 
-    // 2c: serial fold into idx-level memos. External nodes intern on
-    // first encounter, in sorted-key order — deterministic indices.
+    // 2c: serial fold into idx-level memos.
+    //
+    // External nodes are pre-minted in (fqname, path) order across every
+    // resolution output — the same deterministic order the old pipeline
+    // used — so duplicate-fqname externals keep the lexicographically
+    // smallest path and land at the same graph indices.
+    // `intern_external` dedups by fqname, so the memo folds below hit
+    // the pre-minted nodes.
+    {
+        let mut externals: Vec<(&str, String, File)> = Vec::new();
+        let member_nodes = member_results.iter().flat_map(|res| res.targets.iter());
+        let dynamic_nodes = dynamic_results.iter().flatten();
+        for node in member_nodes.chain(dynamic_nodes) {
+            if let ResolvedNode::External { fqname, file } = node {
+                externals.push((fqname.as_str(), file_path_string(db, *file), *file));
+            }
+        }
+        externals.sort_unstable();
+        for (fqname, path, file) in externals {
+            builder.intern_external(fqname.to_string(), path, file);
+        }
+    }
+
     struct MemberSlot {
         idxs: SmallVec<[usize; 4]>,
         unresolved: bool,
@@ -1142,12 +1163,26 @@ fn assemble_graph<'db>(
                                     // the old `target_file == file` skip,
                                     // which must apply per importing file,
                                     // not per memo entry).
-                                    let self_import = matches!(m.role, MemberRole::Binding)
-                                        && slot.start_file == Some(file);
-                                    if !self_import {
-                                        for &idx in &slot.idxs {
-                                            if idx != src_idx {
-                                                out.push((src_idx, idx, flags));
+                                    match m.role {
+                                        MemberRole::Binding => {
+                                            // Old file_to_edges had no self
+                                            // filter: a circular star
+                                            // re-export can land the chain
+                                            // walk back on the alias itself,
+                                            // and that self-loop is kept.
+                                            if slot.start_file != Some(file) {
+                                                for &idx in &slot.idxs {
+                                                    out.push((src_idx, idx, flags));
+                                                }
+                                            }
+                                        }
+                                        MemberRole::Use => {
+                                            // Use side mirrors the old
+                                            // emit_edge `dst != owner` skip.
+                                            for &idx in &slot.idxs {
+                                                if idx != src_idx {
+                                                    out.push((src_idx, idx, flags));
+                                                }
                                             }
                                         }
                                     }
