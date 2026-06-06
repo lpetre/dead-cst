@@ -270,7 +270,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
     /// Emit an edge from `self.owner` to a real External node carrying
     /// the resolved upstream path: `[external dist] X` / `[external file] X`
     /// for site-packages (via `external_fqname_for`'s PEP 503 lookup).
-    fn emit_external_node(&mut self, fqname: String, target_file: File) {
+    fn emit_external_node(&mut self, fqname: compact_str::CompactString, target_file: File) {
         let key = ExternalKey::new(self.db, fqname, target_file);
         self.emit_edge(NodeRef::External(key));
     }
@@ -504,7 +504,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 None => (first_seg, dotted.split('.').skip(1).collect()),
             };
             let spec = ImportPayload {
-                module: dotted.to_string(),
+                module: compact_str::ToCompactString::to_compact_string(&dotted),
                 decl: None,
                 star: false,
             };
@@ -537,8 +537,8 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                 None => name,
             };
             let spec = ImportPayload {
-                module: module_str.clone(),
-                decl: Some(name.to_string()),
+                module: module_str.as_str().into(),
+                decl: Some(compact_str::CompactString::from(name)),
                 star: false,
             };
             self.emit_upstream(&spec, bound_name, &[]);
@@ -762,7 +762,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             if module_name_resolves(&candidate, self.file, db) {
                 loading_target = candidate;
             } else {
-                loading_target = spec.module.clone();
+                loading_target = spec.module.to_string();
                 decl_tail = Some(bound_name.to_string());
             }
         } else {
@@ -772,8 +772,8 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                     if module_name_resolves(&candidate, self.file, db) {
                         loading_target = candidate;
                     } else {
-                        loading_target = spec.module.clone();
-                        decl_tail = Some(decl.clone());
+                        loading_target = spec.module.to_string();
+                        decl_tail = Some(decl.to_string());
                     }
                 }
                 None => {
@@ -789,12 +789,12 @@ impl<'a, 'db> RefWalker<'a, 'db> {
                                 .all(|(a, b)| *a == *b);
                         if prefix_matches {
                             adjusted_chain.drain(..n);
-                            loading_target = spec.module.clone();
+                            loading_target = spec.module.to_string();
                         } else {
                             loading_target = module_first_seg;
                         }
                     } else {
-                        loading_target = spec.module.clone();
+                        loading_target = spec.module.to_string();
                     }
                 }
             }
@@ -845,7 +845,7 @@ impl<'a, 'db> RefWalker<'a, 'db> {
             // *use* side, which should reach the star alias itself.
             self.emit_edge(NodeRef::Module(start_file));
             let target_nodes = file_to_nodes(self.db, start_file);
-            if let Some(locals) = target_nodes.exports_by_name.get(&decl_name) {
+            if let Some(locals) = target_nodes.exports_by_name.get(decl_name.as_str()) {
                 for &local_idx in locals {
                     self.emit_edge(target_nodes.refs[local_idx as usize]);
                 }
