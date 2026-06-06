@@ -361,6 +361,7 @@ name = "dead-cst-runtime"
 version = "0.13.0"
 dependencies = [
  "bincode",
+ "compact_str",
  "crossbeam-channel",
  "get-size2",
  "indicatif",

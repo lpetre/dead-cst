@@ -16,6 +16,7 @@
 //! pattern — a symbolic per-file descriptor resolved at fan-in — and
 //! generalizes it to every reference edge.
 
+use compact_str::{CompactString, ToCompactString};
 use ruff_db::files::File;
 use smallvec::SmallVec;
 use ty_module_resolver::{resolve_module, ModuleName};
@@ -90,8 +91,8 @@ pub(crate) enum MemberRole {
 pub(crate) struct MemberRef {
     pub(crate) role: MemberRole,
     pub(crate) spec: ImportPayload,
-    pub(crate) bound_name: String,
-    pub(crate) chain: Vec<String>,
+    pub(crate) bound_name: CompactString,
+    pub(crate) chain: Vec<CompactString>,
 }
 
 /// Unresolved descriptor for a dynamic import. `target` is already
@@ -101,8 +102,8 @@ pub(crate) struct MemberRef {
 /// `exports_by_name` lookups.
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
 pub(crate) struct DynamicRef {
-    pub(crate) target: String,
-    pub(crate) fromlist: Vec<String>,
+    pub(crate) target: CompactString,
+    pub(crate) fromlist: Vec<CompactString>,
 }
 
 /// A resolved cross-file target, in `'static` terms, so resolution can
@@ -116,7 +117,7 @@ pub(crate) enum ResolvedNode {
     Module(File),
     Def(DeclKey),
     StarStmt(File, (u32, u32)),
-    External { fqname: String, file: File },
+    External { fqname: CompactString, file: File },
 }
 
 impl ResolvedNode {
@@ -181,9 +182,9 @@ fn resolve_binding(db: &dyn ProjectDb, anchor: File, spec: &ImportPayload) -> Re
     // p/__init__.py with a sibling p/q.py — the int binds, not
     // the submodule). Check namespace first; only switch to
     // submodule when the namespace doesn't already export decl.
-    let (target_module_str, decl_name): (String, Option<String>) = match &spec.decl {
+    let (target_module_str, decl_name): (CompactString, Option<CompactString>) = match &spec.decl {
         Some(decl) => {
-            let candidate = format!("{}.{}", spec.module, decl);
+            let candidate = compact_str::format_compact!("{}.{}", spec.module, decl);
             if module_name_resolves(&candidate, anchor, db) {
                 let namespace_has_decl = ModuleName::new(&spec.module)
                     .and_then(|mn| resolve_module(db, anchor, &mn))
@@ -277,24 +278,29 @@ fn resolve_use(db: &dyn ProjectDb, anchor: File, member: &MemberRef) -> Resolved
     if spec.module.is_empty() {
         return out;
     }
-    let module_first_seg = spec.module.split('.').next().unwrap_or("").to_string();
+    let module_first_seg = spec
+        .module
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_compact_string();
 
-    let mut adjusted_chain: Vec<&str> = member.chain.iter().map(String::as_str).collect();
-    let loading_target: String;
-    let mut decl_tail: Option<String> = None;
+    let mut adjusted_chain: Vec<&str> = member.chain.iter().map(CompactString::as_str).collect();
+    let loading_target: CompactString;
+    let mut decl_tail: Option<CompactString> = None;
 
     if spec.star {
-        let candidate = format!("{}.{}", spec.module, bound_name);
+        let candidate = compact_str::format_compact!("{}.{}", spec.module, bound_name);
         if module_name_resolves(&candidate, anchor, db) {
             loading_target = candidate;
         } else {
             loading_target = spec.module.clone();
-            decl_tail = Some(bound_name.to_string());
+            decl_tail = Some(bound_name.to_compact_string());
         }
     } else {
         match &spec.decl {
             Some(decl) => {
-                let candidate = format!("{}.{}", spec.module, decl);
+                let candidate = compact_str::format_compact!("{}.{}", spec.module, decl);
                 if module_name_resolves(&candidate, anchor, db) {
                     loading_target = candidate;
                 } else {
@@ -385,10 +391,10 @@ fn resolve_use(db: &dyn ProjectDb, anchor: File, member: &MemberRef) -> Resolved
     // land on one module (deepest reached) plus at most one
     // terminal decl.
     let mut current_file = start_file;
-    let mut current_path = loading_target.clone();
+    let mut current_path: CompactString = loading_target.clone();
     let mut terminal_decl_refs: Vec<ResolvedNode> = Vec::new();
     for seg in &adjusted_chain {
-        let candidate = format!("{current_path}.{seg}");
+        let candidate = compact_str::format_compact!("{current_path}.{seg}");
         let submodule_file = ModuleName::new(&candidate)
             .and_then(|mn| resolve_module(db, anchor, &mn))
             .and_then(|m| m.file(db));
@@ -428,7 +434,7 @@ pub(crate) fn resolve_dynamic(
         if entry.is_empty() {
             continue;
         }
-        let candidate = format!("{}.{entry}", dynamic.target);
+        let candidate = compact_str::format_compact!("{}.{entry}", dynamic.target);
         if module_name_resolves(&candidate, anchor, db) {
             resolve_module_target(db, anchor, &candidate, &mut out);
             continue;

@@ -274,9 +274,9 @@ pub(crate) enum FileLocalOp {
     /// cache into [`crate::project::BuildOutputs`] for the topic's project-wide
     /// reader.
     Fact {
-        topic: String,
+        topic: compact_str::CompactString,
         decl_local_idx: Option<u32>,
-        value: String,
+        value: compact_str::CompactString,
     },
 }
 
@@ -379,7 +379,7 @@ impl<'db> FileContext<'db> {
         parsed: &ruff_db::parsed::ParsedModuleRef,
         modules: &[String],
         names: &FxHashSet<&str>,
-    ) -> rustc_hash::FxHashMap<String, String> {
+    ) -> crate::helpers::LocalImports {
         collect_modules_imports_local(parsed, modules, names, self.file_package().as_deref())
     }
 
@@ -402,7 +402,7 @@ impl<'db> FileContext<'db> {
                     if tail.is_empty() {
                         return false;
                     }
-                    tail.to_string()
+                    compact_str::CompactString::from(tail)
                 } else {
                     match crate::helpers::resolve_relative_import(
                         im.level,
@@ -2160,15 +2160,15 @@ pub mod plugin_api {
     ) -> FileNodeView {
         FileNodeView {
             local_idx,
-            fqname: node.fqname.clone(),
+            fqname: node.fqname.to_string(),
             kind: node.kind.as_static_str().to_string(),
             path: path.to_string(),
             start_line: node.start_line,
             end_line: node.end_line,
             flags: node.flags,
             imports: node.imports.as_ref().map(|i| ImportRef {
-                module: i.module.clone(),
-                decl: i.decl.clone(),
+                module: i.module.to_string(),
+                decl: i.decl.as_ref().map(|d| d.to_string()),
                 star: i.star,
             }),
         }
@@ -2347,9 +2347,9 @@ pub mod plugin_api {
             value: impl Into<String>,
         ) {
             self.sink.push(FileLocalOp::Fact {
-                topic: topic.into(),
+                topic: topic.into().into(),
                 decl_local_idx,
-                value: value.into(),
+                value: value.into().into(),
             });
         }
     }
@@ -4064,11 +4064,12 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
         // binding name -> [fixture idx]. Binding is the `name=` kwarg literal
         // when present, else the function's simple name.
         let fixture_attrs = ctx.nodes_at(&fixture_idxs_all);
-        let mut fixtures_by_name: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        let mut fixtures_by_name: FxHashMap<compact_str::CompactString, Vec<usize>> =
+            FxHashMap::default();
         for ((idx, args), attr) in fixture_refs.iter().zip(fixture_attrs.iter()) {
             let binding = match args.kwargs.get("name") {
                 Some(ArgValue::Str(alias)) => alias.clone(),
-                _ => simple_name(&attr.fqname).to_string(),
+                _ => simple_name(&attr.fqname).into(),
             };
             fixtures_by_name.entry(binding).or_default().push(*idx);
         }
@@ -4077,7 +4078,7 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
             let params = ctx.function_parameters(&test_function_idxs);
             for (test_idx, names) in test_function_idxs.iter().zip(params) {
                 for name in names {
-                    if let Some(fixture_idxs) = fixtures_by_name.get(&name) {
+                    if let Some(fixture_idxs) = fixtures_by_name.get(name.as_str()) {
                         for &fixture_idx in fixture_idxs {
                             ops.add_edge(*test_idx, fixture_idx, 0);
                         }
@@ -4089,7 +4090,7 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
             let params = ctx.class_method_parameters(&test_class_idxs);
             for (cls_idx, names) in test_class_idxs.iter().zip(params) {
                 for name in names {
-                    if let Some(fixture_idxs) = fixtures_by_name.get(&name) {
+                    if let Some(fixture_idxs) = fixtures_by_name.get(name.as_str()) {
                         for &fixture_idx in fixture_idxs {
                             ops.add_edge(*cls_idx, fixture_idx, 0);
                         }

@@ -276,6 +276,19 @@ two versions.
   overload anchors, module hierarchy) are now synthesized at assembly
   straight from the node payloads.
 
+- **`CompactString` in the salsa-cached payloads.** Every identifier-shaped
+  string in the per-file salsa caches — `NodeData.fqname`, `ImportPayload`,
+  `exports_by_name` / `star_reexports`, `ClassBaseSpec`, the `RefSpec`
+  descriptors, the
+  whole `FileExtraction` fact family, the shared `{local → target}` imports
+  maps (new `helpers::LocalImports` alias), and `FileLocalOp::Fact` — now uses
+  `compact_str::CompactString`, which stores up to 24 bytes inline. Typical
+  Python identifiers and dotted module paths fit inline, so the cached
+  payloads skip one heap allocation per string and pack tighter. Human-prose
+  `warnings` and the graph-side types (`GraphNode` / `SymbolNode` / the dcg
+  file) stay `String`; conversions happen at the assemble boundary where a
+  clone already happened. No behavior change.
+
 - **Parallel edge-storage init and fqname-index map-reduce.** Two more serial
   build chunks now run on rayon workers with the GIL released. The assemble
   pass's bulk edge insert (`GraphBuilder::init_edges_bulk`) derives `edges`,

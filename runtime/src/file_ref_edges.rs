@@ -23,6 +23,7 @@
 //! the assembly pass synthesizes them directly so the payload carries
 //! only real information.
 
+use compact_str::{CompactString, ToCompactString};
 use ruff_db::files::File;
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
@@ -54,7 +55,7 @@ enum Resolution {
     Alias(u32),
     NestedImport {
         spec: ImportPayload,
-        bound_name: String,
+        bound_name: CompactString,
     },
 }
 use crate::helpers::{
@@ -217,60 +218,65 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
         }
 
         let mut src_local = alias_local;
-        let (target_module_str, decl_name, is_star): (String, Option<String>, bool) = match kind {
-            DefinitionKind::Import(k) => {
-                // `import a.b.c` binds `a` locally, but the *statement*
-                // loads the deepest module; the binding spec resolves
-                // the full dotted path.
-                let alias = k.alias(&parsed);
-                (alias.name.id.as_str().to_string(), None, false)
-            }
-            DefinitionKind::ImportFrom(k) => {
-                let module = from_module_string(db, file, k.import(&parsed));
-                let alias = k.alias(&parsed);
-                (module, Some(alias.name.id.as_str().to_string()), false)
-            }
-            DefinitionKind::ImportFromSubmodule(k) => {
-                // ImportFromSubmodule binds a submodule attribute on
-                // the containing package as a side effect of a
-                // `from X import …` statement inside __init__.py.
-                // The bound NAME (k.module) is the attribute, but the
-                // TARGET module is the from-clause itself — for
-                // `from pkg._internal import *` in pkg/__init__.py
-                // the side-effect attribute `_internal` on pkg
-                // points at the file `pkg._internal`, not at
-                // `pkg._internal._internal`. The from-clause module
-                // is what resolves.
-                let target = from_module_string(db, file, k.import(&parsed));
-                (target, None, false)
-            }
-            DefinitionKind::StarImport(k) => {
-                // `from X import *`. Each per-name `STAR_REEXPORT` node
-                // edges into the kept statement-level `*X` node, which in
-                // turn carries the module-level upstream spec. Rebind
-                // `src_local` to that `*X` node so the binding spec
-                // (stdlib / external / unresolved handling included)
-                // resolves from `*X`, not from the per-name node. Uses
-                // of star-bound names land on the per-name node (ty's
-                // use-def chain distinguishes them); `from <here>
-                // import name` lookups resolve per-name via
-                // walk_exports_chain.
-                let module = from_module_string(db, file, k.import(&parsed));
-                let star_ref = NodeRef::StarStmt(file, range_key(kind.target_range(&parsed)));
-                if let Some(&star_local) = self_nodes.ref_to_local.get(&star_ref) {
-                    if star_local != alias_local {
-                        specs.push(RefSpec {
-                            src: alias_local,
-                            target: Target::Local(star_local),
-                            flags: 0,
-                        });
-                    }
-                    src_local = star_local;
+        let (target_module_str, decl_name, is_star): (CompactString, Option<CompactString>, bool) =
+            match kind {
+                DefinitionKind::Import(k) => {
+                    // `import a.b.c` binds `a` locally, but the *statement*
+                    // loads the deepest module; the binding spec resolves
+                    // the full dotted path.
+                    let alias = k.alias(&parsed);
+                    (alias.name.id.as_str().to_compact_string(), None, false)
                 }
-                (module, None, true)
-            }
-            _ => continue,
-        };
+                DefinitionKind::ImportFrom(k) => {
+                    let module = from_module_string(db, file, k.import(&parsed));
+                    let alias = k.alias(&parsed);
+                    (
+                        module,
+                        Some(alias.name.id.as_str().to_compact_string()),
+                        false,
+                    )
+                }
+                DefinitionKind::ImportFromSubmodule(k) => {
+                    // ImportFromSubmodule binds a submodule attribute on
+                    // the containing package as a side effect of a
+                    // `from X import …` statement inside __init__.py.
+                    // The bound NAME (k.module) is the attribute, but the
+                    // TARGET module is the from-clause itself — for
+                    // `from pkg._internal import *` in pkg/__init__.py
+                    // the side-effect attribute `_internal` on pkg
+                    // points at the file `pkg._internal`, not at
+                    // `pkg._internal._internal`. The from-clause module
+                    // is what resolves.
+                    let target = from_module_string(db, file, k.import(&parsed));
+                    (target, None, false)
+                }
+                DefinitionKind::StarImport(k) => {
+                    // `from X import *`. Each per-name `STAR_REEXPORT` node
+                    // edges into the kept statement-level `*X` node, which in
+                    // turn carries the module-level upstream spec. Rebind
+                    // `src_local` to that `*X` node so the binding spec
+                    // (stdlib / external / unresolved handling included)
+                    // resolves from `*X`, not from the per-name node. Uses
+                    // of star-bound names land on the per-name node (ty's
+                    // use-def chain distinguishes them); `from <here>
+                    // import name` lookups resolve per-name via
+                    // walk_exports_chain.
+                    let module = from_module_string(db, file, k.import(&parsed));
+                    let star_ref = NodeRef::StarStmt(file, range_key(kind.target_range(&parsed)));
+                    if let Some(&star_local) = self_nodes.ref_to_local.get(&star_ref) {
+                        if star_local != alias_local {
+                            specs.push(RefSpec {
+                                src: alias_local,
+                                target: Target::Local(star_local),
+                                flags: 0,
+                            });
+                        }
+                        src_local = star_local;
+                    }
+                    (module, None, true)
+                }
+                _ => continue,
+            };
 
         if target_module_str.is_empty() {
             continue;
@@ -285,7 +291,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
                     decl: decl_name,
                     star: is_star,
                 },
-                bound_name: String::new(),
+                bound_name: CompactString::default(),
                 chain: Vec::new(),
             }),
             flags: 0,
@@ -380,8 +386,8 @@ impl<'db> RefWalker<'_, 'db> {
             target: Target::Member(MemberRef {
                 role: MemberRole::Use,
                 spec: spec.clone(),
-                bound_name: bound_name.to_string(),
-                chain: extra_chain.iter().map(|s| s.to_string()).collect(),
+                bound_name: bound_name.to_compact_string(),
+                chain: extra_chain.iter().map(|s| s.to_compact_string()).collect(),
             }),
             flags: self.current_flags,
         });
@@ -484,7 +490,7 @@ impl<'db> RefWalker<'_, 'db> {
                     let PlaceExprRef::Symbol(sym) = place_table.place(place_id) else {
                         continue;
                     };
-                    let bound_name = sym.name().as_str().to_string();
+                    let bound_name = sym.name().as_str().to_compact_string();
                     let spec = import_payload_for(kind, db, self.file, self.parsed);
                     results.push(Resolution::NestedImport { spec, bound_name });
                 }
@@ -609,7 +615,7 @@ impl<'db> RefWalker<'_, 'db> {
                 None => (first_seg, dotted.split('.').skip(1).collect()),
             };
             let spec = ImportPayload {
-                module: dotted.to_string(),
+                module: compact_str::ToCompactString::to_compact_string(&dotted),
                 decl: None,
                 star: false,
             };
@@ -643,8 +649,8 @@ impl<'db> RefWalker<'_, 'db> {
                 None => name,
             };
             let spec = ImportPayload {
-                module: module_str.clone(),
-                decl: Some(name.to_string()),
+                module: module_str.as_str().into(),
+                decl: Some(compact_str::CompactString::from(name)),
                 star: false,
             };
             self.emit_member_use(&spec, bound_name, &[]);
@@ -721,11 +727,11 @@ impl<'db> RefWalker<'_, 'db> {
                     Ok(target) => self.specs.push(RefSpec {
                         src: self.owner_local,
                         target: Target::Dynamic(DynamicRef {
-                            target,
+                            target: target.into(),
                             fromlist: fromlist
                                 .iter()
                                 .filter(|e| !e.is_empty())
-                                .map(|e| e.to_string())
+                                .map(|e| e.to_compact_string())
                                 .collect(),
                         }),
                         flags: self.current_flags | EDGE_FLAG_DYNAMIC_IMPORT,

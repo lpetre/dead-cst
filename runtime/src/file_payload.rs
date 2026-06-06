@@ -17,6 +17,7 @@
 //! the closest analogue (tracked fn, salsa::Update derive on the
 //! carrier struct).
 
+use compact_str::{CompactString, ToCompactString};
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::{line_index, source_text};
@@ -99,7 +100,7 @@ pub(crate) fn def_key<'db>(
 /// derives needed for salsa-tracked return.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct ProjectDistLookup {
-    pub(crate) map: std::collections::HashMap<std::path::PathBuf, String>,
+    pub(crate) map: std::collections::HashMap<std::path::PathBuf, CompactString>,
 }
 
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
@@ -118,18 +119,18 @@ pub(crate) fn external_fqname_for(
     db: &dyn ProjectDb,
     target_file: ruff_db::files::File,
     fallback_top_level: &str,
-) -> String {
+) -> CompactString {
     use ruff_db::files::FilePath;
     let path_str = match target_file.path(db) {
         FilePath::System(p) => p.to_string(),
-        _ => return format!("[external file] {fallback_top_level}"),
+        _ => return compact_str::format_compact!("[external file] {fallback_top_level}"),
     };
     let canonical =
         std::fs::canonicalize(&path_str).unwrap_or_else(|_| std::path::PathBuf::from(&path_str));
     let lookup = project_dist_lookup(db);
     match lookup.map.get(&canonical) {
-        Some(dist_name) => format!("[external dist] {dist_name}"),
-        None => format!("[external file] {fallback_top_level}"),
+        Some(dist_name) => compact_str::format_compact!("[external dist] {dist_name}"),
+        None => compact_str::format_compact!("[external file] {fallback_top_level}"),
     }
 }
 
@@ -140,7 +141,7 @@ pub(crate) fn external_fqname_for(
 /// single GIL acquisition at the end of the build.
 #[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct NodeData {
-    pub(crate) fqname: String,
+    pub(crate) fqname: CompactString,
     pub(crate) kind: NodeKind,
     /// The file this node belongs to. Every node in a `file_to_nodes`
     /// payload shares it; the assembly pass re-derives the path string
@@ -213,8 +214,8 @@ impl NodeKind {
 /// inside `NodeData`.
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
 pub(crate) struct ImportPayload {
-    pub(crate) module: String,
-    pub(crate) decl: Option<String>,
+    pub(crate) module: CompactString,
+    pub(crate) decl: Option<CompactString>,
     pub(crate) star: bool,
 }
 
@@ -265,8 +266,8 @@ pub(crate) struct FileNodes {
     pub(crate) nodes: Box<[NodeData]>,
     pub(crate) refs: Box<[NodeRef]>,
     pub(crate) ref_to_local: FxHashMap<NodeRef, u32>,
-    pub(crate) exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>>,
-    pub(crate) star_reexports: FxHashMap<String, String>,
+    pub(crate) exports_by_name: FxHashMap<CompactString, SmallVec<[u32; 2]>>,
+    pub(crate) star_reexports: FxHashMap<CompactString, CompactString>,
     pub(crate) class_bases: Vec<ClassBaseEntry>,
     pub(crate) overload_anchors: Box<[(u32, u32)]>,
 }
@@ -297,7 +298,10 @@ pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ClassBaseSpec; 2]>);
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub(crate) enum ClassBaseSpec {
     LocalClass((u32, u32)),
-    ModuleMember { module: String, name: String },
+    ModuleMember {
+        module: CompactString,
+        name: CompactString,
+    },
 }
 
 /// Modules whose `.overload` attribute marks a function decl as a stub.
@@ -315,7 +319,7 @@ const OVERLOAD_MODULES: &[&str] = &["typing", "typing_extensions"];
 ///   `imports` map already records `"ovl" -> "typing.overload"`).
 fn is_overload_decorator(
     dec: &ruff_python_ast::Decorator,
-    imports: &rustc_hash::FxHashMap<String, String>,
+    imports: &crate::helpers::LocalImports,
 ) -> bool {
     // Unwrap call form (`@overload()`) so we look at the callee.
     let mut expr = &dec.expression;
@@ -404,7 +408,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     // returning `None` means this is the first name of the statement.
     let mut star_local_name_cache: HashMap<TextRange, String> = HashMap::new();
 
-    let mut star_reexports: FxHashMap<String, String> = FxHashMap::default();
+    let mut star_reexports: FxHashMap<CompactString, CompactString> = FxHashMap::default();
 
     // Pre-scan top-level `Stmt::FunctionDef` decorator lists to identify
     // `@typing.overload`-decorated function defs. The set is keyed on the
@@ -453,7 +457,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
         let PlaceExprRef::Symbol(symbol) = place_table.place(place_id) else {
             continue;
         };
-        let per_name = symbol.name().as_str().to_string();
+        let per_name = symbol.name().as_str().to_compact_string();
 
         let target_range = kind.target_range(&parsed);
         let is_star = matches!(kind, DefinitionKind::StarImport(_));
@@ -517,7 +521,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
         // per-file query.
 
         let node = NodeData {
-            fqname: format!("{module_fqname}.{local_name}"),
+            fqname: compact_str::format_compact!("{module_fqname}.{local_name}"),
             kind: node_kind,
             file,
             start_line: sl,
@@ -554,7 +558,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
                         star_flags |= NODE_FLAGS_NOQA_PIN;
                     }
                     let star_node = NodeData {
-                        fqname: star_fqname,
+                        fqname: star_fqname.into(),
                         kind: NodeKind::Import,
                         file,
                         start_line: sl,
@@ -599,7 +603,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     // emit no anchor; reachability falls back to the module-anchor
     // edge.
     let mut overload_anchors: Vec<(u32, u32)> = Vec::new();
-    let mut by_name: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+    let mut by_name: FxHashMap<&str, Vec<u32>> = FxHashMap::default();
     for (i, node) in nodes.iter().enumerate() {
         if !matches!(node.kind, NodeKind::Function) {
             continue;
@@ -609,10 +613,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
             .rsplit_once('.')
             .map(|p| p.1)
             .unwrap_or(&node.fqname);
-        by_name
-            .entry(simple.to_string())
-            .or_default()
-            .push(i as u32);
+        by_name.entry(simple).or_default().push(i as u32);
     }
     for group in by_name.values() {
         // Find the last non-overload entry — that's the impl. Groups
@@ -642,12 +643,12 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     // resolves to the impl only — the impl `def f` shadows them via
     // ty's end-of-scope binding anyway, but pyi stub files (every
     // `def f` decorated `@overload`) need the explicit filter.
-    let mut exports_by_name: FxHashMap<String, SmallVec<[u32; 2]>> = FxHashMap::default();
+    let mut exports_by_name: FxHashMap<CompactString, SmallVec<[u32; 2]>> = FxHashMap::default();
     for (symbol_id, bindings) in use_def_map.all_end_of_scope_symbol_bindings() {
         let PlaceExprRef::Symbol(sym) = place_table.place(ScopedPlaceId::Symbol(symbol_id)) else {
             continue;
         };
-        let name = sym.name().as_str().to_string();
+        let name = sym.name().as_str().to_compact_string();
         let mut live: SmallVec<[u32; 2]> = SmallVec::new();
         for binding in bindings {
             let Some(def) = binding.binding.definition() else {
@@ -764,7 +765,7 @@ pub(crate) fn walk_exports_chain(
         // into the upstream file's same-name lookup. The star alias
         // itself isn't useful as a target — uses should land on the
         // upstream decl. Skip emitting it here.
-        if let Some(upstream_module) = target_nodes.star_reexports.get(&key.1) {
+        if let Some(upstream_module) = target_nodes.star_reexports.get(key.1.as_str()) {
             if let Some(mn) = ty_module_resolver::ModuleName::new(upstream_module) {
                 if let Some(upstream) = ty_module_resolver::resolve_module(db, key.0, &mn) {
                     if let Some(upstream_file) = upstream.file(db) {
@@ -774,7 +775,7 @@ pub(crate) fn walk_exports_chain(
                 }
             }
         }
-        let Some(locals) = target_nodes.exports_by_name.get(&key.1) else {
+        let Some(locals) = target_nodes.exports_by_name.get(key.1.as_str()) else {
             continue;
         };
         for &local_idx in locals {
@@ -794,7 +795,7 @@ pub(crate) fn import_payload_for_pure<'db>(
         DefinitionKind::Import(k) => {
             let alias = k.alias(parsed);
             ImportPayload {
-                module: alias.name.id.as_str().to_string(),
+                module: alias.name.id.as_str().to_compact_string(),
                 decl: None,
                 star: false,
             }
@@ -803,13 +804,13 @@ pub(crate) fn import_payload_for_pure<'db>(
             let alias = k.alias(parsed);
             ImportPayload {
                 module: from_module_string(db, file, k.import(parsed)),
-                decl: Some(alias.name.id.as_str().to_string()),
+                decl: Some(alias.name.id.as_str().to_compact_string()),
                 star: false,
             }
         }
         DefinitionKind::ImportFromSubmodule(k) => ImportPayload {
             module: from_module_string(db, file, k.import(parsed)),
-            decl: Some(k.module(parsed).id.as_str().to_string()),
+            decl: Some(k.module(parsed).id.as_str().to_compact_string()),
             star: false,
         },
         DefinitionKind::StarImport(k) => ImportPayload {

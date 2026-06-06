@@ -3,6 +3,7 @@
 //! dead-region detection, noqa scanning, position/file helpers, and the
 //! shared `NodeFlags`/`EdgeFlags` constant aliases.
 
+use compact_str::{CompactString, ToCompactString};
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
@@ -35,6 +36,14 @@ use crate::project::BuildOutputs;
 /// string when classifying attribute-style decorator / call references.
 pub(crate) const MODULE_ALIAS_MARKER: &str = "<module>";
 
+/// ``{local name -> imported target}`` map shared by every
+/// import-resolving matcher (decorator / construction / call walks).
+/// Values are a dotted target (``module.decl``), an absolute module
+/// name, or the [`MODULE_ALIAS_MARKER`] sentinel for module-object
+/// bindings. `CompactString` keeps the typical short identifier
+/// inline; probes with `&str` go through `Borrow<str>`.
+pub(crate) type LocalImports = FxHashMap<CompactString, CompactString>;
+
 pub(crate) fn is_dunder_name(fqname: &str) -> bool {
     let name = fqname.rsplit('.').next().unwrap_or("");
     name.len() > 4 && name.starts_with("__") && name.ends_with("__")
@@ -55,7 +64,7 @@ pub(crate) fn is_dunder_name(fqname: &str) -> bool {
 ///   (covers ``import module`` and ``import module as alias``).
 pub(crate) fn decorators_match_imports<'ast>(
     decorators: &'ast [ruff_python_ast::Decorator],
-    imports: &FxHashMap<String, String>,
+    imports: &LocalImports,
     names: &FxHashSet<&str>,
 ) -> Option<Option<&'ast ruff_python_ast::ExprCall>> {
     for dec in decorators {
@@ -77,7 +86,7 @@ pub(crate) fn decorators_match_imports<'ast>(
             }
             Expr::Attribute(attr) => {
                 if let Expr::Name(prefix) = attr.value.as_ref() {
-                    if imports.get(prefix.id.as_str()).map(String::as_str)
+                    if imports.get(prefix.id.as_str()).map(CompactString::as_str)
                         == Some(MODULE_ALIAS_MARKER)
                         && names.contains(attr.attr.as_str())
                     {
@@ -224,7 +233,7 @@ fn classify_name_def<'db>(
             }
             Some(ClassBaseSpec::ModuleMember {
                 module,
-                name: import_from.alias(parsed).name.as_str().to_string(),
+                name: import_from.alias(parsed).name.as_str().to_compact_string(),
             })
         }
         DefinitionKind::StarImport(star_import) => {
@@ -234,7 +243,7 @@ fn classify_name_def<'db>(
             }
             Some(ClassBaseSpec::ModuleMember {
                 module,
-                name: name.to_string(),
+                name: name.to_compact_string(),
             })
         }
         DefinitionKind::Assignment(assign) => {
@@ -256,16 +265,16 @@ fn attribute_to_module_member(
     file: File,
     parsed: &ParsedModuleRef,
     expr: &Expr,
-) -> Option<(String, String)> {
+) -> Option<(CompactString, CompactString)> {
     let (root, segments) = collapse_attribute_chain(expr)?;
     let (member, middle) = segments.split_last()?;
     let prefix = root_module_prefix(db, file, parsed, root)?;
     let module = if middle.is_empty() {
-        prefix
+        CompactString::from(prefix)
     } else {
-        format!("{prefix}.{}", middle.join("."))
+        compact_str::format_compact!("{prefix}.{}", middle.join("."))
     };
-    Some((module, (*member).to_string()))
+    Some((module, (*member).to_compact_string()))
 }
 
 /// Resolve the chain-root name of an attribute-form base to the absolute
@@ -437,8 +446,8 @@ pub(crate) fn is_string_literal(expr: &Expr, value: &str) -> bool {
 pub(crate) fn collect_all_imports_local(
     parsed: &ParsedModuleRef,
     file_package: Option<&str>,
-) -> FxHashMap<String, String> {
-    let mut out: FxHashMap<String, String> = FxHashMap::default();
+) -> LocalImports {
+    let mut out: LocalImports = FxHashMap::default();
     for stmt in &parsed.syntax().body {
         match stmt {
             Stmt::ImportFrom(im) => {
@@ -450,7 +459,7 @@ pub(crate) fn collect_all_imports_local(
                 // a bogus top-level `bases.TestCase`.
                 let tail = im.module.as_ref().map(|n| n.as_str()).unwrap_or("");
                 let module = if im.level == 0 {
-                    (!tail.is_empty()).then(|| tail.to_string())
+                    (!tail.is_empty()).then(|| tail.to_compact_string())
                 } else {
                     resolve_relative_import(im.level, tail, file_package)
                 };
@@ -458,7 +467,10 @@ pub(crate) fn collect_all_imports_local(
                 for alias in &im.names {
                     let target = alias.name.as_str();
                     let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
-                    out.insert(local.to_string(), format!("{module}.{target}"));
+                    out.insert(
+                        local.to_compact_string(),
+                        compact_str::format_compact!("{module}.{target}"),
+                    );
                 }
             }
             Stmt::Import(im) => {
@@ -467,13 +479,16 @@ pub(crate) fn collect_all_imports_local(
                     if let Some(asname) = alias.asname.as_ref() {
                         // ``import foo.bar as fb`` binds ``fb`` to the
                         // ``foo.bar`` module object.
-                        out.insert(asname.as_str().to_string(), name.to_string());
+                        out.insert(
+                            asname.as_str().to_compact_string(),
+                            name.to_compact_string(),
+                        );
                     } else {
                         // ``import foo`` binds ``foo``.
                         // ``import foo.bar`` binds ``foo`` (Python
                         // binds the leftmost segment).
                         let leftmost = name.split('.').next().unwrap_or(name);
-                        out.insert(leftmost.to_string(), leftmost.to_string());
+                        out.insert(leftmost.to_compact_string(), leftmost.to_compact_string());
                     }
                 }
             }
@@ -500,8 +515,8 @@ pub(crate) fn collect_modules_imports_local(
     modules: &[String],
     allowed: &FxHashSet<&str>,
     file_package: Option<&str>,
-) -> FxHashMap<String, String> {
-    let mut out: FxHashMap<String, String> = FxHashMap::default();
+) -> LocalImports {
+    let mut out: LocalImports = FxHashMap::default();
     for module in modules {
         let one = collect_module_imports_local(parsed, module, allowed, file_package);
         out.extend(one);
@@ -526,7 +541,7 @@ pub(crate) fn resolve_relative_import(
     level: u32,
     tail: &str,
     file_package: Option<&str>,
-) -> Option<String> {
+) -> Option<CompactString> {
     if level == 0 {
         return None;
     }
@@ -544,7 +559,7 @@ pub(crate) fn resolve_relative_import(
     if parts.is_empty() {
         return None;
     }
-    Some(parts.join("."))
+    Some(parts.join(".").into())
 }
 
 /// Build the file-local imports map ``{local_name: target}`` for
@@ -560,7 +575,7 @@ pub(crate) fn collect_module_imports_local(
     module: &str,
     allowed: &FxHashSet<&str>,
     file_package: Option<&str>,
-) -> FxHashMap<String, String> {
+) -> LocalImports {
     // Submodule binding: ``from <parent> import <last_seg>`` makes
     // ``last_seg`` a local alias for the queried module (e.g.
     // ``from unittest import mock`` for module ``unittest.mock``).
@@ -574,11 +589,11 @@ pub(crate) fn collect_module_imports_local(
                 // package. ``mod_name`` is just the dotted suffix; ty
                 // exposes the dot count via ``im.level``.
                 let tail = im.module.as_ref().map(|n| n.as_str()).unwrap_or("");
-                let absolute: Option<String> = if im.level == 0 {
+                let absolute: Option<CompactString> = if im.level == 0 {
                     if tail.is_empty() {
                         None
                     } else {
-                        Some(tail.to_string())
+                        Some(tail.to_compact_string())
                     }
                 } else {
                     resolve_relative_import(im.level, tail, file_package)
@@ -591,7 +606,7 @@ pub(crate) fn collect_module_imports_local(
                             continue;
                         }
                         let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(target);
-                        out.insert(local.to_string(), target.to_string());
+                        out.insert(local.to_compact_string(), target.to_compact_string());
                     }
                 } else if let Some((parent, last)) = parent_last {
                     if absolute == parent {
@@ -600,7 +615,10 @@ pub(crate) fn collect_module_imports_local(
                                 continue;
                             }
                             let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(last);
-                            out.insert(local.to_string(), MODULE_ALIAS_MARKER.to_string());
+                            out.insert(
+                                local.to_compact_string(),
+                                CompactString::const_new(MODULE_ALIAS_MARKER),
+                            );
                         }
                     }
                 }
@@ -611,7 +629,10 @@ pub(crate) fn collect_module_imports_local(
                         continue;
                     }
                     let local = alias.asname.as_ref().map(|n| n.as_str()).unwrap_or(module);
-                    out.insert(local.to_string(), MODULE_ALIAS_MARKER.to_string());
+                    out.insert(
+                        local.to_compact_string(),
+                        CompactString::const_new(MODULE_ALIAS_MARKER),
+                    );
                 }
             }
             _ => {}
@@ -635,10 +656,10 @@ pub(crate) fn unwrap_subscripted_callee(expr: &Expr) -> &Expr {
 /// the query forms that accept a list of modules to match against.
 pub(crate) fn matched_call_target_any(
     call: &ruff_python_ast::ExprCall,
-    imports: &FxHashMap<String, String>,
+    imports: &LocalImports,
     modules: &[String],
     allowed: &FxHashSet<&str>,
-) -> Option<String> {
+) -> Option<CompactString> {
     for module in modules {
         if let Some(name) = matched_call_target(call, imports, module, allowed) {
             return Some(name);
@@ -661,10 +682,10 @@ pub(crate) fn matched_call_target_any(
 /// Returns the matched upstream name (``"Flask"``) on hit, else ``None``.
 pub(crate) fn matched_call_target(
     call: &ruff_python_ast::ExprCall,
-    imports: &FxHashMap<String, String>,
+    imports: &LocalImports,
     module: &str,
     allowed: &FxHashSet<&str>,
-) -> Option<String> {
+) -> Option<CompactString> {
     // Unwrap a leading ``Expr::Subscript`` once so subscripted-generic
     // constructors (``Worker[int](...)``, ``Logger[Self]("foo")``)
     // classify the same as their bare ``Worker(...)`` form. Generics
@@ -683,9 +704,9 @@ pub(crate) fn matched_call_target(
                 return None;
             }
             match attr.value.as_ref() {
-                Expr::Name(prefix) => (imports.get(prefix.id.as_str()).map(String::as_str)
+                Expr::Name(prefix) => (imports.get(prefix.id.as_str()).map(CompactString::as_str)
                     == Some(MODULE_ALIAS_MARKER))
-                .then(|| attr_name.to_string()),
+                .then(|| attr_name.to_compact_string()),
                 _ => {
                     let (root, segs) = collapse_attribute_chain(attr.value.as_ref())?;
                     let mut dotted = String::with_capacity(module.len());
@@ -694,7 +715,7 @@ pub(crate) fn matched_call_target(
                         dotted.push('.');
                         dotted.push_str(seg);
                     }
-                    (dotted == module).then(|| attr_name.to_string())
+                    (dotted == module).then(|| attr_name.to_compact_string())
                 }
             }
         }
@@ -732,7 +753,7 @@ pub(crate) fn top_level_assign_to_name(stmt: &Stmt) -> Option<(TextRange, &Expr)
 /// of ``modules`` (OR semantics — for single-module callers pass a
 /// one-element slice).
 pub(crate) struct FactoryCallFinder<'a> {
-    pub(crate) imports: &'a FxHashMap<String, String>,
+    pub(crate) imports: &'a LocalImports,
     pub(crate) modules: &'a [String],
     pub(crate) allowed: &'a FxHashSet<&'a str>,
     pub(crate) kinds: FxHashSet<String>,
@@ -744,7 +765,7 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
             if let Some(name) =
                 matched_call_target_any(call, self.imports, self.modules, self.allowed)
             {
-                self.kinds.insert(name);
+                self.kinds.insert(name.into_string());
             }
         }
         walk_expr(self, expr);
@@ -759,7 +780,7 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
 /// can read decorator/constructor arguments too.
 #[derive(Clone, Debug, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub enum ArgValue {
-    Str(String),
+    Str(CompactString),
     Unknown,
 }
 
@@ -769,7 +790,7 @@ pub enum ArgValue {
 /// the [`CallArgs::get`] / [`CallArgs::str_value`] accessors.
 #[derive(Clone, Debug, Default, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub struct CallArgs {
-    pub(crate) kwargs: FxHashMap<String, ArgValue>,
+    pub(crate) kwargs: FxHashMap<CompactString, ArgValue>,
 }
 
 impl CallArgs {
@@ -854,7 +875,7 @@ impl NodeAttrs {
 /// literals are captured; every other expression is ``Unknown``.
 pub(crate) fn extract_arg_value(expr: &Expr) -> ArgValue {
     match expr {
-        Expr::StringLiteral(s) => ArgValue::Str(s.value.to_str().to_string()),
+        Expr::StringLiteral(s) => ArgValue::Str(s.value.to_str().to_compact_string()),
         _ => ArgValue::Unknown,
     }
 }
@@ -862,12 +883,15 @@ pub(crate) fn extract_arg_value(expr: &Expr) -> ArgValue {
 /// Extract keyword arguments from a call. Positional args are not
 /// captured — no consumer reads them.
 pub(crate) fn extract_call_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs {
-    let mut kwargs: FxHashMap<String, ArgValue> = FxHashMap::default();
+    let mut kwargs: FxHashMap<CompactString, ArgValue> = FxHashMap::default();
     for kw in &call.arguments.keywords {
         let Some(name) = kw.arg.as_ref() else {
             continue;
         };
-        kwargs.insert(name.as_str().to_string(), extract_arg_value(&kw.value));
+        kwargs.insert(
+            name.as_str().to_compact_string(),
+            extract_arg_value(&kw.value),
+        );
     }
     CallArgs { kwargs }
 }
@@ -1667,9 +1691,9 @@ pub(crate) fn canonical_module_name_for_file(
     None
 }
 
-pub(crate) fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
+pub(crate) fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> CompactString {
     if let Some(name) = canonical_module_name_for_file(db, file) {
-        return name.as_str().to_string();
+        return name.as_str().to_compact_string();
     }
     // Fallback for files ty doesn't classify (e.g. ``gunicorn.conf.py`` at
     // the project root — there's no ``__init__.py`` and the stem contains
@@ -1688,7 +1712,7 @@ pub(crate) fn module_fqname_for_file(db: &dyn ProjectDb, file: File) -> String {
         .strip_suffix(".pyi")
         .or_else(|| rel.strip_suffix(".py"))
         .unwrap_or(rel);
-    stem.replace(['/', '\\'], ".")
+    stem.replace(['/', '\\'], ".").into()
 }
 
 #[cfg(test)]
@@ -2395,7 +2419,7 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let mut imports: FxHashMap<String, String> = FxHashMap::default();
+        let mut imports: LocalImports = FxHashMap::default();
         imports.insert("register".into(), "register".into());
         let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("register");
@@ -2410,7 +2434,7 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let mut imports: FxHashMap<String, String> = FxHashMap::default();
+        let mut imports: LocalImports = FxHashMap::default();
         imports.insert("flask".into(), MODULE_ALIAS_MARKER.into());
         let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("route");
@@ -2426,7 +2450,7 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let mut imports: FxHashMap<String, String> = FxHashMap::default();
+        let mut imports: LocalImports = FxHashMap::default();
         imports.insert("app".into(), MODULE_ALIAS_MARKER.into());
         let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("task");
@@ -2442,7 +2466,7 @@ mod tests {
             Stmt::FunctionDef(f) => &f.decorator_list,
             _ => unreachable!(),
         };
-        let imports: FxHashMap<String, String> = FxHashMap::default();
+        let imports: LocalImports = FxHashMap::default();
         let allowed: FxHashSet<&str> = FxHashSet::default();
         assert!(decorators_match_imports(decorators, &imports, &allowed).is_none());
     }
@@ -2452,7 +2476,7 @@ mod tests {
     #[test]
     fn matched_call_target_via_local_name() {
         let call = first_call("Flask(__name__)");
-        let mut imports: FxHashMap<String, String> = FxHashMap::default();
+        let mut imports: LocalImports = FxHashMap::default();
         imports.insert("Flask".into(), "Flask".into());
         let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("Flask");
@@ -2465,7 +2489,7 @@ mod tests {
     #[test]
     fn matched_call_target_via_module_alias_attr() {
         let call = first_call("flask.Flask(__name__)");
-        let mut imports: FxHashMap<String, String> = FxHashMap::default();
+        let mut imports: LocalImports = FxHashMap::default();
         imports.insert("flask".into(), MODULE_ALIAS_MARKER.into());
         let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("Flask");
@@ -2480,7 +2504,7 @@ mod tests {
         let call = first_call("unittest.mock.patch('x')");
         // No file imports entry for the leftmost name — fallback to the
         // literal dotted match against ``module``.
-        let imports: FxHashMap<String, String> = FxHashMap::default();
+        let imports: LocalImports = FxHashMap::default();
         let mut allowed: FxHashSet<&str> = FxHashSet::default();
         allowed.insert("patch");
         assert_eq!(
@@ -2492,7 +2516,7 @@ mod tests {
     #[test]
     fn matched_call_target_rejects_unknown_name() {
         let call = first_call("unrelated()");
-        let imports: FxHashMap<String, String> = FxHashMap::default();
+        let imports: LocalImports = FxHashMap::default();
         let allowed: FxHashSet<&str> = FxHashSet::default();
         assert!(matched_call_target(&call, &imports, "x", &allowed).is_none());
     }
@@ -2500,7 +2524,7 @@ mod tests {
     #[test]
     fn matched_call_target_rejects_disallowed_name() {
         let call = first_call("Flask()");
-        let mut imports: FxHashMap<String, String> = FxHashMap::default();
+        let mut imports: LocalImports = FxHashMap::default();
         imports.insert("Flask".into(), "Flask".into());
         // Empty allowed set: target is present but not allowed.
         let allowed: FxHashSet<&str> = FxHashSet::default();
