@@ -274,7 +274,13 @@ two versions.
   binding failures stamp `NodeFlags::UNRESOLVED`. Graph output is unchanged
   (same nodes, edges, and flags); structural edges (decl → module anchors,
   overload anchors, module hierarchy) are now synthesized at assembly
-  straight from the node payloads.
+  straight from the node payloads. Assembly is structured for row volume:
+  every `Member`/`Dynamic` spec row is interned once into a dense id during
+  the gather (stamping and edge translation index a `Vec` instead of
+  re-hashing string-keyed rows), and all resolution families — member refs,
+  dynamic refs, the parent-module sweep, class bases — run on fine-grained
+  (16× worker count) chunks inside pass 1's rayon join, overlapped with the
+  node fill.
 
 - **`CompactString` in the salsa-cached payloads.** Every identifier-shaped
   string in the per-file salsa caches — `NodeData.fqname`, `ImportPayload`,
