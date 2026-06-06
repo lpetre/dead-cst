@@ -255,9 +255,37 @@ two versions.
 
 ### Changed
 
+- **File-local reference specs; cross-file resolution moved to assembly.**
+  The two per-file salsa edge queries (`file_to_edges` / `file_to_ref_edges`)
+  are consolidated into one combined walk (`file_to_refspecs`) that emits
+  unresolved, file-local `RefSpec` rows — local node indices plus symbolic
+  `Member` / `Dynamic` descriptors — instead of resolved cross-file edges.
+  The walk query now has zero cross-file salsa dependencies, so editing one
+  file no longer invalidates any importer's (expensive) AST/use-def walk;
+  only the assembly-time resolution re-runs. Resolution itself is memoized
+  project-wide per `(ref, anchor directory)` and runs on rayon workers, so a
+  hot import repeated across thousands of use sites resolves once per
+  directory rather than once per use. The class-base fan-in
+  (`build_class_hierarchy_indices`) reuses the same memoized parallel
+  machinery (previously it re-resolved every base spelling once per class,
+  serially). Member resolution carries an explicit `Binding`/`Use` role:
+  binding-side edges keep skipping past star-reexport aliases to the real
+  decl while use-side edges keep landing on the star alias itself, and only
+  binding failures stamp `NodeFlags::UNRESOLVED`. Graph output is unchanged
+  (same nodes, edges, and flags); structural edges (decl → module anchors,
+  overload anchors, module hierarchy) are now synthesized at assembly
+  straight from the node payloads. Assembly is structured for row volume:
+  every `Member`/`Dynamic` spec row is interned once into a dense id during
+  the gather (stamping and edge translation index a `Vec` instead of
+  re-hashing string-keyed rows), and all resolution families — member refs,
+  dynamic refs, the parent-module sweep, class bases — run on fine-grained
+  (16× worker count) chunks inside pass 1's rayon join, overlapped with the
+  node fill.
+
 - **`CompactString` in the salsa-cached payloads.** Every identifier-shaped
   string in the per-file salsa caches — `NodeData.fqname`, `ImportPayload`,
-  `exports_by_name` / `star_reexports`, `ClassBaseSpec`, `ExternalKey`, the
+  `exports_by_name` / `star_reexports`, `ClassBaseSpec`, the `RefSpec`
+  descriptors, the
   whole `FileExtraction` fact family, the shared `{local → target}` imports
   maps (new `helpers::LocalImports` alias), and `FileLocalOp::Fact` — now uses
   `compact_str::CompactString`, which stores up to 24 bytes inline. Typical

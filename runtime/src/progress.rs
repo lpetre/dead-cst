@@ -25,8 +25,7 @@ use pyo3::types::PyDict;
 pub(crate) const PHASE_NONE: usize = 0;
 /// File enumeration (`db.project().files(db)`).
 pub(crate) const PHASE_ENUM: usize = 1;
-/// Parallel rayon ingest (`file_to_nodes` / `file_to_edges` /
-/// `file_to_ref_edges`).
+/// Parallel rayon ingest (`file_to_nodes` / `file_to_refspecs`).
 pub(crate) const PHASE_POPULATE: usize = 2;
 /// Fan-in (`assemble_graph`).
 pub(crate) const PHASE_ASSEMBLE: usize = 3;
