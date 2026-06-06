@@ -89,8 +89,8 @@ impl GraphNode {
             Some(ip) => Some(Py::new(
                 py,
                 Import {
-                    module: ip.module.clone(),
-                    decl: ip.decl.clone(),
+                    module: ip.module.to_string(),
+                    decl: ip.decl.as_ref().map(|d| d.to_string()),
                     star: ip.star,
                 },
             )?),

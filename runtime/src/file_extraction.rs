@@ -17,6 +17,7 @@
 //! (the cross-file lookup primitive) this query is never called
 //! cross-file, so it carries no `'db` lifetime and absorbs facts freely.
 
+use compact_str::{CompactString, ToCompactString};
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::source::source_text;
@@ -29,7 +30,8 @@ use ty_project::Db as ProjectDb;
 
 use crate::helpers::{
     extract_call_kwargs, find_main_block_range, range_key, resolve_relative_import,
-    top_level_assign_to_name, unwrap_subscripted_callee, CallArgs, MODULE_ALIAS_MARKER,
+    top_level_assign_to_name, unwrap_subscripted_callee, CallArgs, LocalImports,
+    MODULE_ALIAS_MARKER,
 };
 use crate::ingest::{collapse_attribute_chain, file_package_name, string_literal_list};
 
@@ -57,8 +59,8 @@ type ByNameRange<T> = Vec<((u32, u32), T)>;
 /// rejects non-`Name` roots, so deeper shapes can't match anyway.
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct CalleeDescriptor {
-    pub(crate) root_name: String,
-    pub(crate) attrs: SmallVec<[String; 2]>,
+    pub(crate) root_name: CompactString,
+    pub(crate) attrs: SmallVec<[CompactString; 2]>,
     pub(crate) kwargs: CallArgs,
 }
 
@@ -73,12 +75,14 @@ pub(crate) enum ImportFact {
     /// `from <absolute> import <name> [as <local>], …` — `names` is
     /// `(imported_name, local_name)` for each alias.
     From {
-        absolute: String,
-        names: Vec<(String, String)>,
+        absolute: CompactString,
+        names: Vec<(CompactString, CompactString)>,
     },
     /// `import <module> [as <local>], …` — `entries` is
     /// `(module_name, local_name)` for each alias.
-    Plain { entries: Vec<(String, String)> },
+    Plain {
+        entries: Vec<(CompactString, CompactString)>,
+    },
 }
 
 /// The `Name`-rooted callee chain of a call — root name + trailing
@@ -88,8 +92,8 @@ pub(crate) enum ImportFact {
 /// the `<owner>.<attr>` shape (`attrs == [attr]`, `root_name == owner`).
 #[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct CalleeChain {
-    pub(crate) root_name: String,
-    pub(crate) attrs: SmallVec<[String; 2]>,
+    pub(crate) root_name: CompactString,
+    pub(crate) attrs: SmallVec<[CompactString; 2]>,
 }
 
 /// String content of a positional call argument, recorded so the
@@ -99,11 +103,11 @@ pub(crate) struct CalleeChain {
 pub(crate) enum StringArg {
     /// A single `"…"` literal — `nth_positional_string` returns it; a
     /// collection read sees a one-element list.
-    Lit(String),
+    Lit(CompactString),
     /// A list/tuple of string literals (non-string elements dropped, as
     /// `string_or_string_collection` does) — `nth_positional_string`
     /// returns `None`; a collection read sees every element.
-    Coll(Vec<String>),
+    Coll(Vec<CompactString>),
 }
 
 /// One call site reduced to the config-independent data the three
@@ -115,7 +119,7 @@ pub(crate) struct CallSiteFact {
     /// Last attribute segment of the callee (`load_extension` in
     /// `bot.load_extension(x)`), for *any* receiver shape; `None` when the
     /// callee isn't an attribute access. Powers `find_calls_on_attr`.
-    pub(crate) callee_attr: Option<String>,
+    pub(crate) callee_attr: Option<CompactString>,
     /// `Name`-rooted callee chain, when the callee bottoms out at a bare
     /// `Name`. Powers `find_calls_to_imported` / `find_calls_on_var`.
     pub(crate) callee: Option<CalleeChain>,
@@ -143,7 +147,7 @@ impl CallSiteFact {
     /// Replay `helpers::string_or_string_collection` for `arg_index`: the
     /// string values (one for a single literal, many for a list/tuple),
     /// or empty.
-    pub(crate) fn string_or_collection(&self, arg_index: usize) -> &[String] {
+    pub(crate) fn string_or_collection(&self, arg_index: usize) -> &[CompactString] {
         self.string_args
             .iter()
             .find_map(|(i, arg)| {
@@ -169,14 +173,14 @@ pub(crate) struct FileExtraction {
     /// assignments whose RHS is a list/tuple of string literals, as
     /// `(target_name, entries)`. Powers `find_literal_list_entries` and
     /// the `__all__` export query.
-    pub(crate) literal_list_rows: Vec<(String, Vec<String>)>,
+    pub(crate) literal_list_rows: Vec<(CompactString, Vec<CompactString>)>,
     /// Per top-level `def`, its positional + keyword-only parameter
     /// names in source order. Powers `function_parameters`.
-    pub(crate) function_params: ByNameRange<Vec<String>>,
+    pub(crate) function_params: ByNameRange<Vec<CompactString>>,
     /// Per top-level `class`, the de-duplicated parameter names across
     /// all its methods, excluding `self` / `cls`. Powers
     /// `class_method_parameters`.
-    pub(crate) class_method_params: ByNameRange<Vec<String>>,
+    pub(crate) class_method_params: ByNameRange<Vec<CompactString>>,
     /// Per `class` *anywhere* in the file (not just top level), the
     /// names of the methods defined directly in its body. Powers
     /// `find_classes_defining_method`, whose original enumeration went
@@ -185,7 +189,7 @@ pub(crate) struct FileExtraction {
     /// let the `class_by_selection` fan-in keep only the global-scope
     /// ones — name-ranges never collide, so nested classes never
     /// produce a false match.
-    pub(crate) class_method_defs: ByNameRange<Vec<String>>,
+    pub(crate) class_method_defs: ByNameRange<Vec<CompactString>>,
     /// Every top-level `import` / `from … import …` statement, resolved
     /// to absolute modules. Powers the import-resolving decorator /
     /// construction / call queries via [`imports_local_from_facts`].
@@ -225,17 +229,17 @@ pub(crate) struct FileExtraction {
 /// defined classes are captured; the project-wide fan-in filters to
 /// global-scope classes via `class_by_selection`.
 struct ClassMethodDefsCollector {
-    rows: ByNameRange<Vec<String>>,
+    rows: ByNameRange<Vec<CompactString>>,
 }
 
 impl<'a> Visitor<'a> for ClassMethodDefsCollector {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         if let Stmt::ClassDef(cls) = stmt {
-            let methods: Vec<String> = cls
+            let methods: Vec<CompactString> = cls
                 .body
                 .iter()
                 .filter_map(|s| match s {
-                    Stmt::FunctionDef(f) => Some(f.name.as_str().to_string()),
+                    Stmt::FunctionDef(f) => Some(f.name.as_str().to_compact_string()),
                     _ => None,
                 })
                 .collect();
@@ -324,7 +328,7 @@ fn build_call_site_fact(call: &ExprCall) -> Option<CallSiteFact> {
     // *any* receiver shape (incl. `foo().attr(…)`), so it is computed off the
     // unwrapped callee directly rather than the `Name`-rooted chain.
     let callee_attr = match unwrap_subscripted_callee(call.func.as_ref()) {
-        Expr::Attribute(attr) => Some(attr.attr.as_str().to_string()),
+        Expr::Attribute(attr) => Some(attr.attr.as_str().to_compact_string()),
         _ => None,
     };
     let callee = collapse_callee(call.func.as_ref())
@@ -346,7 +350,7 @@ fn build_call_site_fact(call: &ExprCall) -> Option<CallSiteFact> {
 /// a hit), so the call isn't recorded on its account.
 fn string_arg(expr: &Expr) -> Option<StringArg> {
     match expr {
-        Expr::StringLiteral(s) => Some(StringArg::Lit(s.value.to_str().to_string())),
+        Expr::StringLiteral(s) => Some(StringArg::Lit(s.value.to_str().to_compact_string())),
         Expr::List(list) => {
             let elems = collect_string_elems(&list.elts);
             (!elems.is_empty()).then_some(StringArg::Coll(elems))
@@ -361,10 +365,10 @@ fn string_arg(expr: &Expr) -> Option<StringArg> {
 
 /// String-literal elements of a list/tuple, non-string elements dropped —
 /// the collection half of `helpers::string_or_string_collection`.
-fn collect_string_elems(elts: &[Expr]) -> Vec<String> {
+fn collect_string_elems(elts: &[Expr]) -> Vec<CompactString> {
     elts.iter()
         .filter_map(|e| match e {
-            Expr::StringLiteral(s) => Some(s.value.to_str().to_string()),
+            Expr::StringLiteral(s) => Some(s.value.to_str().to_compact_string()),
             _ => None,
         })
         .collect()
@@ -409,11 +413,11 @@ fn param_names(params: &ruff_python_ast::Parameters) -> impl Iterator<Item = &st
 /// single subscripted-generic callee, then collapse the attribute chain.
 /// Returns `None` when the callee doesn't bottom out at a bare `Name`
 /// (a call result, a subscript mid chain, …) — those never matched.
-fn collapse_callee(expr: &Expr) -> Option<(String, SmallVec<[String; 2]>)> {
+fn collapse_callee(expr: &Expr) -> Option<(CompactString, SmallVec<[CompactString; 2]>)> {
     let (root, segs) = collapse_attribute_chain(unwrap_subscripted_callee(expr))?;
     Some((
-        root.id.as_str().to_string(),
-        segs.iter().map(|s| s.to_string()).collect(),
+        root.id.as_str().to_compact_string(),
+        segs.iter().map(|s| s.to_compact_string()).collect(),
     ))
 }
 
@@ -464,9 +468,9 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
         None
     };
 
-    let mut literal_list_rows: Vec<(String, Vec<String>)> = Vec::new();
-    let mut function_params: ByNameRange<Vec<String>> = Vec::new();
-    let mut class_method_params: ByNameRange<Vec<String>> = Vec::new();
+    let mut literal_list_rows: Vec<(CompactString, Vec<CompactString>)> = Vec::new();
+    let mut function_params: ByNameRange<Vec<CompactString>> = Vec::new();
+    let mut class_method_params: ByNameRange<Vec<CompactString>> = Vec::new();
     let mut class_defs = ClassMethodDefsCollector { rows: Vec::new() };
     let mut import_facts: Vec<ImportFact> = Vec::new();
     let mut decorator_rows: ByNameRange<Vec<CalleeDescriptor>> = Vec::new();
@@ -483,8 +487,9 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
         collect_call_sites(stmt, &mut call_sites_by_decl, &mut module_call_sites);
         match stmt {
             Stmt::FunctionDef(func) => {
-                let names: Vec<String> =
-                    param_names(&func.parameters).map(str::to_string).collect();
+                let names: Vec<CompactString> = param_names(&func.parameters)
+                    .map(CompactString::from)
+                    .collect();
                 function_params.push((range_key(func.name.range()), names));
                 let descriptors: Vec<CalleeDescriptor> = func
                     .decorator_list
@@ -498,7 +503,7 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
             }
             Stmt::ClassDef(cls) => {
                 let mut seen: FxHashSet<&str> = FxHashSet::default();
-                let mut names: Vec<String> = Vec::new();
+                let mut names: Vec<CompactString> = Vec::new();
                 for body_stmt in &cls.body {
                     let Stmt::FunctionDef(method) = body_stmt else {
                         continue;
@@ -508,7 +513,7 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                             continue;
                         }
                         if seen.insert(n) {
-                            names.push(n.to_string());
+                            names.push(n.to_compact_string());
                         }
                     }
                 }
@@ -518,7 +523,7 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
             Stmt::ImportFrom(im) => {
                 let tail = im.module.as_ref().map(|n| n.as_str()).unwrap_or("");
                 let absolute = if im.level == 0 {
-                    (!tail.is_empty()).then(|| tail.to_string())
+                    (!tail.is_empty()).then(|| tail.to_compact_string())
                 } else {
                     resolve_relative_import(im.level, tail, file_package.as_deref())
                 };
@@ -527,13 +532,13 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                         .names
                         .iter()
                         .map(|alias| {
-                            let name = alias.name.as_str().to_string();
+                            let name = alias.name.as_str().to_compact_string();
                             let local = alias
                                 .asname
                                 .as_ref()
                                 .map(|n| n.as_str())
                                 .unwrap_or(alias.name.as_str())
-                                .to_string();
+                                .to_compact_string();
                             (name, local)
                         })
                         .collect();
@@ -545,13 +550,13 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                     .names
                     .iter()
                     .map(|alias| {
-                        let module_name = alias.name.as_str().to_string();
+                        let module_name = alias.name.as_str().to_compact_string();
                         let local = alias
                             .asname
                             .as_ref()
                             .map(|n| n.as_str())
                             .unwrap_or(alias.name.as_str())
-                            .to_string();
+                            .to_compact_string();
                         (module_name, local)
                     })
                     .collect();
@@ -562,10 +567,10 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                     continue;
                 };
                 if let Some(entries) = string_literal_list(value) {
-                    let name = source
-                        [target_range.start().to_usize()..target_range.end().to_usize()]
-                        .to_string();
-                    literal_list_rows.push((name, entries.into_iter().map(String::from).collect()));
+                    let name = CompactString::from(
+                        &source[target_range.start().to_usize()..target_range.end().to_usize()],
+                    );
+                    literal_list_rows.push((name, entries.into_iter().map(Into::into).collect()));
                 } else if let Expr::Call(call) = value {
                     // `NAME = <callee>(...)` — record the callee descriptor so
                     // `find_instance_constructions` can resolve it at fan-in.
@@ -604,8 +609,8 @@ pub(crate) fn imports_local_from_facts(
     facts: &[ImportFact],
     modules: &[String],
     allowed: &FxHashSet<&str>,
-) -> FxHashMap<String, String> {
-    let mut out: FxHashMap<String, String> = FxHashMap::default();
+) -> LocalImports {
+    let mut out: LocalImports = FxHashMap::default();
     for module in modules {
         let parent_last = module.rsplit_once('.');
         for fact in facts {
@@ -621,7 +626,10 @@ pub(crate) fn imports_local_from_facts(
                         if absolute == parent {
                             for (name, local) in names {
                                 if name == last {
-                                    out.insert(local.clone(), MODULE_ALIAS_MARKER.to_string());
+                                    out.insert(
+                                        local.clone(),
+                                        CompactString::const_new(MODULE_ALIAS_MARKER),
+                                    );
                                 }
                             }
                         }
@@ -630,7 +638,10 @@ pub(crate) fn imports_local_from_facts(
                 ImportFact::Plain { entries } => {
                     for (module_name, local) in entries {
                         if module_name == module {
-                            out.insert(local.clone(), MODULE_ALIAS_MARKER.to_string());
+                            out.insert(
+                                local.clone(),
+                                CompactString::const_new(MODULE_ALIAS_MARKER),
+                            );
                         }
                     }
                 }
@@ -656,17 +667,17 @@ pub(crate) fn imports_local_from_facts(
 /// the call-site query (on [`CallSiteFact::callee`]).
 pub(crate) fn match_callee_chain(
     root_name: &str,
-    attrs: &[String],
-    imports: &FxHashMap<String, String>,
+    attrs: &[CompactString],
+    imports: &LocalImports,
     modules: &[String],
     allowed: &FxHashSet<&str>,
-) -> Option<String> {
+) -> Option<CompactString> {
     match attrs {
         [] => imports
             .get(root_name)
             .filter(|target| allowed.contains(target.as_str()))
             .cloned(),
-        [attr] => (imports.get(root_name).map(String::as_str) == Some(MODULE_ALIAS_MARKER)
+        [attr] => (imports.get(root_name).map(CompactString::as_str) == Some(MODULE_ALIAS_MARKER)
             && allowed.contains(attr.as_str()))
         .then(|| attr.clone()),
         segs => {
@@ -696,9 +707,9 @@ pub(crate) fn match_callee_chain(
 /// [`CalleeChain`].
 pub(crate) fn match_callee_descriptor(
     desc: &CalleeDescriptor,
-    imports: &FxHashMap<String, String>,
+    imports: &LocalImports,
     modules: &[String],
     allowed: &FxHashSet<&str>,
-) -> Option<String> {
+) -> Option<CompactString> {
     match_callee_chain(&desc.root_name, &desc.attrs, imports, modules, allowed)
 }

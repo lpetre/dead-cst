@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use compact_str::{CompactString, ToCompactString};
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
 use ruff_python_ast::{Expr, ExprName, Stmt};
@@ -61,9 +62,9 @@ pub(crate) fn from_module_string(
     db: &dyn ty_python_semantic::Db,
     file: File,
     stmt: &ruff_python_ast::StmtImportFrom,
-) -> String {
+) -> CompactString {
     ModuleName::from_import_statement(db, file, stmt)
-        .map(|n| n.as_str().to_string())
+        .map(|n| n.as_str().to_compact_string())
         .unwrap_or_default()
 }
 
@@ -81,14 +82,14 @@ pub(crate) fn from_module_string(
 /// filesystem — no Python callback, so the same lookup works in
 /// pyo3 contexts where issuing ``importlib.metadata.distributions()``
 /// would round-trip through the runtime.
-pub(crate) type DistLookup = HashMap<PathBuf, String>;
+pub(crate) type DistLookup = HashMap<PathBuf, CompactString>;
 
 /// PEP 503 normalization. Replaces every run of ``[-_.]`` with a
 /// single ``-`` and lowercases the rest. Equivalent to Python's
 /// ``re.sub(r"[-_.]+", "-", name).lower()`` from libcst's
 /// ``_canonical_dist_name``.
-pub(crate) fn pep503_canonicalize(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
+pub(crate) fn pep503_canonicalize(name: &str) -> CompactString {
+    let mut out = CompactString::with_capacity(name.len());
     let mut prev_sep = false;
     for ch in name.chars() {
         if matches!(ch, '-' | '_' | '.') {
@@ -161,7 +162,7 @@ pub(crate) fn build_dist_lookup(site_packages: &[PathBuf]) -> DistLookup {
 /// One ``*.dist-info/`` directory's ``(absolute file path, canonical
 /// dist name)`` pairs. ``None`` when METADATA / RECORD are missing or
 /// the ``Name:`` header isn't found.
-fn process_dist_info(dist_info: &Path, sp_root: &Path) -> Option<Vec<(PathBuf, String)>> {
+fn process_dist_info(dist_info: &Path, sp_root: &Path) -> Option<Vec<(PathBuf, CompactString)>> {
     let metadata = std::fs::read_to_string(dist_info.join("METADATA")).ok()?;
     let canonical = metadata
         .lines()

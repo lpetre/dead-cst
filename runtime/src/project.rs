@@ -805,7 +805,7 @@ fn assemble_graph<'db>(
                             }
 
                             let node = GraphNode {
-                                fqname: node_data.fqname.clone(),
+                                fqname: node_data.fqname.to_string(),
                                 kind: intern_kind(node_data.kind.as_static_str())?,
                                 // Every node in this file's payload shares
                                 // the file, so its path is the per-file
@@ -1005,19 +1005,20 @@ fn assemble_graph<'db>(
     // Sort by (fqname, path) — `intern_external` dedups on fqname, so
     // the first path after the sort wins deterministically, and every
     // External lands at the same index every run.
-    let mut externals: Vec<(String, String, File, NodeRef<'db>)> = external_keys
-        .into_iter()
-        .filter_map(|r| match r {
-            NodeRef::External(key) => {
-                let file = key.file(db);
-                Some((key.fqname(db).clone(), file_path_string(db, file), file, r))
-            }
-            _ => None,
-        })
-        .collect();
+    let mut externals: Vec<(compact_str::CompactString, String, File, NodeRef<'db>)> =
+        external_keys
+            .into_iter()
+            .filter_map(|r| match r {
+                NodeRef::External(key) => {
+                    let file = key.file(db);
+                    Some((key.fqname(db).clone(), file_path_string(db, file), file, r))
+                }
+                _ => None,
+            })
+            .collect();
     externals.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     for (fqname, path, file, r) in externals {
-        let idx = builder.intern_external(fqname, path, file);
+        let idx = builder.intern_external(fqname.into(), path, file);
         ref_to_global.insert(r, idx);
     }
 
@@ -1222,11 +1223,14 @@ fn fold_per_file_plugin_ops(
                         let path = file_path
                             .get_or_insert_with(|| file_path_string(db, file))
                             .clone();
-                        topic_facts.entry(topic.clone()).or_default().push(Fact {
-                            path,
-                            decl_idx,
-                            value: value.clone(),
-                        });
+                        topic_facts
+                            .entry(topic.to_string())
+                            .or_default()
+                            .push(Fact {
+                                path,
+                                decl_idx,
+                                value: value.to_string(),
+                            });
                     }
                 }
             }
@@ -1452,7 +1456,7 @@ pub(crate) fn build_fqname_indices(
                     acc.decls.entry(node.fqname.clone()).or_default().push(idx);
                     if let Some(import) = node.imports.as_ref() {
                         acc.imports_by_module
-                            .entry(import.module.clone())
+                            .entry(import.module.to_string())
                             .or_default()
                             .push(idx);
                     }
@@ -3115,7 +3119,7 @@ fn find_literal_list_entries_in(
                 continue;
             }
             found_any = true;
-            out.extend(entries.iter().cloned());
+            out.extend(entries.iter().map(|e| e.to_string()));
         }
     }
     found_any.then_some(out)
@@ -3216,7 +3220,7 @@ fn function_parameters_in(
     for (&file, rk_to_idx) in &by_file {
         for (rk, names) in &file_extraction(db, file).function_params {
             if let Some(&idx) = rk_to_idx.get(rk) {
-                params_for_idx.insert(idx, names.clone());
+                params_for_idx.insert(idx, names.iter().map(|n| n.to_string()).collect());
             }
         }
     }
@@ -3261,7 +3265,7 @@ fn class_method_parameters_in(
     for (&file, rk_to_idx) in &by_file {
         for (rk, names) in &file_extraction(db, file).class_method_params {
             if let Some(&idx) = rk_to_idx.get(rk) {
-                params_for_idx.insert(idx, names.clone());
+                params_for_idx.insert(idx, names.iter().map(|n| n.to_string()).collect());
             }
         }
     }
@@ -3341,7 +3345,9 @@ fn find_decorated_decls_core(
                     // `@alias.attr` / `@alias.attr(...)` where `alias` is the
                     // module (`import <module> [as alias]`).
                     [attr] => {
-                        imports.get(&desc.root_name).map(String::as_str)
+                        imports
+                            .get(&desc.root_name)
+                            .map(compact_str::CompactString::as_str)
                             == Some(MODULE_ALIAS_MARKER)
                             && names.contains(attr.as_str())
                     }
@@ -3398,7 +3404,7 @@ fn find_instance_constructions_core(
             } else {
                 CallArgs::default()
             };
-            out.push((idx, matched, call_args));
+            out.push((idx, matched.into_string(), call_args));
         }
     }
     out
@@ -3442,7 +3448,7 @@ fn find_handler_decorators_core(
                 } else {
                     CallArgs::default()
                 };
-                out.push((desc.root_name.clone(), idx, call_args));
+                out.push((desc.root_name.to_string(), idx, call_args));
             }
         }
     }
@@ -3488,7 +3494,7 @@ fn find_handler_decorators_via_core(
                 } else {
                     CallArgs::default()
                 };
-                out.push((desc.root_name.clone(), idx, call_args));
+                out.push((desc.root_name.to_string(), idx, call_args));
             }
         }
     }
@@ -3560,7 +3566,7 @@ fn find_calls_on_attr_core(
                 CallArgs::default()
             };
             for s in hits {
-                out.push((owner_idx, s.clone(), call_args.clone()));
+                out.push((owner_idx, s.to_string(), call_args.clone()));
             }
         });
     }
@@ -3593,7 +3599,7 @@ fn find_factory_decls_core(
             let mut kinds: FxHashSet<String> = FxHashSet::default();
             for desc in descriptors {
                 if let Some(name) = match_callee_descriptor(desc, &imports, modules, &allowed) {
-                    kinds.insert(name);
+                    kinds.insert(name.into_string());
                 }
             }
             if kinds.is_empty() {
@@ -4582,7 +4588,7 @@ mod tests {
                     decls.entry(node.fqname.clone()).or_default().push(idx);
                     if let Some(import) = node.imports.as_ref() {
                         imports_by_module
-                            .entry(import.module.clone())
+                            .entry(import.module.to_string())
                             .or_default()
                             .push(idx);
                     }
@@ -4624,7 +4630,7 @@ mod tests {
         b.nodes.push(node("pkg.mod.x", "variable"));
         let mut imp = node("pkg.mod.os", "import");
         imp.imports = Some(ImportPayload {
-            module: "os".to_string(),
+            module: "os".into(),
             decl: None,
             star: false,
         });
@@ -4659,8 +4665,8 @@ mod tests {
                 3 => {
                     let mut imp = node(&format!("pkg.m{}.dep", i % 11), "import");
                     imp.imports = Some(ImportPayload {
-                        module: format!("dep{}", i % 3),
-                        decl: Some("thing".to_string()),
+                        module: compact_str::format_compact!("dep{}", i % 3),
+                        decl: Some("thing".into()),
                         star: false,
                     });
                     b.nodes.push(imp);
