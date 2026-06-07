@@ -114,8 +114,24 @@ impl GraphNode {
     }
 }
 
+/// Sentinel file ordinal for nodes that belong to no per-file block:
+/// synthetic externals and plugin-minted nodes. They survive graph
+/// surgery untouched.
+pub(crate) const NO_FILE: u32 = u32::MAX;
+
 pub(crate) struct GraphBuilder {
     pub(crate) nodes: Vec<GraphNode>,
+    /// Dense node idx → owning-file ordinal (position in the build's
+    /// sorted project-file list), [`NO_FILE`] for synthetic nodes.
+    /// In-memory only — never serialized; the on-disk format carries
+    /// per-node `path_idx` instead. Maintained alongside `nodes` by
+    /// every append path so graph surgery can answer "which file owns
+    /// this node" in O(1).
+    pub(crate) node_file: Vec<u32>,
+    /// Per file ordinal: `(start, len)` of the file's contiguous node
+    /// block. Initial builds mint exactly one block per file; surgery
+    /// appends replacement blocks at the tail and tombstones old ones.
+    pub(crate) file_blocks: Vec<(u32, u32)>,
     pub(crate) node_index: FxHashMap<NodeKey, usize>,
     pub(crate) edges: Vec<(usize, usize, u8)>,
     pub(crate) edge_set: FxHashSet<(usize, usize, u8)>,
@@ -168,6 +184,8 @@ impl GraphBuilder {
             reverse_adj: Vec::with_capacity(expected_nodes),
             peer_pyi_to_py: FxHashMap::default(),
             external_nodes: FxHashMap::default(),
+            node_file: Vec::new(),
+            file_blocks: Vec::new(),
         }
     }
 
@@ -178,6 +196,7 @@ impl GraphBuilder {
         }
         let idx = self.nodes.len();
         self.nodes.push(node);
+        self.node_file.push(NO_FILE);
         self.node_index.insert(key, idx);
         self.forward_adj.push(Vec::new());
         self.reverse_adj.push(Vec::new());

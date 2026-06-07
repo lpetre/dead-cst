@@ -3,7 +3,6 @@
 //! Salsa-backed analysis context that the rest of the crate operates on.
 
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::lock_api::RawRwLockRecursive;
@@ -347,15 +346,6 @@ pub(crate) fn build_project_graph(
     // classification) hits a warm salsa cache instead of paying
     // the ~100ms walk inline.
     let t_populate = std::time::Instant::now();
-    // Per-file node counts, captured during the fan-out: each worker
-    // records its file's node total at the file's (sorted) position.
-    // Prefix-summed into per-file global-index offsets below, so the
-    // assembly pass assigns each node a deterministic index
-    // (`offset[file] + local_idx`) instead of a serial running
-    // counter — the seam for a future parallel assembly.
-    let node_counts: Vec<AtomicUsize> = (0..project_files.len())
-        .map(|_| AtomicUsize::new(0))
-        .collect();
     {
         // Per-file work-stealing on rayon: pre-clone N salsa
         // snapshots into a bounded MPMC channel; each task pulls a
@@ -386,7 +376,6 @@ pub(crate) fn build_project_graph(
         // commit message for the hazard.
         let dist_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &project_files;
-        let counts_ref: &[AtomicUsize] = &node_counts;
         let per_file_ids_ref: &[crate::native_plugins::PerFilePluginId] = per_file_plugin_ids;
         let counters_ref = Arc::clone(counters);
         let run_populate = move || {
@@ -421,14 +410,7 @@ pub(crate) fn build_project_graph(
                         s.spawn(move |_| {
                             let local_db = db_rx.recv().expect("snapshot available");
                             local_db.attach(|local_db| {
-                                // Record this file's node count for the offset
-                                // prefix-sum. `nodes` and `refs` are parallel
-                                // arrays, so `nodes.len()` is exactly what the
-                                // assembly mint loop iterates for this file.
-                                counts_ref[file_idx].store(
-                                    file_to_nodes(local_db, file).nodes.len(),
-                                    Ordering::Relaxed,
-                                );
+                                let _ = file_to_nodes(local_db, file);
                                 let _ = file_to_refspecs(local_db, file);
                                 // Owned per-file facts for the project-wide
                                 // plugin queries. Warmed here, while the AST
@@ -491,18 +473,6 @@ pub(crate) fn build_project_graph(
     progress.imports.finish_and_clear();
     progress.references.finish_and_clear();
 
-    // Exclusive prefix-sum the per-file node counts into per-file
-    // global-index offsets: file `i`'s nodes occupy global indices
-    // `[offset[i], offset[i] + count[i])`. The running total after the
-    // last file is the exact graph node population, which sizes the
-    // builder's payload region.
-    let mut node_offsets: Vec<usize> = Vec::with_capacity(node_counts.len());
-    let mut total_nodes: usize = 0;
-    for count in &node_counts {
-        node_offsets.push(total_nodes);
-        total_nodes += count.load(Ordering::Relaxed);
-    }
-
     counters.start_phase(PHASE_ASSEMBLE, Some(project_files.len()));
 
     // Assembly pass: assign global graph node indices to each
@@ -522,8 +492,6 @@ pub(crate) fn build_project_graph(
         py,
         db,
         &project_files,
-        &node_offsets,
-        total_nodes,
         &peer_pyi_to_py,
         per_file_plugin_ids,
         counters,
@@ -693,45 +661,11 @@ fn assemble_graph<'db>(
     py: Python<'_>,
     db: &'db ProjectDatabase,
     project_files: &[File],
-    node_offsets: &[usize],
-    total_nodes: usize,
     peer_pyi_to_py: &FxHashMap<File, File>,
     per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
     counters: &Arc<ProgressCounters>,
     reload_log: &ReloadLog,
 ) -> PyResult<AssembledGraph> {
-    // `total_nodes` and `node_offsets` come from the fan-out's per-file
-    // node-count prefix sum (see the populate phase). The exact total
-    // sizes the hashmaps that grow one-per-node (ref_to_global,
-    // global_index, decl_by_name_range) and skip rehashing entirely.
-    // Every file's index 0 is its synthetic module node and everything
-    // else is a decl, so `decls = nodes - 1` per file — an upper bound
-    // (star-statement nodes aren't decls either) that's fine for
-    // capacity reservation.
-    let total_decls = total_nodes.saturating_sub(project_files.len());
-
-    let mut builder = GraphBuilder::with_capacity(total_nodes);
-    // Pre-size the payload region so Pass 1 can place each node at its
-    // offset-derived global index instead of appending. The offsets
-    // partition [0, total_nodes), so every slot is written exactly once.
-    builder.prefill_payload_region(total_nodes);
-    let mut global_index: DeclIndex =
-        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
-    let mut module_nodes_by_file: FxHashMap<File, usize> =
-        FxHashMap::with_capacity_and_hasher(project_files.len(), Default::default());
-    // class_by_selection only sees class decls — typically a small
-    // fraction of all decls, so size to a modest fraction (1/4) to
-    // dodge initial growth without wasting space.
-    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> =
-        FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
-    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
-        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
-    let mut ref_to_global: FxHashMap<NodeRef, usize> =
-        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
-    let mut local_to_global: FxHashMap<(File, u32), usize> =
-        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
-    let mut all_warnings: Vec<String> = Vec::new();
-
     // Pass 1: node mint.
     //
     // Mirrors pass 2's shape so the alloc-heavy work runs without the
@@ -773,7 +707,8 @@ fn assemble_graph<'db>(
         twin_payload: Option<&'db FileNodes>,
     }
     let mut mints: Vec<FileMint<'db>> = Vec::with_capacity(project_files.len());
-    for (file_pos, &file) in project_files.iter().enumerate() {
+    let mut total_nodes: usize = 0;
+    for &file in project_files.iter() {
         let path_str = file_path_string(db, file);
         let is_stub = path_str.ends_with(".pyi");
         let twin_payload = if is_stub {
@@ -783,14 +718,61 @@ fn assemble_graph<'db>(
         } else {
             None
         };
+        let payload = file_to_nodes(db, file);
         mints.push(FileMint {
             file,
-            base: node_offsets[file_pos],
-            payload: file_to_nodes(db, file),
+            base: total_nodes,
+            payload,
             path_str,
             is_stub,
             twin_payload,
         });
+        total_nodes += payload.nodes.len();
+    }
+
+    // `total_nodes` is the running prefix sum over the per-file
+    // payload lengths the mints loop just walked — each file's nodes
+    // occupy the contiguous block `[base, base + len)`, which is also
+    // recorded on the builder (`file_blocks` / `node_file`) as the
+    // file-identity layer graph surgery operates on. The exact total
+    // sizes the hashmaps that grow one-per-node (ref_to_global,
+    // global_index, decl_by_name_range) and skip rehashing entirely.
+    // Every file's index 0 is its synthetic module node and everything
+    // else is a decl, so `decls = nodes - 1` per file — an upper bound
+    // (star-statement nodes aren't decls either) that's fine for
+    // capacity reservation.
+    let total_decls = total_nodes.saturating_sub(project_files.len());
+
+    let mut builder = GraphBuilder::with_capacity(total_nodes);
+    // Pre-size the payload region so Pass 1 can place each node at its
+    // offset-derived global index instead of appending. The offsets
+    // partition [0, total_nodes), so every slot is written exactly once.
+    builder.prefill_payload_region(total_nodes);
+    let mut global_index: DeclIndex =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut module_nodes_by_file: FxHashMap<File, usize> =
+        FxHashMap::with_capacity_and_hasher(project_files.len(), Default::default());
+    // class_by_selection only sees class decls — typically a small
+    // fraction of all decls, so size to a modest fraction (1/4) to
+    // dodge initial growth without wasting space.
+    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
+    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut ref_to_global: FxHashMap<NodeRef, usize> =
+        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
+    let mut local_to_global: FxHashMap<(File, u32), usize> =
+        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
+    let mut all_warnings: Vec<String> = Vec::new();
+
+    // File-identity layer: dense idx → owning-file ordinal plus the
+    // per-file contiguous block, recorded on the builder so graph
+    // surgery can tombstone/append per-file blocks without scanning.
+    builder.node_file = vec![crate::builder::NO_FILE; total_nodes];
+    for (ordinal, mint) in mints.iter().enumerate() {
+        let n = mint.payload.nodes.len();
+        builder.file_blocks.push((mint.base as u32, n as u32));
+        builder.node_file[mint.base..mint.base + n].fill(ordinal as u32);
     }
 
     // Pass 0: serial-only resolution prep — fetch the spec payloads
@@ -1235,7 +1217,7 @@ fn assemble_graph<'db>(
     // directly. Only `Binding`-role refs are eligible (one flag per
     // alias; a use through it resolves or drops silently).
     for (pos, payload) in spec_payloads.iter().enumerate() {
-        let base = node_offsets[pos];
+        let base = mints[pos].base;
         let ids = &spec_ids[pos];
         for (i, spec) in payload.specs.iter().enumerate() {
             let Target::Member(m) = &spec.target else {
@@ -1289,7 +1271,7 @@ fn assemble_graph<'db>(
                 .par_iter()
                 .enumerate()
                 .flat_map_iter(|(pos, payload)| {
-                    let base = node_offsets[pos];
+                    let base = mints[pos].base;
                     let ids = &spec_ids_ref[pos];
                     let file = project_files[pos];
                     payload.specs.iter().enumerate().flat_map(move |(i, spec)| {
