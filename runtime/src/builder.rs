@@ -132,13 +132,33 @@ pub(crate) struct GraphBuilder {
     /// block. Initial builds mint exactly one block per file; surgery
     /// appends replacement blocks at the tail and tombstones old ones.
     pub(crate) file_blocks: Vec<(u32, u32)>,
-    /// Dense indices tombstoned by graph surgery: the node slot stays
-    /// in place (untouched files' dense ids — and so their edges —
-    /// never remap) but is dead. Surgery removes a tombstone's edges,
-    /// so reachability never visits one; iteration surfaces (`nodes()`
-    /// exposure, fqname-index build, serialization) skip members, and
-    /// `len()` is the compaction trigger. Empty until surgery runs.
+    /// Dense indices tombstoned by an incremental re-mint: the node
+    /// slot stays in place (untouched files' dense ids — and so their
+    /// cached edge triples — never remap) but is dead: blanked node
+    /// data, zero flags, and no part references it, so the per-build
+    /// edge refold emits nothing touching it. Iteration surfaces
+    /// (`indices_where`, fqname-index build, serialization) skip
+    /// members; `len()` drives the compaction trigger (a full rebuild
+    /// resets the id space). Empty until an incremental rebuild
+    /// re-mints a file.
     pub(crate) tombstoned: FxHashSet<u32>,
+    /// Per file ordinal: the file's **part** — its translated
+    /// out-edge triples (spec + structural + peer + per-file-plugin),
+    /// in dense-id terms, sorted + deduplicated. This is the
+    /// persistent per-file builder output: an incremental rebuild
+    /// reuses a clean file's part verbatim (no re-translation, no
+    /// re-hashing) and the per-build global edge structures are
+    /// refolded by concatenating parts. Project-wide plugin edges are
+    /// deliberately *not* part of any part — they re-apply through
+    /// `add_edge` each build and vanish at the next refold.
+    pub(crate) part_edges: Vec<Vec<(u32, u32, u8)>>,
+    /// Per-node **base** flags: the post-assemble, pre-plugin-pass
+    /// flag state (default + stub fixup + `UNRESOLVED` stamps +
+    /// per-file plugin ops). Each build starts by restoring
+    /// `nodes[i].flags` from here — which erases the previous plugin
+    /// pass's ORs without any undo bookkeeping — and re-snapshots
+    /// after the dirty files' stamps are refreshed.
+    pub(crate) base_flags: Vec<u32>,
     pub(crate) node_index: FxHashMap<NodeKey, usize>,
     pub(crate) edges: Vec<(usize, usize, u8)>,
     pub(crate) edge_set: FxHashSet<(usize, usize, u8)>,
@@ -194,6 +214,41 @@ impl GraphBuilder {
             node_file: Vec::new(),
             file_blocks: Vec::new(),
             tombstoned: FxHashSet::default(),
+            part_edges: Vec::new(),
+            base_flags: Vec::new(),
+        }
+    }
+
+    /// Clear every **derived** edge structure (`edges`, `edge_set`,
+    /// both adjacency tables) and re-size the adjacency tables to the
+    /// current node count, ready for the per-build refold from
+    /// `part_edges`. The persistent state — nodes, parts, blocks,
+    /// tombstones, externals — is untouched.
+    pub(crate) fn reset_derived_edges(&mut self) {
+        self.edges.clear();
+        self.edge_set.clear();
+        self.forward_adj.clear();
+        self.reverse_adj.clear();
+        self.forward_adj.resize_with(self.nodes.len(), Vec::new);
+        self.reverse_adj.resize_with(self.nodes.len(), Vec::new);
+    }
+
+    /// Tombstone one contiguous node block `[start, start + len)`:
+    /// mark every index dead and reset its slot to the empty
+    /// placeholder (freeing the node's strings, zeroing its flags so
+    /// the reachability seed scan never picks it up, and blanking its
+    /// kind so kind-filtered scans skip it). The slot itself stays in
+    /// place — untouched files' dense indices never remap. The
+    /// per-build edge refold can't reference a tombstone (no part
+    /// points at it after the owning file's part is replaced).
+    pub(crate) fn tombstone_block(&mut self, start: u32, len: u32) {
+        for idx in start..start + len {
+            self.tombstoned.insert(idx);
+            self.nodes[idx as usize] = GraphNode::default();
+            self.node_file[idx as usize] = NO_FILE;
+            if (idx as usize) < self.base_flags.len() {
+                self.base_flags[idx as usize] = 0;
+            }
         }
     }
 
@@ -270,6 +325,10 @@ impl GraphBuilder {
     /// with looping `add_edge`, the win is amortising the per-edge
     /// branch / hash overhead and pre-reserving capacity on `edges`
     /// and the per-node adjacency vectors.
+    /// Retained as the serial reference implementation for
+    /// `init_edges_bulk`'s equivalence tests (no production caller
+    /// since the per-part edge refold subsumed the post-init inserts).
+    #[allow(dead_code)]
     pub(crate) fn extend_edges(&mut self, triples: Vec<(usize, usize, u8)>) {
         if triples.is_empty() {
             return;

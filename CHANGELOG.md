@@ -29,6 +29,24 @@ two versions.
   diagnostic `ProjectContext._last_resolve_counts()` reports `(resolved,
   reused)` for the most recent build; `DEAD_CST_TIMING=1` prints the same
   counts.
+- **Per-file builder parts with stable dense ids.** The builder output is now
+  stored per file and persists across builds: each file owns a contiguous
+  node block in the dense id space (reached through the O(1)
+  `node_file` / `file_blocks` indirection) and a translated out-edge list
+  (`GraphBuilder::part_edges`). On an incremental `re_materialize`, clean
+  files keep their node block and part verbatim — no node re-mint, no edge
+  re-translation, no row re-hashing; dirty files tombstone their old block
+  and append a fresh one at the tail (so live indices never remap — cached
+  positional indices into unchanged files stay valid across rebuilds,
+  exposed via `ProjectContext.tombstoned_indices()`); files whose
+  cross-file answers changed (a re-resolved memo entry, or a cached triple
+  targeting a tombstoned block) re-translate their edges only. Every global
+  structure — the edge vec + adjacency, decl/fqname indices, node flags
+  (restored from a per-build base snapshot, so plugin effects never leak
+  into reused parts), topic facts, the class hierarchy, the plugin pass —
+  is still refolded from the parts each build. Full builds compact the id
+  space, and run automatically once tombstones outnumber live nodes;
+  `write_graph` packs tombstones away at serialization time.
 
 - **Topic/fact channel for native plugins.** A per-file native plugin can
   now hand structured facts up to its project-wide reader. A plugin declares

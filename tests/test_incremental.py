@@ -37,11 +37,14 @@ def _edges(ctx) -> set[tuple[str, str]]:
 
 
 def _node_keys(ctx) -> list[tuple[str, str, int]]:
-    """``[(fqname, kind, start_line), ...]`` for every node in ``ctx``.
+    """``[(fqname, kind, start_line), ...]`` for every live node in
+    ``ctx`` (incremental tombstones keep blanked slots in place so live
+    indices never remap — skip them).
 
     Returns a list (not a set) so duplicate-node bugs don't get
     silently collapsed by set equality."""
-    keys = [(n.fqname, n.kind, n.start_line) for n in ctx.nodes()]
+    dead = set(ctx.tombstoned_indices())
+    keys = [(n.fqname, n.kind, n.start_line) for i, n in enumerate(ctx.nodes()) if i not in dead]
     keys.sort()
     return keys
 
@@ -328,7 +331,12 @@ def test_re_materialize_zero_change_skips_rebuild(tmp_path):
 
 
 def _node_flags(ctx) -> list[tuple[str, str, int, int]]:
-    keys = [(n.fqname, n.kind, n.start_line, int(n.flags)) for n in ctx.nodes()]
+    dead = set(ctx.tombstoned_indices())
+    keys = [
+        (n.fqname, n.kind, n.start_line, int(n.flags))
+        for i, n in enumerate(ctx.nodes())
+        if i not in dead
+    ]
     keys.sort()
     return keys
 
@@ -621,3 +629,106 @@ def test_incremental_resolve_repeated_edits(tmp_path):
         _write(tmp_path / "a.py", body)
         analysis.re_materialize(_changed(tmp_path, "a.py"))
         _assert_matches_fresh(analysis, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-file builder parts: id stability, tombstones, compaction.
+# ---------------------------------------------------------------------------
+
+
+def test_incremental_untouched_indices_stable(tmp_path):
+    """The locality guarantee of the per-file parts layout: a node in
+    an untouched file keeps its dense index across an incremental
+    rebuild (the changed file's block is tombstoned and re-appended at
+    the tail)."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    _write(tmp_path / "c.py", "def lonely(): pass\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+    before = {i: (n.fqname, n.path) for i, n in enumerate(ctx.nodes()) if n.path.endswith("c.py")}
+    assert before
+
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+
+    assert ctx.tombstoned_indices()  # a.py's old block
+    after_nodes = ctx.nodes()
+    for idx, key in before.items():
+        assert (after_nodes[idx].fqname, after_nodes[idx].path) == key
+
+
+def test_incremental_tombstones_accumulate_then_compact(tmp_path):
+    """Each incremental re-mint tombstones the old block; once the
+    tombstones outnumber live nodes the next build takes the full path
+    and compacts the id space back to zero tombstones — while staying
+    exact against fresh builds throughout."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+    assert ctx.tombstoned_indices() == []
+
+    compacted = False
+    prev_tombs = 0
+    for round_no in range(12):
+        _write(tmp_path / "a.py", f"def f(): pass\ndef g{round_no}(): pass\n")
+        analysis.re_materialize(_changed(tmp_path, "a.py"))
+        tombs = len(ctx.tombstoned_indices())
+        if tombs < prev_tombs:
+            compacted = True
+            break
+        prev_tombs = tombs
+        _assert_matches_fresh(analysis, tmp_path)
+    assert compacted, "compaction trigger never fired"
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_incremental_rescan_compacts(tmp_path):
+    """A full-path rebuild (rescan) resets the tombstone set."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+    assert ctx.tombstoned_indices()
+
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\ndef h(): pass\n")
+    analysis.re_materialize([native.ChangeEvent.rescan()])
+    assert ctx.tombstoned_indices() == []
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_write_graph_compacts_tombstones(tmp_path):
+    """Serialization packs tombstoned slots away and remaps edge
+    endpoints, so a graph written mid-session round-trips clean."""
+    from dead_cst import _native
+
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+    assert ctx.tombstoned_indices()
+
+    out = tmp_path / "g.dcg"
+    _native.write_graph(
+        str(out),
+        ctx.nodes(),
+        [(s, d, f) for s, d, f in ctx.edges()],
+        [],
+        ctx.node_flag_registry(),
+        ctx.edge_flag_registry(),
+    )
+    graph, meta = _native.read_graph(str(out))
+    read_keys = sorted((n.fqname, n.kind, n.start_line) for n in graph.nodes)
+    assert read_keys == _node_keys(ctx)
+    assert meta.node_count == len(read_keys)
+    # Edge content survives the remap.
+    live = ctx.nodes()
+    want = sorted((live[s].fqname, live[d].fqname, f) for s, d, f in ctx.edges())
+    got = sorted((graph.nodes[s].fqname, graph.nodes[d].fqname, f) for s, d, f in graph.edges)
+    assert want == got

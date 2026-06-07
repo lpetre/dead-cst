@@ -97,6 +97,7 @@ impl Project {
             None,
             &counters,
             &[],
+            GraphBuilder::with_capacity(0),
             ResolveCache::default(),
             None,
         )?;
@@ -362,6 +363,7 @@ pub(crate) fn build_project_graph(
     stack_size: Option<usize>,
     counters: &Arc<ProgressCounters>,
     per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
+    carry: GraphBuilder,
     cache: ResolveCache,
     scope: Option<Vec<File>>,
 ) -> PyResult<BuildOutputs> {
@@ -590,6 +592,7 @@ pub(crate) fn build_project_graph(
         per_file_plugin_ids,
         counters,
         &reload_log,
+        carry,
         cache,
         scope,
     )?;
@@ -727,35 +730,44 @@ struct AssembledGraph {
 
 /// Fan-in pass that converts the salsa-tracked per-file payloads
 /// (`file_to_nodes` / `file_to_refspecs`) into a fully-populated
-/// `GraphBuilder`.
+/// `GraphBuilder` of **per-file parts**.
 ///
-/// Three sub-passes:
+/// The builder output is per-file: each file owns a contiguous node
+/// block in the dense id space (`file_blocks` / `node_file` are the
+/// O(1) indirection) and a translated out-edge list
+/// (`GraphBuilder::part_edges`). Both persist across builds — `carry`
+/// is the previous build's builder. Every **derived** structure (the
+/// global edge vec + adjacency, `ref_to_global`, the decl/fqname
+/// indices, topic facts, the class hierarchy) is refolded from the
+/// parts on every build, so nothing global is ever patched in place
+/// and nothing can be stale.
 ///
-/// 1. **Node mint** — write each file's payload `NodeData` into its
-///    offset-derived block of the prefilled payload region (the
-///    per-file blocks are disjoint, so the fill fans out across
-///    rayon workers with the GIL released). Build the
-///    `NodeRef -> global_idx` map and the assorted secondary
-///    indices (`global_index`, `module_nodes_by_file`,
-///    `class_by_selection`, `decl_by_name_range`) on concurrent
-///    sibling tasks. Apply the stub-only `ENTRYPOINT` flag fixup
-///    for `.pyi` decls whose runtime twin doesn't expose the same
-///    name.
+/// Two paths share all the machinery:
 ///
-/// 2. **Spec resolution + edge translation** — resolve the
-///    project-wide unique `Member` / `Dynamic` refs on rayon
-///    workers (memoized per `(ref, anchor directory)`), then
-///    translate each file's `RefSpec`s to `(usize, usize, u8)`
-///    triples. Synthetic External nodes mint during the memo fold.
-///    Edges whose endpoint isn't recognised (e.g. a Definition in a
-///    non-project file that ty's resolver reached but we didn't
-///    enumerate) silently drop. Structural edges (decl → module
-///    anchors, overload anchors, module hierarchy) are synthesized
-///    here straight from the node payloads.
+/// * **Full** (first build, out-of-scope events, changed file list, or
+///   the tombstone-compaction trigger): a fresh builder, every file
+///   minted and translated — exactly the historical pipeline, plus the
+///   parts as a by-product.
+/// * **Incremental** (`dirty_files = Some`): clean files keep their
+///   node block and part verbatim. Dirty files (event scope ∪
+///   fingerprint-moved ∪ `.pyi` stubs of dirty twins) are re-minted —
+///   their old block is tombstoned and a fresh block appended at the
+///   tail, so dense ids of untouched files never remap. Files whose
+///   *cross-file answers* changed (a spec row whose memo entry
+///   re-resolved, or a cached triple targeting a tombstoned block) are
+///   re-translated only: nodes kept, part edges rebuilt.
 ///
-/// 3. **Peer .pyi/.py edges** — for each peer pair, walk both
-///    files' `exports_by_name` and emit `pyi_decl -> py_decl`
-///    edges for any name present in both.
+/// Pass shape (mirrors the historical numbering):
+///
+/// 1. **Node mint** — bases assigned (prefix sums on the full path;
+///    tail appends on the incremental path), parallel fill of the
+///    minted blocks, concurrent refold of the `(File, …)`-keyed decl
+///    indices over *all* files, overlapped with the resolve arm
+///    (incremental via [`ResolveCache`]).
+/// 2. **Translation** — memo slots to dense ids, `UNRESOLVED`
+///    re-stamps and per-part edge translation for the re-translate
+///    set, then the global edge refold (concat parts → sort →
+///    [`GraphBuilder::init_edges_bulk`]).
 ///
 /// Warnings buffered in each `FileRefSpecs.warnings` are flushed to
 /// the `dead_cst._visitor` Python logger at the end — once per
@@ -769,157 +781,20 @@ fn assemble_graph<'db>(
     per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
     counters: &Arc<ProgressCounters>,
     reload_log: &ReloadLog,
+    carry: GraphBuilder,
     cache: ResolveCache,
     scope: Option<Vec<File>>,
 ) -> PyResult<AssembledGraph> {
-    // Pass 1: node mint.
-    //
-    // Mirrors pass 2's shape so the alloc-heavy work runs without the
-    // GIL on rayon workers:
-    //
-    //   1a. Serial fetch of every file's salsa-tracked `FileNodes`
-    //       payload (a memoized cache read after the populate fan-out),
-    //       its path string, and — for peer stubs — the `.py` twin's
-    //       payload for the stub-only ENTRYPOINT fixup.
-    //   1b. `Python::allow_threads` + rayon. The per-file offsets
-    //       partition the prefilled payload region, so each file's
-    //       `GraphNode`s are written through a disjoint `&mut` slice by
-    //       a parallel fill (one rayon item per file) that also collects
-    //       the file's `(NodeKey, global_idx)` rows. Concurrently,
-    //       sibling rayon tasks fold the secondary index maps
-    //       (`ref_to_global`, `local_to_global`, and the decl indices)
-    //       — each needs only the payload refs plus the offsets, so
-    //       they're independent of the node fill and of each other.
-    //   1c. Serial fold of the `NodeKey` rows into `node_index`,
-    //       keeping the key-collision assert that guards the
-    //       position-distinct invariant (`CLAUDE.md` principle 3).
-
     let t_pass1_start = std::time::Instant::now();
-
-    // 1a: serial prefetch.
-    struct FileMint<'db> {
-        file: File,
-        /// This file's nodes occupy the contiguous global-index block
-        /// `[base, base + payload.nodes.len())`; each local ref lands
-        /// at `base + local_idx`.
-        base: usize,
-        payload: &'db FileNodes,
-        path_str: String,
-        is_stub: bool,
-        /// Stub-only ENTRYPOINT context: if this is a .pyi without a
-        /// .py twin (`None`), every decl needs ENTRYPOINT. If it has a
-        /// twin, only decls whose name isn't in the twin's exports
-        /// need it.
-        twin_payload: Option<&'db FileNodes>,
-    }
-    let mut mints: Vec<FileMint<'db>> = Vec::with_capacity(project_files.len());
-    let mut total_nodes: usize = 0;
-    for &file in project_files.iter() {
-        let path_str = file_path_string(db, file);
-        let is_stub = path_str.ends_with(".pyi");
-        let twin_payload = if is_stub {
-            peer_pyi_to_py
-                .get(&file)
-                .map(|&py_file| file_to_nodes(db, py_file))
-        } else {
-            None
-        };
-        let payload = file_to_nodes(db, file);
-        mints.push(FileMint {
-            file,
-            base: total_nodes,
-            payload,
-            path_str,
-            is_stub,
-            twin_payload,
-        });
-        total_nodes += payload.nodes.len();
-    }
-
-    // `total_nodes` is the running prefix sum over the per-file
-    // payload lengths the mints loop just walked — each file's nodes
-    // occupy the contiguous block `[base, base + len)`, which is also
-    // recorded on the builder (`file_blocks` / `node_file`) as the
-    // file-identity layer graph surgery operates on. The exact total
-    // sizes the hashmaps that grow one-per-node (ref_to_global,
-    // global_index, decl_by_name_range) and skip rehashing entirely.
-    // Every file's index 0 is its synthetic module node and everything
-    // else is a decl, so `decls = nodes - 1` per file — an upper bound
-    // (star-statement nodes aren't decls either) that's fine for
-    // capacity reservation.
-    let total_decls = total_nodes.saturating_sub(project_files.len());
-
-    let mut builder = GraphBuilder::with_capacity(total_nodes);
-    // Pre-size the payload region so Pass 1 can place each node at its
-    // offset-derived global index instead of appending. The offsets
-    // partition [0, total_nodes), so every slot is written exactly once.
-    builder.prefill_payload_region(total_nodes);
-    let mut global_index: DeclIndex =
-        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
-    let mut module_nodes_by_file: FxHashMap<File, usize> =
-        FxHashMap::with_capacity_and_hasher(project_files.len(), Default::default());
-    // class_by_selection only sees class decls — typically a small
-    // fraction of all decls, so size to a modest fraction (1/4) to
-    // dodge initial growth without wasting space.
-    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> =
-        FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
-    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
-        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
-    let mut ref_to_global: FxHashMap<NodeRef, usize> =
-        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
-    let mut local_to_global: FxHashMap<(File, u32), usize> =
-        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
-    let mut all_warnings: Vec<String> = Vec::new();
-
-    // File-identity layer: dense idx → owning-file ordinal plus the
-    // per-file contiguous block, recorded on the builder so graph
-    // surgery can tombstone/append per-file blocks without scanning.
-    builder.node_file = vec![crate::builder::NO_FILE; total_nodes];
-    for (ordinal, mint) in mints.iter().enumerate() {
-        let n = mint.payload.nodes.len();
-        builder.file_blocks.push((mint.base as u32, n as u32));
-        builder.node_file[mint.base..mint.base + n].fill(ordinal as u32);
-    }
-
-    // Pass 0: serial-only resolution prep — fetch the spec payloads
-    // (salsa cache reads that borrow from the main db handle, so they
-    // can't move off this thread), derive the per-file anchor-directory
-    // ids, and pre-clone the snapshot pool. Everything row-shaped (the
-    // unique-key interning, the class-base gather) runs inside pass 1's
-    // resolve arm instead, overlapped with the node fill.
-    let t_pass0_start = std::time::Instant::now();
-    let mut spec_payloads: Vec<&FileRefSpecs> = Vec::with_capacity(project_files.len());
-    for &file in project_files {
-        spec_payloads.push(file_to_refspecs(db, file));
-    }
-
-    // Per-file anchor-directory ids. ty's `resolve_module` is anchor-
-    // sensitive only through its desperate-resolution fallback, which
-    // depends on the importing file's ancestor directories — so files
-    // sharing a directory share resolutions. `mints` is path-sorted,
-    // so the first file seen for a directory is deterministic; that
-    // file is the directory's representative resolution anchor.
-    let mut dir_to_id: FxHashMap<&str, u32> = FxHashMap::default();
-    let mut dir_anchors: Vec<File> = Vec::new();
-    let mut dir_ids: Vec<u32> = Vec::with_capacity(project_files.len());
-    for mint in &mints {
-        let dir = match mint.path_str.rsplit_once(['/', '\\']) {
-            Some((dir, _)) => dir,
-            None => "",
-        };
-        let id = *dir_to_id.entry(dir).or_insert_with(|| {
-            dir_anchors.push(mint.file);
-            (dir_anchors.len() - 1) as u32
-        });
-        dir_ids.push(id);
-    }
+    let n_files = project_files.len();
 
     // Incremental gate: per-file resolution-surface fingerprints
     // (salsa-tracked — warmed in the populate fan-out, so this loop is
     // memo reads) plus the *effectively dirty* file set. `Some(dirty)`
-    // means the resolve arm may reuse every cached entry whose read
-    // set avoids dirty files; `None` means resolve everything (first
-    // build, an out-of-scope event batch, or a changed file list).
+    // means clean files keep their node block + part and the resolve
+    // arm reuses every cached entry whose read set avoids dirty files;
+    // `None` means rebuild everything (first build, an out-of-scope
+    // event batch, a changed file list, or the compaction trigger).
     // See [`ResolveCache`] for the full gating contract.
     let new_fps: Vec<u64> = project_files
         .iter()
@@ -931,8 +806,17 @@ fn assemble_graph<'db>(
         .map(|(i, &f)| (f, i))
         .collect();
     let dirty_files: Option<Vec<bool>> = match &scope {
-        Some(scope_files) if cache.valid && cache.files.as_slice() == project_files => {
-            let mut dirty: Vec<bool> = (0..project_files.len())
+        Some(scope_files)
+            if cache.valid
+                && cache.files.as_slice() == project_files
+                && carry.file_blocks.len() == n_files
+                && carry.part_edges.len() == n_files
+                // Compaction trigger: once tombstones outnumber live
+                // nodes, take the full path — it rebuilds a packed id
+                // space from scratch.
+                && carry.tombstoned.len() * 2 <= carry.nodes.len() =>
+        {
+            let mut dirty: Vec<bool> = (0..n_files)
                 .map(|pos| new_fps[pos] != cache.surface_fp[pos])
                 .collect();
             let mut in_scope = true;
@@ -948,10 +832,216 @@ fn assemble_graph<'db>(
                     }
                 }
             }
+            // A `.pyi` part reads its `.py` twin's export surface (the
+            // stub-only ENTRYPOINT fixup), so a dirty twin re-mints the
+            // stub: its payload is unchanged (cheap cache re-read) but
+            // its node flags can differ.
+            for (&pyi, &twin) in peer_pyi_to_py {
+                if dirty[ordinal_of[&twin]] {
+                    dirty[ordinal_of[&pyi]] = true;
+                }
+            }
             in_scope.then_some(dirty)
         }
         _ => None,
     };
+
+    // 1a: serial prefetch + base assignment.
+    struct FileMint<'db> {
+        file: File,
+        /// This file's nodes occupy the contiguous global-index block
+        /// `[base, base + payload.nodes.len())`; each local ref lands
+        /// at `base + local_idx`.
+        base: usize,
+        payload: &'db FileNodes,
+        path_str: String,
+        is_stub: bool,
+        /// Stub-only ENTRYPOINT context: if this is a .pyi without a
+        /// .py twin (`None`), every decl needs ENTRYPOINT. If it has a
+        /// twin, only decls whose name isn't in the twin's exports
+        /// need it.
+        twin_payload: Option<&'db FileNodes>,
+        /// Whether this file's node block is (re-)minted this build.
+        /// Clean incremental files keep their block and skip the fill.
+        fill: bool,
+    }
+    let mut mints: Vec<FileMint<'db>> = Vec::with_capacity(n_files);
+    let mut builder;
+    // Old-block ids tombstoned *this* build — the dst-scan that pulls
+    // `Module`-target consumers into the re-translate set probes it.
+    let mut newly_tombstoned: FxHashSet<u32> = FxHashSet::default();
+    match &dirty_files {
+        None => {
+            // Full path: fresh builder, prefix-sum bases, prefilled
+            // payload region (parallel fill writes disjoint slices).
+            drop(carry);
+            let mut total_nodes: usize = 0;
+            for &file in project_files.iter() {
+                let path_str = file_path_string(db, file);
+                let is_stub = path_str.ends_with(".pyi");
+                let twin_payload = if is_stub {
+                    peer_pyi_to_py
+                        .get(&file)
+                        .map(|&py_file| file_to_nodes(db, py_file))
+                } else {
+                    None
+                };
+                let payload = file_to_nodes(db, file);
+                mints.push(FileMint {
+                    file,
+                    base: total_nodes,
+                    payload,
+                    path_str,
+                    is_stub,
+                    twin_payload,
+                    fill: true,
+                });
+                total_nodes += payload.nodes.len();
+            }
+            builder = GraphBuilder::with_capacity(total_nodes);
+            builder.prefill_payload_region(total_nodes);
+            builder.node_file = vec![crate::builder::NO_FILE; total_nodes];
+            builder.part_edges = vec![Vec::new(); n_files];
+            for (ordinal, mint) in mints.iter().enumerate() {
+                let n = mint.payload.nodes.len();
+                builder.file_blocks.push((mint.base as u32, n as u32));
+                builder.node_file[mint.base..mint.base + n].fill(ordinal as u32);
+            }
+        }
+        Some(dirty) => {
+            // Incremental path: keep the carried builder. Restore the
+            // base flags first — that erases the previous plugin
+            // pass's ORs (the only post-base mutation) with no undo
+            // bookkeeping. Dirty files tombstone their old block and
+            // append a fresh one at the tail (ascending ordinal order,
+            // so multi-file batches are deterministic).
+            builder = carry;
+            debug_assert_eq!(builder.base_flags.len(), builder.nodes.len());
+            for (idx, &fl) in builder.base_flags.iter().enumerate() {
+                builder.nodes[idx].flags = fl;
+            }
+            let mut append = builder.nodes.len();
+            for (pos, &file) in project_files.iter().enumerate() {
+                let path_str = file_path_string(db, file);
+                let is_stub = path_str.ends_with(".pyi");
+                let twin_payload = if is_stub {
+                    peer_pyi_to_py
+                        .get(&file)
+                        .map(|&py_file| file_to_nodes(db, py_file))
+                } else {
+                    None
+                };
+                let payload = file_to_nodes(db, file);
+                let base = if dirty[pos] {
+                    let (ob, ol) = builder.file_blocks[pos];
+                    for idx in ob..ob + ol {
+                        newly_tombstoned.insert(idx);
+                    }
+                    builder.tombstone_block(ob, ol);
+                    let base = append;
+                    append += payload.nodes.len();
+                    base
+                } else {
+                    builder.file_blocks[pos].0 as usize
+                };
+                mints.push(FileMint {
+                    file,
+                    base,
+                    payload,
+                    path_str,
+                    is_stub,
+                    twin_payload,
+                    fill: dirty[pos],
+                });
+            }
+            // Extend the persistent per-node storage for the appended
+            // region; the parallel fill below overwrites every new
+            // slot, and the end-of-assemble snapshot rewrites
+            // `base_flags` wholesale.
+            builder.nodes.resize_with(append, GraphNode::default);
+            builder.node_file.resize(append, crate::builder::NO_FILE);
+            builder.base_flags.resize(append, 0);
+            for (pos, mint) in mints.iter().enumerate() {
+                if mint.fill {
+                    let n = mint.payload.nodes.len();
+                    builder.file_blocks[pos] = (mint.base as u32, n as u32);
+                    builder.node_file[mint.base..mint.base + n].fill(pos as u32);
+                }
+            }
+        }
+    }
+    let total_nodes = builder.nodes.len();
+    // Upper bound for the one-entry-per-decl index maps (the full
+    // path's exact total; an over-estimate on the incremental path,
+    // which is fine for capacity reservation).
+    let total_decls = total_nodes.saturating_sub(n_files);
+
+    let mut global_index: DeclIndex =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut module_nodes_by_file: FxHashMap<File, usize> =
+        FxHashMap::with_capacity_and_hasher(n_files, Default::default());
+    // class_by_selection only sees class decls — typically a small
+    // fraction of all decls, so size to a modest fraction (1/4) to
+    // dodge initial growth without wasting space.
+    let mut class_by_selection: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
+    let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
+        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
+    let mut ref_to_global: FxHashMap<NodeRef, usize> =
+        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
+    let mut all_warnings: Vec<String> = Vec::new();
+
+    // Pass 0: serial-only resolution prep — fetch the spec payloads
+    // and per-file plugin ops (salsa cache reads that borrow from the
+    // main db handle, so they can't move off this thread), derive the
+    // per-file anchor-directory ids, and pre-clone the snapshot pool.
+    // Everything row-shaped (the unique-key interning, the class-base
+    // gather) runs inside pass 1's resolve arm instead, overlapped
+    // with the node fill.
+    let t_pass0_start = std::time::Instant::now();
+    let mut spec_payloads: Vec<&FileRefSpecs> = Vec::with_capacity(n_files);
+    for &file in project_files {
+        spec_payloads.push(file_to_refspecs(db, file));
+    }
+    // Per-file plugin ops, flattened across the registered per-file
+    // plugins (in registration order). Prefetched here so the per-part
+    // edge translation below can run db-free on rayon workers.
+    let plugin_ops: Vec<Vec<&'db crate::native_plugins::FileLocalOp>> = if per_file_plugin_ids
+        .is_empty()
+    {
+        vec![Vec::new(); n_files]
+    } else {
+        project_files
+            .iter()
+            .map(|&file| {
+                per_file_plugin_ids
+                    .iter()
+                    .flat_map(|&id| crate::native_plugins::per_file_plugin_ops(db, file, id).iter())
+                    .collect()
+            })
+            .collect()
+    };
+
+    // Per-file anchor-directory ids. ty's `resolve_module` is anchor-
+    // sensitive only through its desperate-resolution fallback, which
+    // depends on the importing file's ancestor directories — so files
+    // sharing a directory share resolutions. `mints` is path-sorted,
+    // so the first file seen for a directory is deterministic; that
+    // file is the directory's representative resolution anchor.
+    let mut dir_to_id: FxHashMap<&str, u32> = FxHashMap::default();
+    let mut dir_anchors: Vec<File> = Vec::new();
+    let mut dir_ids: Vec<u32> = Vec::with_capacity(n_files);
+    for mint in &mints {
+        let dir = match mint.path_str.rsplit_once(['/', '\\']) {
+            Some((dir, _)) => dir,
+            None => "",
+        };
+        let id = *dir_to_id.entry(dir).or_insert_with(|| {
+            dir_anchors.push(mint.file);
+            (dir_anchors.len() - 1) as u32
+        });
+        dir_ids.push(id);
+    }
 
     // Snapshot pool for the resolve fan-out, cloned here on the main
     // thread (a salsa clone must not race a worker mid-query — the
@@ -965,17 +1055,33 @@ fn assemble_graph<'db>(
         eprintln!("[dead-cst-timing] pass0={:?}", t_pass0_start.elapsed());
     }
 
-    // Disjoint per-file `&mut` windows over the prefilled payload
-    // region. The offsets are the exclusive prefix sum of the payload
-    // lengths, so successive `split_at_mut` calls reproduce them
-    // exactly (debug-asserted) and partition `[0, total_nodes)`.
-    let mut file_slices: Vec<&mut [GraphNode]> = Vec::with_capacity(mints.len());
-    let mut rest: &mut [GraphNode] = &mut builder.nodes;
-    for mint in &mints {
-        debug_assert_eq!(total_nodes - rest.len(), mint.base);
-        let (head, tail) = rest.split_at_mut(mint.payload.nodes.len());
-        file_slices.push(head);
-        rest = tail;
+    // Disjoint per-file `&mut` windows over the fill region (the whole
+    // payload region on the full path; the appended tail on the
+    // incremental path). Fill-minted blocks are contiguous and
+    // ascending there, so successive `split_at_mut` calls partition it
+    // exactly (debug-asserted).
+    let fill_region_start = match &dirty_files {
+        None => 0,
+        Some(_) => mints
+            .iter()
+            .filter(|m| m.fill)
+            .map(|m| m.base)
+            .min()
+            .unwrap_or(total_nodes),
+    };
+    let mut fill_mints: Vec<&FileMint<'db>> = Vec::new();
+    let mut file_slices: Vec<&mut [GraphNode]> = Vec::new();
+    {
+        let mut rest: &mut [GraphNode] = &mut builder.nodes[fill_region_start..];
+        let mut consumed = fill_region_start;
+        for mint in mints.iter().filter(|m| m.fill) {
+            debug_assert_eq!(consumed, mint.base);
+            let (head, tail) = rest.split_at_mut(mint.payload.nodes.len());
+            fill_mints.push(mint);
+            file_slices.push(head);
+            consumed += mint.payload.nodes.len();
+            rest = tail;
+        }
     }
 
     /// Everything the resolve arm hands back across the pass-1 join.
@@ -984,12 +1090,16 @@ fn assemble_graph<'db>(
     /// they are the previous build's vecs with the dirty / new entries
     /// overwritten in place, so every downstream pass (external mint,
     /// memo-slot translation, stamping) is identical for the full and
-    /// incremental paths.
+    /// incremental paths. `member_redo` / `dynamic_redo` mark the
+    /// entries (re-)resolved this build — the consumer detection that
+    /// drives per-part re-translation reads them.
     struct ResolveOutputs {
         member_keys: FxHashMap<(MemberRef, u32), u32>,
         member_results: Vec<(crate::refspec::ResolvedMember, Touched)>,
+        member_redo: Vec<bool>,
         dynamic_keys: FxHashMap<(DynamicRef, u32), u32>,
         dynamic_results: Vec<(SmallVec<[ResolvedNode; 4]>, Touched)>,
+        dynamic_redo: Vec<bool>,
         parent_results: Vec<Option<File>>,
         spec_ids: Vec<Box<[u32]>>,
         class_base_memo: ClassBaseMemo,
@@ -1049,6 +1159,8 @@ fn assemble_graph<'db>(
         // `member_results[id]`, so work order is irrelevant.
         let mut member_work: Vec<(u32, MemberRef, File)> = Vec::new();
         let mut dynamic_work: Vec<(u32, DynamicRef, File)> = Vec::new();
+        let mut member_redo: Vec<bool>;
+        let mut dynamic_redo: Vec<bool>;
 
         match dirty_ref {
             None => {
@@ -1095,6 +1207,8 @@ fn assemble_graph<'db>(
                 }
                 member_results.resize_with(member_work.len(), Default::default);
                 dynamic_results.resize_with(dynamic_work.len(), Default::default);
+                member_redo = vec![true; member_work.len()];
+                dynamic_redo = vec![true; dynamic_work.len()];
             }
             Some(dirty) => {
                 // Incremental: a retained entry re-resolves iff its
@@ -1102,13 +1216,13 @@ fn assemble_graph<'db>(
                 // outside the project can't change under the
                 // content-only scope gate and count as clean).
                 let file_dirty = |f: &File| ordinal_of_ref.get(f).is_some_and(|&pos| dirty[pos]);
-                let mut member_redo: Vec<bool> = vec![false; member_results.len()];
+                member_redo = vec![false; member_results.len()];
                 for (id, (_res, touched)) in member_results.iter().enumerate() {
                     if touched.0.iter().any(&file_dirty) {
                         member_redo[id] = true;
                     }
                 }
-                let mut dynamic_redo: Vec<bool> = vec![false; dynamic_results.len()];
+                dynamic_redo = vec![false; dynamic_results.len()];
                 for (id, (_res, touched)) in dynamic_results.iter().enumerate() {
                     if touched.0.iter().any(&file_dirty) {
                         dynamic_redo[id] = true;
@@ -1152,6 +1266,7 @@ fn assemble_graph<'db>(
                                             let id = member_results.len() as u32;
                                             member_keys.insert((m.clone(), dir), id);
                                             member_results.push(Default::default());
+                                            member_redo.push(true);
                                             member_work.push((id, m.clone(), anchor));
                                             id
                                         }
@@ -1165,6 +1280,7 @@ fn assemble_graph<'db>(
                                                 let id = dynamic_results.len() as u32;
                                                 dynamic_keys.insert((d.clone(), dir), id);
                                                 dynamic_results.push(Default::default());
+                                                dynamic_redo.push(true);
                                                 dynamic_work.push((id, d.clone(), anchor));
                                                 id
                                             }
@@ -1265,8 +1381,10 @@ fn assemble_graph<'db>(
         ResolveOutputs {
             member_keys,
             member_results,
+            member_redo,
             dynamic_keys,
             dynamic_results,
+            dynamic_redo,
             parent_results,
             spec_ids,
             class_base_memo,
@@ -1277,24 +1395,26 @@ fn assemble_graph<'db>(
         }
     };
 
-    // 1b: parallel node fill + concurrent index folds.
-    // 1b: parallel node fill + concurrent index folds.
+    // 1b: parallel node fill (fill-minted blocks only) + concurrent
+    // index refolds over ALL files — the `(File, …)`-keyed decl
+    // indices are derived state, rebuilt from the per-file payload
+    // refs every pass.
     let mints_ref = &mints;
     let counters_ref: &ProgressCounters = counters;
     let ref_to_global_mut = &mut ref_to_global;
-    let local_to_global_mut = &mut local_to_global;
     let global_index_mut = &mut global_index;
     let module_nodes_mut = &mut module_nodes_by_file;
     let class_by_selection_mut = &mut class_by_selection;
     let decl_by_name_range_mut = &mut decl_by_name_range;
+    let fill_mints_ref = fill_mints;
     let ((fill_result, ()), resolve_outputs) = py.allow_threads(move || {
         use rayon::prelude::*;
         rayon::join(
             || {
                 rayon::join(
                     move || -> PyResult<()> {
-                        mints_ref
-                            .par_iter()
+                        fill_mints_ref
+                            .into_par_iter()
                             .zip_eq(file_slices)
                             .try_for_each(|(mint, slots)| {
                                 for (local_idx, node_data) in mint.payload.nodes.iter().enumerate()
@@ -1363,59 +1483,39 @@ fn assemble_graph<'db>(
                                 }
                             },
                             move || {
-                                rayon::join(
-                                    move || {
-                                        for mint in mints_ref {
-                                            for local_idx in 0..mint.payload.refs.len() {
-                                                local_to_global_mut.insert(
-                                                    (mint.file, local_idx as u32),
-                                                    mint.base + local_idx,
-                                                );
+                                for mint in mints_ref {
+                                    for (local_idx, &node_ref) in
+                                        mint.payload.refs.iter().enumerate()
+                                    {
+                                        let global_idx = mint.base + local_idx;
+                                        match node_ref {
+                                            NodeRef::Module(_) => {
+                                                module_nodes_mut.insert(mint.file, global_idx);
                                             }
-                                        }
-                                    },
-                                    move || {
-                                        for mint in mints_ref {
-                                            for (local_idx, &node_ref) in
-                                                mint.payload.refs.iter().enumerate()
-                                            {
-                                                let global_idx = mint.base + local_idx;
-                                                match node_ref {
-                                                    NodeRef::Module(_) => {
-                                                        module_nodes_mut
-                                                            .insert(mint.file, global_idx);
-                                                    }
-                                                    NodeRef::Def(d) => {
-                                                        // `d` is already the `(file,
-                                                        // place_id, name_range)` triple
-                                                        // `global_index` keys on.
-                                                        global_index_mut.insert(d, global_idx);
-                                                        let node_data =
-                                                            &mint.payload.nodes[local_idx];
-                                                        let rk = node_data.name_range;
-                                                        if matches!(node_data.kind, NodeKind::Class)
-                                                        {
-                                                            class_by_selection_mut.insert(
-                                                                (mint.file, rk),
-                                                                global_idx,
-                                                            );
-                                                        }
-                                                        decl_by_name_range_mut
-                                                            .insert((mint.file, rk), global_idx);
-                                                    }
-                                                    NodeRef::StarStmt(_, _) => {
-                                                        // The kept `*<src>` star-statement
-                                                        // node. Not a real decl, so it
-                                                        // contributes nothing to the decl
-                                                        // indices; the `ref_to_global` /
-                                                        // `local_to_global` folds already
-                                                        // wired it up.
-                                                    }
+                                            NodeRef::Def(d) => {
+                                                // `d` is already the `(file,
+                                                // place_id, name_range)` triple
+                                                // `global_index` keys on.
+                                                global_index_mut.insert(d, global_idx);
+                                                let node_data = &mint.payload.nodes[local_idx];
+                                                let rk = node_data.name_range;
+                                                if matches!(node_data.kind, NodeKind::Class) {
+                                                    class_by_selection_mut
+                                                        .insert((mint.file, rk), global_idx);
                                                 }
+                                                decl_by_name_range_mut
+                                                    .insert((mint.file, rk), global_idx);
+                                            }
+                                            NodeRef::StarStmt(_, _) => {
+                                                // The kept `*<src>` star-statement
+                                                // node. Not a real decl, so it
+                                                // contributes nothing to the decl
+                                                // indices; the `ref_to_global`
+                                                // fold already wired it up.
                                             }
                                         }
-                                    },
-                                );
+                                    }
+                                }
                             },
                         );
                     },
@@ -1438,8 +1538,10 @@ fn assemble_graph<'db>(
     let ResolveOutputs {
         member_keys,
         member_results,
+        member_redo,
         dynamic_keys,
         dynamic_results,
+        dynamic_redo,
         parent_results,
         spec_ids,
         class_base_memo,
@@ -1462,11 +1564,10 @@ fn assemble_graph<'db>(
     }
 
     // Pass 2: edge translation. All cross-file resolution already ran
-    // in pass 0 (gather) + pass 1's resolve arm (overlapped with the
-    // node fill); this pass folds the results into idx-level memo
-    // slots and translates every `RefSpec` into `(usize, usize, u8)`
-    // triples. Dropped triples reference Definitions in non-project
-    // files.
+    // in pass 1's resolve arm (overlapped with the node fill); this
+    // pass folds the results into idx-level memo slots and rebuilds
+    // exactly the re-translate set's parts. Dropped triples reference
+    // Definitions in non-project files.
 
     let t_pass2_start = std::time::Instant::now();
 
@@ -1475,9 +1576,10 @@ fn assemble_graph<'db>(
     // External nodes are pre-minted in (fqname, path) order across every
     // resolution output — the same deterministic order the old pipeline
     // used — so duplicate-fqname externals keep the lexicographically
-    // smallest path and land at the same graph indices.
-    // `intern_external` dedups by fqname, so the memo folds below hit
-    // the pre-minted nodes.
+    // smallest path and land at the same graph indices. (On an
+    // incremental build the intern is a re-probe of the persistent
+    // external map, so existing anchors keep their ids and only
+    // genuinely new externals append.)
     {
         let mut externals: Vec<(&str, String, File)> = Vec::new();
         let member_nodes = member_results
@@ -1495,13 +1597,11 @@ fn assemble_graph<'db>(
         }
     }
 
-    // Memo slots indexed by the dense ids assigned in pass 0 — the
-    // stamping and translation passes below never hash a key.
-    struct MemberSlot {
-        idxs: SmallVec<[usize; 4]>,
-        unresolved: bool,
-        start_file: Option<File>,
-    }
+    // Memo slots indexed by the dense resolution ids — the stamping
+    // and translation passes below never hash a key. Rebuilt for every
+    // entry each pass (cheap — per unique resolution, not per row):
+    // dense node ids only move for re-minted files, and the symbolic
+    // memo never goes stale.
     let mut member_slots: Vec<MemberSlot> = Vec::with_capacity(member_results.len());
     for (res, _touched) in &member_results {
         let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
@@ -1527,11 +1627,53 @@ fn assemble_graph<'db>(
         dynamic_slots.push(idxs);
     }
 
-    // Stamp `NodeFlags::UNRESOLVED` on every import alias whose
-    // upstream module didn't resolve — the flag rides the alias node
-    // directly. Only `Binding`-role refs are eligible (one flag per
-    // alias; a use through it resolves or drops silently).
+    // Re-translate set: the files whose part must be rebuilt this
+    // build. Dirty (re-minted) files always; plus files whose
+    // cross-file answers changed — a spec row whose memo entry
+    // re-resolved this build (read-set consumers), or a cached triple
+    // targeting a block tombstoned this build (`Module`-target edges
+    // whose resolution read nothing — e.g. plain `import a` — and the
+    // structural submodule → parent edges land here).
+    let retranslate: Vec<bool> = match &dirty_files {
+        None => vec![true; n_files],
+        Some(dirty) => {
+            let mut r = dirty.clone();
+            for pos in 0..n_files {
+                if r[pos] {
+                    continue;
+                }
+                let ids = &spec_ids[pos];
+                let hit = spec_payloads[pos]
+                    .specs
+                    .iter()
+                    .zip(ids.iter())
+                    .any(|(spec, &id)| match &spec.target {
+                        Target::Local(_) => false,
+                        Target::Member(_) => member_redo[id as usize],
+                        Target::Dynamic(_) => dynamic_redo[id as usize],
+                    })
+                    || builder.part_edges[pos]
+                        .iter()
+                        .any(|&(_, d, _)| newly_tombstoned.contains(&d));
+                if hit {
+                    r[pos] = true;
+                }
+            }
+            r
+        }
+    };
+
+    // Re-stamp `NodeFlags::UNRESOLVED` on every import alias in the
+    // re-translate set whose upstream module didn't resolve — the flag
+    // rides the alias node directly. Only `Binding`-role refs are
+    // eligible (one flag per alias; a use through it resolves or drops
+    // silently). Clean files' stamps survive in their restored base
+    // flags; consumers clear-and-set so a flipped resolution outcome
+    // lands either way.
     for (pos, payload) in spec_payloads.iter().enumerate() {
+        if !retranslate[pos] {
+            continue;
+        }
         let base = mints[pos].base;
         let ids = &spec_ids[pos];
         for (i, spec) in payload.specs.iter().enumerate() {
@@ -1541,177 +1683,233 @@ fn assemble_graph<'db>(
             if !matches!(m.role, MemberRole::Binding) {
                 continue;
             }
+            let node = &mut builder.nodes[base + spec.src as usize];
             if member_slots[ids[i] as usize].unresolved {
-                builder.nodes[base + spec.src as usize].flags |= NODE_FLAG_UNRESOLVED;
+                node.flags |= NODE_FLAG_UNRESOLVED;
+            } else {
+                node.flags &= !NODE_FLAG_UNRESOLVED;
             }
         }
     }
 
-    // Structural edges synthesized straight from the node payloads —
-    // deliberately not part of the RefSpec payload since they're fully
-    // derivable: decl → module anchors (every per-file node points at
-    // its module node, `refs[0]`), overload impl → stub anchors, and
-    // the submodule → parent-package hierarchy edge (skipped when the
-    // parent doesn't resolve into the project).
-    let mut structural: Vec<(usize, usize, u8)> = Vec::with_capacity(total_nodes);
-    for (pos, mint) in mints.iter().enumerate() {
-        for local in 1..mint.payload.nodes.len() {
-            structural.push((mint.base + local, mint.base, 0));
-        }
-        for &(impl_local, stub_local) in mint.payload.overload_anchors.iter() {
-            structural.push((
-                mint.base + impl_local as usize,
-                mint.base + stub_local as usize,
-                0,
-            ));
-        }
-        if let Some(parent_file) = parent_results[pos] {
-            if let Some(&parent_idx) = module_nodes_by_file.get(&parent_file) {
-                structural.push((mint.base, parent_idx, 0));
+    // Per-file plugin flag + fact ops. Edge ops fold into the part
+    // translation below; flags apply to freshly minted blocks only
+    // (clean files carry theirs in the restored base flags); facts are
+    // derived state, rebuilt from every file's ops each pass.
+    let mut topic_facts: FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>> =
+        FxHashMap::default();
+    if !per_file_plugin_ids.is_empty() {
+        use crate::native_plugins::FileLocalOp;
+        for (pos, ops) in plugin_ops.iter().enumerate() {
+            let mint = &mints[pos];
+            let len = mint.payload.nodes.len();
+            let to_global =
+                |local: u32| ((local as usize) < len).then_some(mint.base + local as usize);
+            let mut file_path: Option<String> = None;
+            for op in ops {
+                match op {
+                    FileLocalOp::Edge { .. } => {}
+                    FileLocalOp::Entrypoint { decl_local_idx } => {
+                        if !mint.fill {
+                            continue;
+                        }
+                        if let Some(decl_idx) = to_global(*decl_local_idx) {
+                            builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
+                        }
+                    }
+                    FileLocalOp::FlagDecl {
+                        decl_local_idx,
+                        flags,
+                    } => {
+                        if !mint.fill {
+                            continue;
+                        }
+                        if let Some(decl_idx) = to_global(*decl_local_idx) {
+                            builder.nodes[decl_idx].flags |= flags;
+                        }
+                    }
+                    FileLocalOp::Fact {
+                        topic,
+                        decl_local_idx,
+                        value,
+                    } => {
+                        // A fact that pinned a decl is dropped when that
+                        // decl doesn't resolve to a global node — same
+                        // lenient contract as edge/flag ops.
+                        let decl_idx = match decl_local_idx {
+                            Some(local) => match to_global(*local) {
+                                Some(global) => Some(global),
+                                None => continue,
+                            },
+                            None => None,
+                        };
+                        let path = file_path
+                            .get_or_insert_with(|| file_path_string(db, mint.file))
+                            .clone();
+                        topic_facts.entry(topic.to_string()).or_default().push(
+                            crate::native_plugins::plugin_api::Fact {
+                                path,
+                                decl_idx,
+                                value: value.to_string(),
+                            },
+                        );
+                    }
+                }
             }
         }
     }
 
-    // 2d: parallel translation. The memo slots are owned + read-only
-    // from here; no GIL needed, no salsa access, no key hashing — the
-    // dense id rows from pass 0 turn every probe into an array index.
+    // 2d: parallel per-part translation for the re-translate set. Each
+    // part collects its spec edges, structural edges (decl → module
+    // anchors, overload impl → stub anchors, the submodule →
+    // parent-package edge), peer .pyi → .py edges (when this part is a
+    // stub with a project twin), and its per-file plugin edge ops —
+    // then sorts + dedups. Everything read is owned or prefetched, so
+    // the fan-out is db-free and GIL-free.
     let member_slots_ref = &member_slots;
     let dynamic_slots_ref = &dynamic_slots;
     let spec_payloads_ref = &spec_payloads;
     let spec_ids_ref = &spec_ids;
-    let mut triples: Vec<(usize, usize, u8)> = py.allow_threads(move || {
+    let mints_ref2 = &mints;
+    let parent_results_ref = &parent_results;
+    let module_nodes_ref = &module_nodes_by_file;
+    let ref_to_global_ref = &ref_to_global;
+    let plugin_ops_ref = &plugin_ops;
+    let retranslate_pos: Vec<usize> = (0..n_files).filter(|&pos| retranslate[pos]).collect();
+    /// One re-translated part: `(file ordinal, sorted triples)`.
+    type NewPart = (usize, Vec<(u32, u32, u8)>);
+    let new_parts: Vec<NewPart> = py.allow_threads(move || {
         use rayon::prelude::*;
-        let from_specs =
-            spec_payloads_ref
-                .par_iter()
-                .enumerate()
-                .flat_map_iter(|(pos, payload)| {
-                    let base = mints[pos].base;
-                    let ids = &spec_ids_ref[pos];
-                    let file = project_files[pos];
-                    payload.specs.iter().enumerate().flat_map(move |(i, spec)| {
-                        let src_idx = base + spec.src as usize;
-                        let flags = spec.flags;
-                        let mut out: SmallVec<[(usize, usize, u8); 4]> = SmallVec::new();
-                        match &spec.target {
-                            Target::Local(dst_local) => {
-                                if *dst_local != spec.src {
-                                    out.push((src_idx, base + *dst_local as usize, flags));
-                                }
-                            }
-                            Target::Member(m) => {
-                                let slot = &member_slots_ref[ids[i] as usize];
-                                // Self-import suppression: a Binding ref
-                                // whose upstream resolves to the importing
-                                // file itself emits nothing — the whole
-                                // emission, decl edges included (mirrors
-                                // the old `target_file == file` skip,
-                                // which must apply per importing file,
-                                // not per memo entry).
-                                match m.role {
-                                    MemberRole::Binding => {
-                                        // Old file_to_edges had no self
-                                        // filter: a circular star
-                                        // re-export can land the chain
-                                        // walk back on the alias itself,
-                                        // and that self-loop is kept.
-                                        if slot.start_file != Some(file) {
-                                            for &idx in &slot.idxs {
-                                                out.push((src_idx, idx, flags));
-                                            }
-                                        }
-                                    }
-                                    MemberRole::Use => {
-                                        // Use side mirrors the old
-                                        // emit_edge `dst != owner` skip.
-                                        for &idx in &slot.idxs {
-                                            if idx != src_idx {
-                                                out.push((src_idx, idx, flags));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Target::Dynamic(_) => {
-                                for &idx in &dynamic_slots_ref[ids[i] as usize] {
-                                    if idx != src_idx {
-                                        out.push((src_idx, idx, flags));
-                                    }
+        retranslate_pos
+            .par_iter()
+            .map(|&pos| {
+                let mint = &mints_ref2[pos];
+                let base = mint.base;
+                let file = project_files[pos];
+                let payload = spec_payloads_ref[pos];
+                let ids = &spec_ids_ref[pos];
+                let mut t: Vec<(u32, u32, u8)> = Vec::with_capacity(payload.specs.len() + 8);
+                for (i, spec) in payload.specs.iter().enumerate() {
+                    for (s, d, fl) in spec_edges(
+                        spec,
+                        ids[i],
+                        base,
+                        file,
+                        member_slots_ref,
+                        dynamic_slots_ref,
+                    ) {
+                        t.push((s as u32, d as u32, fl));
+                    }
+                }
+                // Structural edges — fully derivable from the node
+                // payloads, deliberately not part of the RefSpec
+                // payload.
+                for local in 1..mint.payload.nodes.len() {
+                    t.push(((base + local) as u32, base as u32, 0));
+                }
+                for &(impl_local, stub_local) in mint.payload.overload_anchors.iter() {
+                    t.push((
+                        (base + impl_local as usize) as u32,
+                        (base + stub_local as usize) as u32,
+                        0,
+                    ));
+                }
+                if let Some(parent_file) = parent_results_ref[pos] {
+                    if let Some(&parent_idx) = module_nodes_ref.get(&parent_file) {
+                        t.push((base as u32, parent_idx as u32, 0));
+                    }
+                }
+                // Peer .pyi → .py reachability edges: for each name
+                // both sides export, edge every stub decl to every
+                // runtime decl.
+                if mint.is_stub {
+                    if let Some(py_payload) = mint.twin_payload {
+                        for (name, pyi_locals) in &mint.payload.exports_by_name {
+                            let Some(py_locals) = py_payload.exports_by_name.get(name) else {
+                                continue;
+                            };
+                            for &pyi_local in pyi_locals {
+                                let pyi_idx = base + pyi_local as usize;
+                                for &py_local in py_locals {
+                                    let py_ref = py_payload.refs[py_local as usize];
+                                    let Some(&py_idx) = ref_to_global_ref.get(&py_ref) else {
+                                        continue;
+                                    };
+                                    t.push((pyi_idx as u32, py_idx as u32, 0));
                                 }
                             }
                         }
-                        out
-                    })
-                });
-        let mut t: Vec<(usize, usize, u8)> = from_specs.collect();
-        t.extend(structural);
-        t.par_sort_unstable();
-        t.dedup();
-        t
+                    }
+                }
+                // Per-file plugin edge ops (file-local endpoints).
+                {
+                    use crate::native_plugins::FileLocalOp;
+                    let len = mint.payload.nodes.len();
+                    for op in &plugin_ops_ref[pos] {
+                        if let FileLocalOp::Edge {
+                            src_local_idx,
+                            dst_local_idx,
+                            flags,
+                        } = op
+                        {
+                            if (*src_local_idx as usize) < len && (*dst_local_idx as usize) < len {
+                                t.push((
+                                    (base + *src_local_idx as usize) as u32,
+                                    (base + *dst_local_idx as usize) as u32,
+                                    *flags,
+                                ));
+                            }
+                        }
+                    }
+                }
+                t.sort_unstable();
+                t.dedup();
+                (pos, t)
+            })
+            .collect()
     });
+    for (pos, t) in new_parts {
+        builder.part_edges[pos] = t;
+    }
 
-    // Bulk-initialize the edge storage from the translated triples.
-    // The builder is edge-less here (pass 1 mints only nodes), so the
-    // adjacency fills run as a parallel scatter; the GIL is released
-    // for the same reason as 2d.
-    let bulk_triples = std::mem::take(&mut triples);
-    py.allow_threads(|| builder.init_edges_bulk(bulk_triples));
+    // Global edge refold: concatenate every part (clean parts
+    // verbatim), sort, and bulk-initialize the derived edge stores.
+    // Cross-part duplicates are impossible (a triple's src pins it to
+    // one part), so the dedup only guards the per-part contract.
+    {
+        builder.reset_derived_edges();
+        let total: usize = builder.part_edges.iter().map(Vec::len).sum();
+        let mut triples: Vec<(usize, usize, u8)> = Vec::with_capacity(total);
+        for part in &builder.part_edges {
+            triples.extend(part.iter().map(|&(s, d, f)| (s as usize, d as usize, f)));
+        }
+        py.allow_threads(|| {
+            use rayon::prelude::*;
+            triples.par_sort_unstable();
+            triples.dedup();
+            builder.init_edges_bulk(triples);
+        });
+    }
+
+    // Base-flag snapshot: the post-assemble, pre-plugin-pass state the
+    // next build restores from (erasing the plugin pass's ORs).
+    builder.base_flags = builder.nodes.iter().map(|n| n.flags).collect();
 
     // Warnings are still serial — they live on `FileRefSpecs` only.
+    // Re-emitted for every file each build (matching the historical
+    // full-rebuild behavior).
     for payload in &spec_payloads {
         all_warnings.extend(payload.warnings.iter().cloned());
     }
 
     if std::env::var_os("DEAD_CST_TIMING").is_some() {
-        eprintln!("[dead-cst-timing] pass2={:?}", t_pass2_start.elapsed());
+        eprintln!(
+            "[dead-cst-timing] pass2={:?} retranslated={} tombstoned={}",
+            t_pass2_start.elapsed(),
+            retranslate.iter().filter(|&&r| r).count(),
+            builder.tombstoned.len(),
+        );
     }
-
-    // Pass 3: peer .pyi/.py reachability edges. Collect every peer
-    // edge first, then sort + dedup before inserting: the source maps
-    // (`peer_pyi_to_py` and each file's `exports_by_name`) are
-    // FxHashMaps whose iteration order isn't stable run-to-run, so
-    // inserting as we walk them would give the adjacency lists a
-    // run-dependent order. Sorting the collected triples pins it.
-    let mut peer_triples: Vec<(usize, usize, u8)> = Vec::new();
-    for (&pyi_file, &py_twin) in peer_pyi_to_py {
-        let pyi_payload = file_to_nodes(db, pyi_file);
-        let py_payload = file_to_nodes(db, py_twin);
-        for (name, pyi_locals) in &pyi_payload.exports_by_name {
-            let Some(py_locals) = py_payload.exports_by_name.get(name) else {
-                continue;
-            };
-            for &pyi_local in pyi_locals {
-                let pyi_ref = pyi_payload.refs[pyi_local as usize];
-                let Some(&pyi_idx) = ref_to_global.get(&pyi_ref) else {
-                    continue;
-                };
-                for &py_local in py_locals {
-                    let py_ref = py_payload.refs[py_local as usize];
-                    let Some(&py_idx) = ref_to_global.get(&py_ref) else {
-                        continue;
-                    };
-                    peer_triples.push((pyi_idx, py_idx, 0));
-                }
-            }
-        }
-    }
-    peer_triples.sort_unstable();
-    peer_triples.dedup();
-    builder.extend_edges(peer_triples);
-
-    // Pass 4: per-file native plugin fold. Replay each per-file
-    // plugin's salsa-cached `FileLocalOp`s (warmed in the parallel
-    // fan-out) into the builder, translating file-local indices to
-    // global ones via `local_to_global`. Runs here, after the real
-    // graph is fully assembled, so every decl endpoint a plugin
-    // edge/flag op references already has its global index.
-    let topic_facts = fold_per_file_plugin_ops(
-        db,
-        &mut builder,
-        project_files,
-        per_file_plugin_ids,
-        &local_to_global,
-    )?;
 
     // Flush warnings to Python logger from the main thread (we hold
     // the GIL here; workers don't).
@@ -1741,6 +1939,82 @@ fn assemble_graph<'db>(
         resolve_stats,
         dir_ids,
     })
+}
+
+/// One memoized cross-file resolution, translated to dense graph
+/// indices for this build. Rebuilt from the symbolic
+/// [`ResolveCache`] memo every pass (`assemble_graph` 2c), so the
+/// translation can never go stale across re-minted blocks.
+struct MemberSlot {
+    idxs: SmallVec<[usize; 4]>,
+    unresolved: bool,
+    start_file: Option<File>,
+}
+
+/// Translate one spec row into its edge triples, given the row's dense
+/// resolution id and the owning file's node-block base. The single
+/// translation used for every part — full builds and incremental
+/// re-translations can't drift.
+///
+/// Semantics carried here (see the inline comments): `Local` rows skip
+/// self-loops; `Binding` member rows are suppressed entirely when the
+/// upstream resolves to the importing file itself (mirroring the old
+/// `target_file == file` skip — which must apply per importing file,
+/// not per memo entry) but *keep* circular-star-reexport self-loops;
+/// `Use` member rows and dynamic rows filter `dst == src`.
+fn spec_edges(
+    spec: &crate::refspec::RefSpec,
+    slot_id: u32,
+    base: usize,
+    file: File,
+    member_slots: &[MemberSlot],
+    dynamic_slots: &[SmallVec<[usize; 4]>],
+) -> SmallVec<[(usize, usize, u8); 4]> {
+    let src_idx = base + spec.src as usize;
+    let flags = spec.flags;
+    let mut out: SmallVec<[(usize, usize, u8); 4]> = SmallVec::new();
+    match &spec.target {
+        Target::Local(dst_local) => {
+            if *dst_local != spec.src {
+                out.push((src_idx, base + *dst_local as usize, flags));
+            }
+        }
+        Target::Member(m) => {
+            let slot = &member_slots[slot_id as usize];
+            // Self-import suppression: a Binding ref whose upstream
+            // resolves to the importing file itself emits nothing —
+            // the whole emission, decl edges included.
+            match m.role {
+                MemberRole::Binding => {
+                    // Old file_to_edges had no self filter: a circular
+                    // star re-export can land the chain walk back on
+                    // the alias itself, and that self-loop is kept.
+                    if slot.start_file != Some(file) {
+                        for &idx in &slot.idxs {
+                            out.push((src_idx, idx, flags));
+                        }
+                    }
+                }
+                MemberRole::Use => {
+                    // Use side mirrors the old emit_edge `dst != owner`
+                    // skip.
+                    for &idx in &slot.idxs {
+                        if idx != src_idx {
+                            out.push((src_idx, idx, flags));
+                        }
+                    }
+                }
+            }
+        }
+        Target::Dynamic(_) => {
+            for &idx in &dynamic_slots[slot_id as usize] {
+                if idx != src_idx {
+                    out.push((src_idx, idx, flags));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Translate one `'static` resolution output node to its global graph
@@ -1828,114 +2102,6 @@ fn run_job<T: Sync, R: Send>(
         })
         .collect();
     nested.into_iter().flatten().collect()
-}
-
-/// Fold every registered per-file native plugin's file-local ops into
-/// the assembled graph. Each op is applied with the same semantics as
-/// the `apply_prepared` handlers for the [`PreparedOp`] variants:
-///
-/// * [`FileLocalOp::Edge`] → add the translated edge with its flags.
-/// * [`FileLocalOp::Entrypoint`] → OR [`NODE_FLAG_ENTRYPOINT`] onto the
-///   decl itself (reachability seeds off the flag, not a marker node).
-/// * [`FileLocalOp::FlagDecl`] → OR the caller-supplied flags onto the
-///   decl itself (e.g. a registered plugin flag like `test/testcase`).
-///
-/// Endpoints are file-local indices into that file's `FileNodes.refs`;
-/// `local_to_global` maps them to global node indices (built in pass
-/// 1, so every well-formed endpoint resolves). A local idx with no
-/// global entry is skipped — same lenient contract as the old path.
-///
-/// `per_file_plugin_ops(db, file, id)` is a no-op cache read here: the
-/// parallel fan-out already warmed it on a worker thread. `run_on_file`
-/// is GIL-free and intra-file, so nothing in this fold needs the salsa
-/// DB beyond the cached lookup.
-fn fold_per_file_plugin_ops(
-    db: &ProjectDatabase,
-    builder: &mut GraphBuilder,
-    project_files: &[File],
-    per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
-    local_to_global: &FxHashMap<(File, u32), usize>,
-) -> PyResult<FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>>> {
-    use crate::native_plugins::plugin_api::Fact;
-    let mut topic_facts: FxHashMap<String, Vec<Fact>> = FxHashMap::default();
-    if per_file_plugin_ids.is_empty() {
-        return Ok(topic_facts);
-    }
-    use crate::native_plugins::{per_file_plugin_ops, FileLocalOp};
-    for &file in project_files {
-        // The fact `path` is the same for every fact in this file; resolve
-        // it once, lazily, since most files emit no facts at all.
-        let mut file_path: Option<String> = None;
-        for &id in per_file_plugin_ids {
-            let file_ops = per_file_plugin_ops(db, file, id);
-            if file_ops.is_empty() {
-                continue;
-            }
-            let to_global = |local: u32| local_to_global.get(&(file, local)).copied();
-            for op in file_ops {
-                match op {
-                    FileLocalOp::Edge {
-                        src_local_idx,
-                        dst_local_idx,
-                        flags,
-                    } => {
-                        if let (Some(src_idx), Some(dst_idx)) =
-                            (to_global(*src_local_idx), to_global(*dst_local_idx))
-                        {
-                            builder.add_edge(src_idx, dst_idx, *flags);
-                        }
-                    }
-                    FileLocalOp::Entrypoint { decl_local_idx } => {
-                        let Some(decl_idx) = to_global(*decl_local_idx) else {
-                            continue;
-                        };
-                        // Flag the decl itself an entrypoint seed — no
-                        // marker node (reachability seeds off the flag,
-                        // not an edge from a marker).
-                        builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
-                    }
-                    FileLocalOp::FlagDecl {
-                        decl_local_idx,
-                        flags,
-                    } => {
-                        let Some(decl_idx) = to_global(*decl_local_idx) else {
-                            continue;
-                        };
-                        builder.nodes[decl_idx].flags |= flags;
-                    }
-                    FileLocalOp::Fact {
-                        topic,
-                        decl_local_idx,
-                        value,
-                    } => {
-                        // A fact that pinned a decl is dropped when that decl
-                        // doesn't resolve to a global node — same lenient
-                        // contract as edge/flag ops, and it keeps a `Some`
-                        // `decl_idx` always naming a live node.
-                        let decl_idx = match decl_local_idx {
-                            Some(local) => match to_global(*local) {
-                                Some(global) => Some(global),
-                                None => continue,
-                            },
-                            None => None,
-                        };
-                        let path = file_path
-                            .get_or_insert_with(|| file_path_string(db, file))
-                            .clone();
-                        topic_facts
-                            .entry(topic.to_string())
-                            .or_default()
-                            .push(Fact {
-                                path,
-                                decl_idx,
-                                value: value.to_string(),
-                            });
-                    }
-                }
-            }
-        }
-    }
-    Ok(topic_facts)
 }
 
 /// Collect the [`PerFilePluginId`](crate::native_plugins::PerFilePluginId)
@@ -2728,6 +2894,26 @@ impl ProjectContext {
         Ok(self.materialized("_last_resolve_counts")?.resolve_stats)
     }
 
+    /// Sorted dense node indices tombstoned by incremental re-mints:
+    /// slots whose file block was replaced by a later
+    /// ``re_materialize``. The slots stay in place (live indices never
+    /// remap — cached positional indices into unchanged files stay
+    /// valid) but are dead: blanked node data, zero flags, no edges,
+    /// excluded from every query. Empty after a full build, which
+    /// compacts the id space (and runs automatically once tombstones
+    /// outnumber live nodes).
+    pub(crate) fn tombstoned_indices(&self) -> PyResult<Vec<usize>> {
+        let outputs = self.materialized("tombstoned_indices")?;
+        let mut v: Vec<usize> = outputs
+            .builder
+            .tombstoned
+            .iter()
+            .map(|&i| i as usize)
+            .collect();
+        v.sort_unstable();
+        Ok(v)
+    }
+
     /// Build the project-wide graph, run every registered plugin, then
     /// snapshot the final state.
     ///
@@ -2758,12 +2944,16 @@ impl ProjectContext {
             // under-scope the retry — the post-build reset below only
             // runs on success.
             let scope = this.pending_scope.take();
-            let cache = this
-                .outputs
-                .write()
-                .as_mut()
-                .map(|o| std::mem::take(&mut o.resolve_cache))
-                .unwrap_or_default();
+            let (carry, cache) = {
+                let mut guard = this.outputs.write();
+                match guard.as_mut() {
+                    Some(o) => (
+                        std::mem::replace(&mut o.builder, GraphBuilder::with_capacity(0)),
+                        std::mem::take(&mut o.resolve_cache),
+                    ),
+                    None => (GraphBuilder::with_capacity(0), ResolveCache::default()),
+                }
+            };
             build_project_graph(
                 py,
                 &mut this.db,
@@ -2771,6 +2961,7 @@ impl ProjectContext {
                 stack_size,
                 &counters,
                 &per_file_ids,
+                carry,
                 cache,
                 scope,
             )
@@ -3791,6 +3982,12 @@ fn indices_where_in(
 
     let mut out: Vec<usize> = Vec::new();
     for (idx, node) in outputs.builder.nodes.iter().enumerate() {
+        // Incremental tombstones keep their (blanked) slot in place so
+        // live indices never remap; an unfiltered scan must still
+        // never surface one.
+        if outputs.builder.tombstoned.contains(&(idx as u32)) {
+            continue;
+        }
         if let Some(k) = &kinds_set {
             if !k.contains(node.kind) {
                 continue;

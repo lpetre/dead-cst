@@ -624,6 +624,16 @@ class ProjectContext:
         """
         ...
 
+    def tombstoned_indices(self) -> list[int]:
+        """Sorted dense node indices tombstoned by incremental
+        re-mints — slots whose file block was replaced by a later
+        ``re_materialize``. The slots stay in place (live indices never
+        remap) but are dead: blanked node data, zero flags, no edges,
+        excluded from every query. Empty after a full build, which
+        compacts the id space (and runs automatically once tombstones
+        outnumber live nodes)."""
+        ...
+
     def _last_resolve_counts(self) -> tuple[int, int]:
         """``(resolved, reused)`` cross-file resolution counts from the
         most recent build — the observability hook for the resolve
