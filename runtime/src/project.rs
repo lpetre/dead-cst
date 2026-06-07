@@ -24,7 +24,8 @@ use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
 
 use crate::builder::{
-    apply_prepared_batch, bfs, not_materialized, Direction, GraphBuilder, GraphNode, PreparedOp,
+    apply_prepared_batch, bfs, not_materialized, Direction, GraphBuilder, GraphNode, PartEdges,
+    PreparedOp,
 };
 use crate::file_extraction::{
     file_extraction, imports_local_from_facts, match_callee_chain, match_callee_descriptor,
@@ -281,8 +282,16 @@ pub(crate) struct ResolveCache {
     pub(crate) member_keys: FxHashMap<(MemberRef, u32), u32>,
     /// Id-indexed symbolic results + each resolution's read set.
     pub(crate) member_results: Vec<(crate::refspec::ResolvedMember, Touched)>,
+    /// Id-indexed: whether any current spec row references the entry.
+    /// Stale entries (their last referencing row vanished) keep their
+    /// slot — ids must stay stable for the retained per-file
+    /// `spec_ids` — but are excluded from re-resolution, external
+    /// pre-mint, and slot translation, so they can never leak into
+    /// the output; a row referencing one again re-resolves it first.
+    pub(crate) member_live: Vec<bool>,
     pub(crate) dynamic_keys: FxHashMap<(DynamicRef, u32), u32>,
     pub(crate) dynamic_results: Vec<(SmallVec<[ResolvedNode; 4]>, Touched)>,
+    pub(crate) dynamic_live: Vec<bool>,
     /// Class-base resolution memo (shared with the class-hierarchy
     /// fan-in) plus each entry's read set.
     pub(crate) class_base_memo: ClassBaseMemo,
@@ -410,8 +419,79 @@ pub(crate) fn build_project_graph(
     let t_enum = t0.elapsed();
     counters.finish_phase(PHASE_ENUM);
 
-    let progress = ProgressBars::new(show_progress, project_files.len() as u64);
-    counters.start_phase(PHASE_POPULATE, Some(project_files.len()));
+    // Incremental gate + effectively-dirty file set, derived *before*
+    // the populate phase so the fan-out (query warm + AST/index
+    // eviction — the salsa sweep) can run over exactly the touched
+    // set instead of every project file. `Some(dirty)` requires: a
+    // content-only event scope, a valid resolve cache, an identical
+    // file list, a coherent carried builder, and the compaction
+    // trigger not firing (tombstones ≤ live nodes). Dirty = event
+    // scope ∪ files whose salsa-tracked resolution-surface
+    // fingerprint moved (computing the fingerprints is itself the
+    // parallel sweep that re-derives star importers' payloads) ∪
+    // `.pyi` stubs of dirty twins (their stub-only ENTRYPOINT flags
+    // read the twin's exports).
+    let ordinal_of: FxHashMap<File, usize> = project_files
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| (f, i))
+        .collect();
+    let mut new_fps: Option<Vec<u64>> = None;
+    let dirty_files: Option<Vec<bool>> = match &scope {
+        Some(scope_files)
+            if cache.valid
+                && cache.files.as_slice() == project_files.as_slice()
+                && carry.file_blocks.len() == project_files.len()
+                && carry.part_edges.len() == project_files.len()
+                && carry.tombstoned.len() * 2 <= carry.nodes.len() =>
+        {
+            let pool = DbPool::new(db);
+            let fps: Vec<u64> = py.allow_threads(|| {
+                run_job(&pool, &project_files, |ldb, &file| {
+                    resolution_surface_fp(ldb, file)
+                })
+            });
+            let mut dirty: Vec<bool> = (0..project_files.len())
+                .map(|pos| fps[pos] != cache.surface_fp[pos])
+                .collect();
+            let mut in_scope = true;
+            for f in scope_files {
+                match ordinal_of.get(f) {
+                    Some(&pos) => dirty[pos] = true,
+                    // A scoped file that's no longer in the project
+                    // contradicts the stable-file-list gate — bail to
+                    // the full path.
+                    None => {
+                        in_scope = false;
+                        break;
+                    }
+                }
+            }
+            for (&pyi, &twin) in &peer_pyi_to_py {
+                if dirty[ordinal_of[&twin]] {
+                    dirty[ordinal_of[&pyi]] = true;
+                }
+            }
+            new_fps = Some(fps);
+            in_scope.then_some(dirty)
+        }
+        _ => None,
+    };
+
+    // The populate fan-out's worklist: the touched set on an
+    // incremental build, every project file otherwise.
+    let populate_files: Vec<File> = match &dirty_files {
+        Some(dirty) => project_files
+            .iter()
+            .enumerate()
+            .filter(|&(pos, _)| dirty[pos])
+            .map(|(_, &f)| f)
+            .collect(),
+        None => project_files.clone(),
+    };
+
+    let progress = ProgressBars::new(show_progress, populate_files.len() as u64);
+    counters.start_phase(PHASE_POPULATE, Some(populate_files.len()));
 
     // (prewarm phase deleted — confirmed redundant after the
     // fan-out refactor. The populate phase below already
@@ -466,7 +546,7 @@ pub(crate) fn build_project_graph(
         // database mid-query" salsa panic — see the prior PR's
         // commit message for the hazard.
         let dist_db: ProjectDatabase = db.clone();
-        let files_ref: &[File] = &project_files;
+        let files_ref: &[File] = &populate_files;
         let per_file_ids_ref: &[crate::native_plugins::PerFilePluginId] = per_file_plugin_ids;
         let counters_ref = Arc::clone(counters);
         let run_populate = move || {
@@ -584,6 +664,20 @@ pub(crate) fn build_project_graph(
     // class-base resolution shares the log with the plugin pass (it
     // moves into `BuildOutputs` below).
     let reload_log = ReloadLog::default();
+    // Full-path fingerprints, computed after populate (warm payload
+    // memos — pure hash work, no AST loads); the incremental path
+    // computed them up front as the dirty-set input.
+    let new_fps: Vec<u64> = match new_fps {
+        Some(fps) => fps,
+        None => {
+            let pool = DbPool::new(db);
+            py.allow_threads(|| {
+                run_job(&pool, &project_files, |ldb, &file| {
+                    resolution_surface_fp(ldb, file)
+                })
+            })
+        }
+    };
     let assembled = assemble_graph(
         py,
         db,
@@ -594,7 +688,9 @@ pub(crate) fn build_project_graph(
         &reload_log,
         carry,
         cache,
-        scope,
+        dirty_files,
+        new_fps,
+        ordinal_of,
     )?;
     let t_assemble_elapsed = t_assemble.elapsed();
     counters.finish_phase(PHASE_ASSEMBLE);
@@ -783,68 +879,12 @@ fn assemble_graph<'db>(
     reload_log: &ReloadLog,
     carry: GraphBuilder,
     cache: ResolveCache,
-    scope: Option<Vec<File>>,
+    dirty_files: Option<Vec<bool>>,
+    new_fps: Vec<u64>,
+    ordinal_of: FxHashMap<File, usize>,
 ) -> PyResult<AssembledGraph> {
     let t_pass1_start = std::time::Instant::now();
     let n_files = project_files.len();
-
-    // Incremental gate: per-file resolution-surface fingerprints
-    // (salsa-tracked — warmed in the populate fan-out, so this loop is
-    // memo reads) plus the *effectively dirty* file set. `Some(dirty)`
-    // means clean files keep their node block + part and the resolve
-    // arm reuses every cached entry whose read set avoids dirty files;
-    // `None` means rebuild everything (first build, an out-of-scope
-    // event batch, a changed file list, or the compaction trigger).
-    // See [`ResolveCache`] for the full gating contract.
-    let new_fps: Vec<u64> = project_files
-        .iter()
-        .map(|&f| resolution_surface_fp(db, f))
-        .collect();
-    let ordinal_of: FxHashMap<File, usize> = project_files
-        .iter()
-        .enumerate()
-        .map(|(i, &f)| (f, i))
-        .collect();
-    let dirty_files: Option<Vec<bool>> = match &scope {
-        Some(scope_files)
-            if cache.valid
-                && cache.files.as_slice() == project_files
-                && carry.file_blocks.len() == n_files
-                && carry.part_edges.len() == n_files
-                // Compaction trigger: once tombstones outnumber live
-                // nodes, take the full path — it rebuilds a packed id
-                // space from scratch.
-                && carry.tombstoned.len() * 2 <= carry.nodes.len() =>
-        {
-            let mut dirty: Vec<bool> = (0..n_files)
-                .map(|pos| new_fps[pos] != cache.surface_fp[pos])
-                .collect();
-            let mut in_scope = true;
-            for f in scope_files {
-                match ordinal_of.get(f) {
-                    Some(&pos) => dirty[pos] = true,
-                    // A scoped file that's no longer in the project
-                    // contradicts the stable-file-list gate — bail to
-                    // the full path.
-                    None => {
-                        in_scope = false;
-                        break;
-                    }
-                }
-            }
-            // A `.pyi` part reads its `.py` twin's export surface (the
-            // stub-only ENTRYPOINT fixup), so a dirty twin re-mints the
-            // stub: its payload is unchanged (cheap cache re-read) but
-            // its node flags can differ.
-            for (&pyi, &twin) in peer_pyi_to_py {
-                if dirty[ordinal_of[&twin]] {
-                    dirty[ordinal_of[&pyi]] = true;
-                }
-            }
-            in_scope.then_some(dirty)
-        }
-        _ => None,
-    };
 
     // 1a: serial prefetch + base assignment.
     struct FileMint<'db> {
@@ -901,7 +941,7 @@ fn assemble_graph<'db>(
             builder = GraphBuilder::with_capacity(total_nodes);
             builder.prefill_payload_region(total_nodes);
             builder.node_file = vec![crate::builder::NO_FILE; total_nodes];
-            builder.part_edges = vec![Vec::new(); n_files];
+            builder.part_edges = (0..n_files).map(|_| PartEdges::default()).collect();
             for (ordinal, mint) in mints.iter().enumerate() {
                 let n = mint.payload.nodes.len();
                 builder.file_blocks.push((mint.base as u32, n as u32));
@@ -1097,9 +1137,11 @@ fn assemble_graph<'db>(
         member_keys: FxHashMap<(MemberRef, u32), u32>,
         member_results: Vec<(crate::refspec::ResolvedMember, Touched)>,
         member_redo: Vec<bool>,
+        member_live: Vec<bool>,
         dynamic_keys: FxHashMap<(DynamicRef, u32), u32>,
         dynamic_results: Vec<(SmallVec<[ResolvedNode; 4]>, Touched)>,
         dynamic_redo: Vec<bool>,
+        dynamic_live: Vec<bool>,
         parent_results: Vec<Option<File>>,
         spec_ids: Vec<Box<[u32]>>,
         class_base_memo: ClassBaseMemo,
@@ -1145,8 +1187,10 @@ fn assemble_graph<'db>(
         let ResolveCache {
             mut member_keys,
             mut member_results,
+            member_live: prev_member_live,
             mut dynamic_keys,
             mut dynamic_results,
+            dynamic_live: prev_dynamic_live,
             mut class_base_memo,
             mut class_touched,
             spec_ids: mut cached_spec_ids,
@@ -1161,6 +1205,14 @@ fn assemble_graph<'db>(
         let mut dynamic_work: Vec<(u32, DynamicRef, File)> = Vec::new();
         let mut member_redo: Vec<bool>;
         let mut dynamic_redo: Vec<bool>;
+        // This build's liveness: an entry is live iff some current
+        // spec row references it. Stale entries are never re-resolved,
+        // never pre-minted, never translated — they cannot leak into
+        // the output, and a row referencing one again (the file
+        // re-adds the import) re-resolves it first via the
+        // `!prev_live` resurrection rule below.
+        let mut member_live: Vec<bool>;
+        let mut dynamic_live: Vec<bool>;
 
         match dirty_ref {
             None => {
@@ -1209,6 +1261,8 @@ fn assemble_graph<'db>(
                 dynamic_results.resize_with(dynamic_work.len(), Default::default);
                 member_redo = vec![true; member_work.len()];
                 dynamic_redo = vec![true; dynamic_work.len()];
+                member_live = vec![true; member_work.len()];
+                dynamic_live = vec![true; dynamic_work.len()];
             }
             Some(dirty) => {
                 // Incremental: a retained entry re-resolves iff its
@@ -1216,81 +1270,118 @@ fn assemble_graph<'db>(
                 // outside the project can't change under the
                 // content-only scope gate and count as clean).
                 let file_dirty = |f: &File| ordinal_of_ref.get(f).is_some_and(|&pos| dirty[pos]);
-                member_redo = vec![false; member_results.len()];
-                for (id, (_res, touched)) in member_results.iter().enumerate() {
-                    if touched.0.iter().any(&file_dirty) {
-                        member_redo[id] = true;
-                    }
-                }
-                dynamic_redo = vec![false; dynamic_results.len()];
-                for (id, (_res, touched)) in dynamic_results.iter().enumerate() {
-                    if touched.0.iter().any(&file_dirty) {
-                        dynamic_redo[id] = true;
-                    }
-                }
-                // Recover the (key, anchor) for read-set-dirty ids
-                // with one scan over the retained key maps (the only
-                // id → key mapping kept).
-                for ((m, dir), &id) in &member_keys {
-                    if member_redo[id as usize] {
-                        member_work.push((id, m.clone(), dir_anchors_ref[*dir as usize]));
-                    }
-                }
-                for ((d, dir), &id) in &dynamic_keys {
-                    if dynamic_redo[id as usize] {
-                        dynamic_work.push((id, d.clone(), dir_anchors_ref[*dir as usize]));
-                    }
-                }
-                // Row gather: clean files reuse their cached id rows
-                // verbatim; dirty files re-hash their rows. A
-                // per-build borrowed probe map keeps the owned-key
-                // probes (which clone) to one per unique (ref, dir).
+                let prev_member_len = member_results.len();
+                let prev_dynamic_len = dynamic_results.len();
+                member_live = vec![false; prev_member_len];
+                dynamic_live = vec![false; prev_dynamic_len];
+                // Row gather first, so this build's liveness is known
+                // before any redo decision: clean files reuse their
+                // cached id rows verbatim (and only mark them live);
+                // dirty files re-hash their rows, interning against
+                // the retained key maps. A per-build borrowed probe
+                // map keeps the owned-key probes (which clone) to one
+                // per unique (ref, dir). Brand-new unique refs append
+                // a placeholder slot and go straight onto the work
+                // list.
                 let mut seen_member: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
                 let mut seen_dynamic: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
                 for (pos, payload) in spec_payloads_ref.iter().enumerate() {
                     if !dirty[pos] {
-                        spec_ids.push(std::mem::take(&mut cached_spec_ids[pos]));
+                        let ids = std::mem::take(&mut cached_spec_ids[pos]);
+                        for (spec, &id) in payload.specs.iter().zip(ids.iter()) {
+                            match &spec.target {
+                                Target::Local(_) => {}
+                                Target::Member(_) => member_live[id as usize] = true,
+                                Target::Dynamic(_) => dynamic_live[id as usize] = true,
+                            }
+                        }
+                        spec_ids.push(ids);
                         continue;
                     }
                     let dir = dir_ids_ref[pos];
                     let anchor = dir_anchors_ref[dir as usize];
                     let mut ids: Vec<u32> = Vec::with_capacity(payload.specs.len());
                     for spec in payload.specs.iter() {
-                        let id =
-                            match &spec.target {
-                                Target::Local(_) => LOCAL_SPEC,
-                                Target::Member(m) => *seen_member.entry((m, dir)).or_insert_with(
-                                    || match member_keys.get(&(m.clone(), dir)) {
-                                        Some(&id) => id,
-                                        None => {
-                                            let id = member_results.len() as u32;
-                                            member_keys.insert((m.clone(), dir), id);
-                                            member_results.push(Default::default());
-                                            member_redo.push(true);
-                                            member_work.push((id, m.clone(), anchor));
-                                            id
-                                        }
-                                    },
-                                ),
-                                Target::Dynamic(d) => {
-                                    *seen_dynamic.entry((d, dir)).or_insert_with(|| {
-                                        match dynamic_keys.get(&(d.clone(), dir)) {
+                        let id = match &spec.target {
+                            Target::Local(_) => LOCAL_SPEC,
+                            Target::Member(m) => {
+                                let id =
+                                    *seen_member.entry((m, dir)).or_insert_with(
+                                        || match member_keys.get(&(m.clone(), dir)) {
                                             Some(&id) => id,
                                             None => {
-                                                let id = dynamic_results.len() as u32;
-                                                dynamic_keys.insert((d.clone(), dir), id);
-                                                dynamic_results.push(Default::default());
-                                                dynamic_redo.push(true);
-                                                dynamic_work.push((id, d.clone(), anchor));
+                                                let id = member_results.len() as u32;
+                                                member_keys.insert((m.clone(), dir), id);
+                                                member_results.push(Default::default());
+                                                member_live.push(false);
+                                                member_work.push((id, m.clone(), anchor));
                                                 id
                                             }
+                                        },
+                                    );
+                                member_live[id as usize] = true;
+                                id
+                            }
+                            Target::Dynamic(d) => {
+                                let id = *seen_dynamic.entry((d, dir)).or_insert_with(|| {
+                                    match dynamic_keys.get(&(d.clone(), dir)) {
+                                        Some(&id) => id,
+                                        None => {
+                                            let id = dynamic_results.len() as u32;
+                                            dynamic_keys.insert((d.clone(), dir), id);
+                                            dynamic_results.push(Default::default());
+                                            dynamic_live.push(false);
+                                            dynamic_work.push((id, d.clone(), anchor));
+                                            id
                                         }
-                                    })
-                                }
-                            };
+                                    }
+                                });
+                                dynamic_live[id as usize] = true;
+                                id
+                            }
+                        };
                         ids.push(id);
                     }
                     spec_ids.push(ids.into_boxed_slice());
+                }
+                // Redo decision for *retained* ids (new ids are already
+                // on the work list): a live entry re-resolves iff its
+                // read set touches a dirty file, or it was stale last
+                // build (resurrection — its cached answer was allowed
+                // to rot while nothing referenced it). Stale entries
+                // are never re-resolved: they can't reach the output.
+                member_redo = vec![false; member_results.len()];
+                for id in 0..prev_member_len {
+                    if member_live[id]
+                        && (!prev_member_live.get(id).copied().unwrap_or(false)
+                            || member_results[id].1 .0.iter().any(&file_dirty))
+                    {
+                        member_redo[id] = true;
+                    }
+                }
+                dynamic_redo = vec![false; dynamic_results.len()];
+                for id in 0..prev_dynamic_len {
+                    if dynamic_live[id]
+                        && (!prev_dynamic_live.get(id).copied().unwrap_or(false)
+                            || dynamic_results[id].1 .0.iter().any(&file_dirty))
+                    {
+                        dynamic_redo[id] = true;
+                    }
+                }
+                member_redo[prev_member_len..].fill(true);
+                dynamic_redo[prev_dynamic_len..].fill(true);
+                // Recover the (key, anchor) for redo'd retained ids
+                // with one scan over the retained key maps (the only
+                // id → key mapping kept).
+                for ((m, dir), &id) in &member_keys {
+                    if (id as usize) < prev_member_len && member_redo[id as usize] {
+                        member_work.push((id, m.clone(), dir_anchors_ref[*dir as usize]));
+                    }
+                }
+                for ((d, dir), &id) in &dynamic_keys {
+                    if (id as usize) < prev_dynamic_len && dynamic_redo[id as usize] {
+                        dynamic_work.push((id, d.clone(), dir_anchors_ref[*dir as usize]));
+                    }
                 }
             }
         }
@@ -1336,11 +1427,11 @@ fn assemble_graph<'db>(
 
         let t_resolve = std::time::Instant::now();
         let resolved = member_work.len() + dynamic_work.len() + class_work.len();
-        // Retained-and-clean entry count: the id-indexed vecs already
-        // include this build's new placeholder slots, so subtracting
-        // the work lists leaves exactly the reused entries.
-        let reused = (member_results.len() - member_work.len())
-            + (dynamic_results.len() - dynamic_work.len())
+        // Live-and-clean entry count: every work item is live, so
+        // subtracting the work lists from the live populations leaves
+        // exactly the reused entries (stale slots count for nothing).
+        let reused = (member_live.iter().filter(|&&l| l).count() - member_work.len())
+            + (dynamic_live.iter().filter(|&&l| l).count() - dynamic_work.len())
             + class_reused;
         let member_done: Vec<(u32, crate::refspec::ResolvedMember, Touched)> =
             run_job(&pool, &member_work, |ldb, (id, m, anchor)| {
@@ -1382,9 +1473,11 @@ fn assemble_graph<'db>(
             member_keys,
             member_results,
             member_redo,
+            member_live,
             dynamic_keys,
             dynamic_results,
             dynamic_redo,
+            dynamic_live,
             parent_results,
             spec_ids,
             class_base_memo,
@@ -1539,9 +1632,11 @@ fn assemble_graph<'db>(
         member_keys,
         member_results,
         member_redo,
+        member_live,
         dynamic_keys,
         dynamic_results,
         dynamic_redo,
+        dynamic_live,
         parent_results,
         spec_ids,
         class_base_memo,
@@ -1584,16 +1679,40 @@ fn assemble_graph<'db>(
         let mut externals: Vec<(&str, String, File)> = Vec::new();
         let member_nodes = member_results
             .iter()
-            .flat_map(|(res, _)| res.targets.iter());
-        let dynamic_nodes = dynamic_results.iter().flat_map(|(res, _)| res.iter());
+            .zip(&member_live)
+            .filter(|(_, &live)| live)
+            .flat_map(|((res, _), _)| res.targets.iter());
+        let dynamic_nodes = dynamic_results
+            .iter()
+            .zip(&dynamic_live)
+            .filter(|(_, &live)| live)
+            .flat_map(|((res, _), _)| res.iter());
         for node in member_nodes.chain(dynamic_nodes) {
             if let ResolvedNode::External { fqname, file } = node {
                 externals.push((fqname.as_str(), file_path_string(db, *file), *file));
             }
         }
         externals.sort_unstable();
+        let mut live_externals: FxHashSet<usize> = FxHashSet::default();
         for (fqname, path, file) in externals {
-            builder.intern_external(fqname.to_string(), path, file);
+            live_externals.insert(builder.intern_external(fqname.to_string(), path, file));
+        }
+        // External GC: an anchor no live resolution targets must not
+        // survive into the output (a fresh build wouldn't mint it).
+        // Tombstone the slot but keep the `external_nodes` map entry,
+        // so a later re-import resurrects the same stable dense id
+        // (`intern_external` un-tombstones on a map hit).
+        let stale: Vec<usize> = builder
+            .external_nodes
+            .values()
+            .copied()
+            .filter(|idx| {
+                !live_externals.contains(idx) && !builder.tombstoned.contains(&(*idx as u32))
+            })
+            .collect();
+        for idx in stale {
+            builder.tombstoned.insert(idx as u32);
+            builder.nodes[idx] = GraphNode::default();
         }
     }
 
@@ -1603,7 +1722,19 @@ fn assemble_graph<'db>(
     // dense node ids only move for re-minted files, and the symbolic
     // memo never goes stale.
     let mut member_slots: Vec<MemberSlot> = Vec::with_capacity(member_results.len());
-    for (res, _touched) in &member_results {
+    for ((res, _touched), &live) in member_results.iter().zip(&member_live) {
+        if !live {
+            // Stale entry: no current row references this id, so the
+            // slot is never read — and translating it could mint
+            // phantom externals. Push an empty placeholder to keep the
+            // id space aligned.
+            member_slots.push(MemberSlot {
+                idxs: SmallVec::new(),
+                unresolved: false,
+                start_file: None,
+            });
+            continue;
+        }
         let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
         for node in &res.targets {
             if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
@@ -1617,7 +1748,11 @@ fn assemble_graph<'db>(
         });
     }
     let mut dynamic_slots: Vec<SmallVec<[usize; 4]>> = Vec::with_capacity(dynamic_results.len());
-    for (nodes, _touched) in &dynamic_results {
+    for ((nodes, _touched), &live) in dynamic_results.iter().zip(&dynamic_live) {
+        if !live {
+            dynamic_slots.push(SmallVec::new());
+            continue;
+        }
         let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
         for node in nodes {
             if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
@@ -1653,7 +1788,7 @@ fn assemble_graph<'db>(
                         Target::Dynamic(_) => dynamic_redo[id as usize],
                     })
                     || builder.part_edges[pos]
-                        .iter()
+                        .iter_all()
                         .any(|&(_, d, _)| newly_tombstoned.contains(&d));
                 if hit {
                     r[pos] = true;
@@ -1776,8 +1911,8 @@ fn assemble_graph<'db>(
     let ref_to_global_ref = &ref_to_global;
     let plugin_ops_ref = &plugin_ops;
     let retranslate_pos: Vec<usize> = (0..n_files).filter(|&pos| retranslate[pos]).collect();
-    /// One re-translated part: `(file ordinal, sorted triples)`.
-    type NewPart = (usize, Vec<(u32, u32, u8)>);
+    /// One re-translated part: `(file ordinal, sectioned triples)`.
+    type NewPart = (usize, PartEdges);
     let new_parts: Vec<NewPart> = py.allow_threads(move || {
         use rayon::prelude::*;
         retranslate_pos
@@ -1788,7 +1923,8 @@ fn assemble_graph<'db>(
                 let file = project_files[pos];
                 let payload = spec_payloads_ref[pos];
                 let ids = &spec_ids_ref[pos];
-                let mut t: Vec<(u32, u32, u8)> = Vec::with_capacity(payload.specs.len() + 8);
+                let mut part = PartEdges::default();
+                part.spec.reserve(payload.specs.len() + 8);
                 for (i, spec) in payload.specs.iter().enumerate() {
                     for (s, d, fl) in spec_edges(
                         spec,
@@ -1798,17 +1934,18 @@ fn assemble_graph<'db>(
                         member_slots_ref,
                         dynamic_slots_ref,
                     ) {
-                        t.push((s as u32, d as u32, fl));
+                        part.spec.push((s as u32, d as u32, fl));
                     }
                 }
                 // Structural edges — fully derivable from the node
                 // payloads, deliberately not part of the RefSpec
-                // payload.
+                // payload. Same section as the spec rows: the old
+                // pipeline sorted them into one bulk init together.
                 for local in 1..mint.payload.nodes.len() {
-                    t.push(((base + local) as u32, base as u32, 0));
+                    part.spec.push(((base + local) as u32, base as u32, 0));
                 }
                 for &(impl_local, stub_local) in mint.payload.overload_anchors.iter() {
-                    t.push((
+                    part.spec.push((
                         (base + impl_local as usize) as u32,
                         (base + stub_local as usize) as u32,
                         0,
@@ -1816,12 +1953,15 @@ fn assemble_graph<'db>(
                 }
                 if let Some(parent_file) = parent_results_ref[pos] {
                     if let Some(&parent_idx) = module_nodes_ref.get(&parent_file) {
-                        t.push((base as u32, parent_idx as u32, 0));
+                        part.spec.push((base as u32, parent_idx as u32, 0));
                     }
                 }
+                part.spec.sort_unstable();
+                part.spec.dedup();
                 // Peer .pyi → .py reachability edges: for each name
                 // both sides export, edge every stub decl to every
-                // runtime decl.
+                // runtime decl. Own section — the old pipeline's
+                // pass 3 extended these after the bulk init.
                 if mint.is_stub {
                     if let Some(py_payload) = mint.twin_payload {
                         for (name, pyi_locals) in &mint.payload.exports_by_name {
@@ -1835,13 +1975,18 @@ fn assemble_graph<'db>(
                                     let Some(&py_idx) = ref_to_global_ref.get(&py_ref) else {
                                         continue;
                                     };
-                                    t.push((pyi_idx as u32, py_idx as u32, 0));
+                                    part.peer.push((pyi_idx as u32, py_idx as u32, 0));
                                 }
                             }
                         }
+                        part.peer.sort_unstable();
+                        part.peer.dedup();
                     }
                 }
-                // Per-file plugin edge ops (file-local endpoints).
+                // Per-file plugin edge ops (file-local endpoints). Own
+                // section, kept in op order and *not* deduplicated —
+                // the refold replays them through `add_edge` exactly
+                // like the old pipeline's pass 4 did.
                 {
                     use crate::native_plugins::FileLocalOp;
                     let len = mint.payload.nodes.len();
@@ -1853,7 +1998,7 @@ fn assemble_graph<'db>(
                         } = op
                         {
                             if (*src_local_idx as usize) < len && (*dst_local_idx as usize) < len {
-                                t.push((
+                                part.plugin.push((
                                     (base + *src_local_idx as usize) as u32,
                                     (base + *dst_local_idx as usize) as u32,
                                     *flags,
@@ -1862,26 +2007,36 @@ fn assemble_graph<'db>(
                         }
                     }
                 }
-                t.sort_unstable();
-                t.dedup();
-                (pos, t)
+                (pos, part)
             })
             .collect()
     });
-    for (pos, t) in new_parts {
-        builder.part_edges[pos] = t;
+    for (pos, part) in new_parts {
+        builder.part_edges[pos] = part;
     }
 
-    // Global edge refold: concatenate every part (clean parts
-    // verbatim), sort, and bulk-initialize the derived edge stores.
-    // Cross-part duplicates are impossible (a triple's src pins it to
-    // one part), so the dedup only guards the per-part contract.
+    // Global edge refold, replaying the historical assemble's phases
+    // so a full build's edge order is **byte-identical** to the old
+    // pipeline (and an incremental build's order follows the same
+    // construction over its sparse id space):
+    //
+    // 1. every part's spec section → one globally-sorted bulk init
+    //    (cross-part duplicates are impossible — a triple's src pins
+    //    it to one part — so per-part dedup equals global dedup);
+    // 2. every part's peer section → sort + dedup + `extend_edges`
+    //    (the old pass 3);
+    // 3. every part's plugin section → `add_edge` replay in ordinal +
+    //    op order (the old pass 4; `add_edge` supplies the dedup).
     {
         builder.reset_derived_edges();
-        let total: usize = builder.part_edges.iter().map(Vec::len).sum();
+        let total: usize = builder.part_edges.iter().map(|p| p.spec.len()).sum();
         let mut triples: Vec<(usize, usize, u8)> = Vec::with_capacity(total);
         for part in &builder.part_edges {
-            triples.extend(part.iter().map(|&(s, d, f)| (s as usize, d as usize, f)));
+            triples.extend(
+                part.spec
+                    .iter()
+                    .map(|&(s, d, f)| (s as usize, d as usize, f)),
+            );
         }
         py.allow_threads(|| {
             use rayon::prelude::*;
@@ -1889,6 +2044,31 @@ fn assemble_graph<'db>(
             triples.dedup();
             builder.init_edges_bulk(triples);
         });
+
+        let mut peer_triples: Vec<(usize, usize, u8)> = Vec::new();
+        for part in &builder.part_edges {
+            peer_triples.extend(
+                part.peer
+                    .iter()
+                    .map(|&(s, d, f)| (s as usize, d as usize, f)),
+            );
+        }
+        peer_triples.sort_unstable();
+        peer_triples.dedup();
+        builder.extend_edges(peer_triples);
+
+        let plugin_triples: Vec<(usize, usize, u8)> = builder
+            .part_edges
+            .iter()
+            .flat_map(|p| {
+                p.plugin
+                    .iter()
+                    .map(|&(s, d, f)| (s as usize, d as usize, f))
+            })
+            .collect();
+        for (src, dst, flags) in plugin_triples {
+            builder.add_edge(src, dst, flags);
+        }
     }
 
     // Base-flag snapshot: the post-assemble, pre-plugin-pass state the
@@ -1931,8 +2111,10 @@ fn assemble_graph<'db>(
             spec_ids,
             member_keys,
             member_results,
+            member_live,
             dynamic_keys,
             dynamic_results,
+            dynamic_live,
             class_base_memo,
             class_touched,
         },

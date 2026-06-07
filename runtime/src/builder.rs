@@ -114,6 +114,38 @@ impl GraphNode {
     }
 }
 
+/// One file's translated out-edges, sectioned by the historical
+/// assemble phase that produced them so the per-build global refold
+/// reproduces the old pipeline's edge order **byte-for-byte** on a
+/// full build:
+///
+/// 1. every part's `spec` section (spec rows + structural anchors,
+///    deduplicated per part — cross-part duplicates are impossible
+///    since a triple's src pins it to one part) concatenates into one
+///    globally-sorted bulk init;
+/// 2. every part's `peer` section (`.pyi` → `.py` reachability edges)
+///    concatenates, sorts, and extends — the old pass-3 shape;
+/// 3. every part's `plugin` section (per-file plugin edge ops, kept
+///    in op order, *not* sorted) replays through `add_edge` in
+///    ordinal order — the old pass-4 shape.
+#[derive(Default)]
+pub(crate) struct PartEdges {
+    pub(crate) spec: Vec<(u32, u32, u8)>,
+    pub(crate) peer: Vec<(u32, u32, u8)>,
+    pub(crate) plugin: Vec<(u32, u32, u8)>,
+}
+
+impl PartEdges {
+    /// Iterate every triple across the three sections (the dst-scan
+    /// that detects cached edges into freshly tombstoned blocks).
+    pub(crate) fn iter_all(&self) -> impl Iterator<Item = &(u32, u32, u8)> {
+        self.spec
+            .iter()
+            .chain(self.peer.iter())
+            .chain(self.plugin.iter())
+    }
+}
+
 /// Sentinel file ordinal for nodes that belong to no per-file block:
 /// synthetic externals and plugin-minted nodes. They survive graph
 /// surgery untouched.
@@ -143,15 +175,15 @@ pub(crate) struct GraphBuilder {
     /// re-mints a file.
     pub(crate) tombstoned: FxHashSet<u32>,
     /// Per file ordinal: the file's **part** — its translated
-    /// out-edge triples (spec + structural + peer + per-file-plugin),
-    /// in dense-id terms, sorted + deduplicated. This is the
-    /// persistent per-file builder output: an incremental rebuild
-    /// reuses a clean file's part verbatim (no re-translation, no
-    /// re-hashing) and the per-build global edge structures are
-    /// refolded by concatenating parts. Project-wide plugin edges are
-    /// deliberately *not* part of any part — they re-apply through
-    /// `add_edge` each build and vanish at the next refold.
-    pub(crate) part_edges: Vec<Vec<(u32, u32, u8)>>,
+    /// out-edge triples in dense-id terms, sectioned so the per-build
+    /// global refold can replay the historical assemble's exact byte
+    /// order (see [`PartEdges`]). This is the persistent per-file
+    /// builder output: an incremental rebuild reuses a clean file's
+    /// part verbatim (no re-translation, no re-hashing). Project-wide
+    /// plugin edges are deliberately *not* part of any part — they
+    /// re-apply through `add_edge` each build and vanish at the next
+    /// refold.
+    pub(crate) part_edges: Vec<PartEdges>,
     /// Per-node **base** flags: the post-assemble, pre-plugin-pass
     /// flag state (default + stub fixup + `UNRESOLVED` stamps +
     /// per-file plugin ops). Each build starts by restoring
@@ -296,6 +328,13 @@ impl GraphBuilder {
     /// single node.
     pub(crate) fn intern_external(&mut self, fqname: String, path: String, file: File) -> usize {
         if let Some(&idx) = self.external_nodes.get(&fqname) {
+            // Resurrect an anchor the external GC tombstoned in an
+            // earlier incremental build: the map entry is kept exactly
+            // so a re-imported external lands back on its stable dense
+            // id (re-minted with the caller's — current — path).
+            if self.tombstoned.remove(&(idx as u32)) {
+                self.nodes[idx] = positionless_node(fqname, "external", path, 0);
+            }
             return idx;
         }
         let idx = self.intern_node(positionless_node(fqname.clone(), "external", path, 0), file);
@@ -325,10 +364,6 @@ impl GraphBuilder {
     /// with looping `add_edge`, the win is amortising the per-edge
     /// branch / hash overhead and pre-reserving capacity on `edges`
     /// and the per-node adjacency vectors.
-    /// Retained as the serial reference implementation for
-    /// `init_edges_bulk`'s equivalence tests (no production caller
-    /// since the per-part edge refold subsumed the post-init inserts).
-    #[allow(dead_code)]
     pub(crate) fn extend_edges(&mut self, triples: Vec<(usize, usize, u8)>) {
         if triples.is_empty() {
             return;

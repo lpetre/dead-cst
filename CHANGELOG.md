@@ -46,7 +46,18 @@ two versions.
   into reused parts), topic facts, the class hierarchy, the plugin pass —
   is still refolded from the parts each build. Full builds compact the id
   space, and run automatically once tombstones outnumber live nodes;
-  `write_graph` packs tombstones away at serialization time.
+  `write_graph` packs tombstones away at serialization time. Memo entries
+  whose last referencing row vanished go *stale*: they're excluded from
+  re-resolution, the external pre-mint, and slot translation (so a removed
+  `import X` drops its `[external dist] X` anchor exactly like a fresh
+  build — the anchor is tombstoned, and a later re-import resurrects the
+  same dense id with a fresh resolution). A full build's output is
+  **byte-identical** to the historical pipeline — the per-part edge
+  sections replay the old assemble's exact phase order (verified A/B
+  against the pre-change binary, plugins included). The populate phase's
+  warm-and-evict sweep runs over the touched set only on incremental
+  builds (event scope ∪ fingerprint-moved files) instead of every project
+  file.
 
 - **Topic/fact channel for native plugins.** A per-file native plugin can
   now hand structured facts up to its project-wide reader. A plugin declares

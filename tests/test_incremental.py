@@ -732,3 +732,77 @@ def test_write_graph_compacts_tombstones(tmp_path):
     want = sorted((live[s].fqname, live[d].fqname, f) for s, d, f in ctx.edges())
     got = sorted((graph.nodes[s].fqname, graph.nodes[d].fqname, f) for s, d, f in graph.edges)
     assert want == got
+
+
+# ---------------------------------------------------------------------------
+# Stale-entry hygiene: entries whose last referencing row vanished must
+# not leak into the output (no phantom externals), and re-referencing
+# one must re-resolve it.
+# ---------------------------------------------------------------------------
+
+
+def _external_fqnames(ctx) -> set[str]:
+    dead = set(ctx.tombstoned_indices())
+    return {n.fqname for i, n in enumerate(ctx.nodes()) if i not in dead and n.kind == "external"}
+
+
+def test_incremental_external_removed_is_gcd(tmp_path):
+    """Removing the last import of a third-party dist drops its
+    ``[external dist]`` anchor on the incremental path — a fresh build
+    wouldn't mint it, so neither may the rebuild."""
+    _write(tmp_path / "a.py", "import yaml\nDATA = yaml.safe_load('a: 1')\n")
+    _write(tmp_path / "b.py", "x = 1\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+    assert "[external dist] pyyaml" in _external_fqnames(ctx)
+
+    _write(tmp_path / "a.py", "DATA = {'a': 1}\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+    assert "[external dist] pyyaml" not in _external_fqnames(ctx)
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_incremental_external_resurrects_with_stable_id(tmp_path):
+    """Re-importing a GC'd external lands back on the same dense id
+    (the anchor map survives the tombstone), and the graph stays exact
+    against a fresh build."""
+    _write(tmp_path / "a.py", "import yaml\nDATA = yaml.safe_load('a: 1')\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+    nodes = ctx.nodes()
+    (ext_idx,) = [i for i, n in enumerate(nodes) if n.fqname == "[external dist] pyyaml"]
+
+    _write(tmp_path / "a.py", "DATA = {'a': 1}\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+    assert ext_idx in ctx.tombstoned_indices()
+
+    _write(tmp_path / "a.py", "import yaml\nDATA = yaml.safe_load('a: 1')\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+    assert ext_idx not in ctx.tombstoned_indices()
+    assert ctx.nodes()[ext_idx].fqname == "[external dist] pyyaml"
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_incremental_stale_member_entry_resurrects(tmp_path):
+    """A first-party import removed then re-added: the stale memo entry
+    must re-resolve on resurrection (its cached answer was allowed to
+    rot while nothing referenced it)."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis = Analysis(tmp_path)
+    analysis.materialize_all()
+
+    _write(tmp_path / "b.py", "x = 1\n")
+    analysis.re_materialize(_changed(tmp_path, "b.py"))
+    _assert_matches_fresh(analysis, tmp_path)
+
+    # While the entry is stale, the upstream decl moves — the rotted
+    # cached answer points at the old position.
+    _write(tmp_path / "a.py", "# pad\n\ndef f(): pass\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+    _assert_matches_fresh(analysis, tmp_path)
+
+    # Resurrection must re-resolve, not replay the rotted answer.
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis.re_materialize(_changed(tmp_path, "b.py"))
+    _assert_matches_fresh(analysis, tmp_path)
