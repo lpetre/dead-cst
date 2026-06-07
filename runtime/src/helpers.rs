@@ -113,6 +113,30 @@ pub(crate) fn iter_top_level_classes(
 /// project classes (looked up via ``decl_by_fqname`` + the inverted
 /// ``class_by_selection``) and external classes (resolved through
 /// [`resolve_member_def`]).
+/// Files whose parsed module / semantic index were reloaded on demand
+/// *after* the populate-phase eviction: class-base resolution during
+/// assembly and class-seed relocation during the plugin pass / Python
+/// queries. [`resolve_member_in_file`] — the one chokepoint where
+/// those reloads happen — records every file it touches, and the
+/// post-plugin-pass sweep re-clears exactly this set instead of
+/// probing every project file's salsa slots.
+#[derive(Debug, Default)]
+pub(crate) struct ReloadLog(parking_lot::Mutex<FxHashSet<File>>);
+
+impl ReloadLog {
+    pub(crate) fn record(&self, file: File) {
+        self.0.lock().insert(file);
+    }
+
+    /// Take the recorded set, leaving the log empty so later on-demand
+    /// reloads (post-build Python queries) start a fresh set. Order is
+    /// irrelevant to the caller (clears are idempotent and
+    /// order-independent).
+    pub(crate) fn drain(&self) -> Vec<File> {
+        self.0.lock().drain().collect()
+    }
+}
+
 pub(crate) fn locate_class_seed(
     db: &ProjectDatabase,
     outputs: &BuildOutputs,
@@ -139,7 +163,7 @@ pub(crate) fn locate_class_seed(
     // by construction, not via a query-time string scan.
     let anchor = *outputs.project_files.first()?;
     let (seed_module, seed_name) = fqn.rsplit_once('.')?;
-    resolve_member_def(db, seed_module, seed_name, anchor, 0)
+    resolve_member_def(db, seed_module, seed_name, anchor, 0, &outputs.reload_log)
 }
 
 /// Maximum hops [`resolve_member_def`] / [`classify_base`] follow through
@@ -323,13 +347,14 @@ pub(crate) fn resolve_base_spec(
     local_file: File,
     anchor: File,
     depth: u32,
+    reloads: &ReloadLog,
 ) -> Option<(File, TextRange)> {
     match spec {
         ClassBaseSpec::LocalClass((start, end)) => {
             Some((local_file, TextRange::new((*start).into(), (*end).into())))
         }
         ClassBaseSpec::ModuleMember { module, name } => {
-            resolve_member_def(db, module, name, anchor, depth)
+            resolve_member_def(db, module, name, anchor, depth, reloads)
         }
     }
 }
@@ -344,13 +369,14 @@ pub(crate) fn resolve_member_def(
     name: &str,
     anchor: File,
     depth: u32,
+    reloads: &ReloadLog,
 ) -> Option<(File, TextRange)> {
     if depth > MEMBER_RESOLVE_DEPTH_CAP {
         return None;
     }
     let module_name = ModuleName::new(module)?;
     let module_file = resolve_module(db, anchor, &module_name)?.file(db)?;
-    resolve_member_in_file(db, module_file, name, anchor, depth)
+    resolve_member_in_file(db, module_file, name, anchor, depth, reloads)
 }
 
 /// Resolve `name` in `file`'s global scope to a canonical
@@ -367,13 +393,19 @@ fn resolve_member_in_file(
     name: &str,
     anchor: File,
     depth: u32,
+    reloads: &ReloadLog,
 ) -> Option<(File, TextRange)> {
+    // This load (and `local_member_defs`'s semantic-index load below)
+    // repopulates salsa slots the populate-phase eviction emptied —
+    // record the file so the post-plugin-pass sweep can re-clear
+    // exactly the touched set.
+    reloads.record(file);
     let parsed = parsed_module(db, file).load(db);
     local_member_defs(db, file, name)
         .into_iter()
         .find_map(|def| {
             let spec = classify_name_def(db, file, &parsed, def, name, depth)?;
-            resolve_base_spec(db, &spec, file, anchor, depth + 1)
+            resolve_base_spec(db, &spec, file, anchor, depth + 1, reloads)
         })
 }
 

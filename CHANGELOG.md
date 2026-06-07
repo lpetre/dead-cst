@@ -262,8 +262,11 @@ two versions.
   AST ids) for lazy, ingredient-reusing rebuild on the next `load()`. The
   populate fan-out clears each file's index (alongside its parsed AST) as
   soon as the per-file extraction queries have memoized their owned
-  payloads, and the post-plugin-pass sweep re-clears any files the class
-  hierarchy / plugin passes reloaded on demand. On large projects the
+  payloads, and the post-plugin-pass sweep re-clears the files the
+  assembly / plugin passes reloaded on demand — tracked precisely via a
+  reload log on `resolve_member_in_file` (the one reload chokepoint), so
+  the sweep touches the handful of base-defining files instead of probing
+  every project file's salsa slots. On large projects the
   resident semantic indices were the dominant share of peak memory
   (~16 GB at 200k files); they are now transient per-file working state.
 

@@ -40,7 +40,7 @@ use crate::flag_registry::FlagRegistry;
 use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
 use crate::helpers::{
     file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_member_def,
-    CallArgs, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT, NODE_FLAG_UNRESOLVED,
+    CallArgs, ReloadLog, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT, NODE_FLAG_UNRESOLVED,
 };
 use crate::ingest::emit_visitor_warning;
 use crate::progress::{
@@ -198,6 +198,9 @@ pub(crate) struct BuildOutputs {
     /// (handle → name → this map); Python reads it via
     /// `ProjectContext.facts_for_topic`.
     pub(crate) topic_facts: FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>>,
+    /// On-demand reload tracking for the post-plugin-pass eviction
+    /// sweep — see [`crate::helpers::ReloadLog`].
+    pub(crate) reload_log: ReloadLog,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -509,6 +512,12 @@ pub(crate) fn build_project_graph(
     // memoized from the parallel pre-populate above so this pass
     // is pure hashmap/index work.
     let t_assemble = std::time::Instant::now();
+    // Records every file the assembly/plugin passes reload on demand
+    // after the populate-phase eviction; the post-plugin-pass sweep
+    // re-clears exactly that set. Created here so assembly's
+    // class-base resolution shares the log with the plugin pass (it
+    // moves into `BuildOutputs` below).
+    let reload_log = ReloadLog::default();
     let assembled = assemble_graph(
         py,
         db,
@@ -518,6 +527,7 @@ pub(crate) fn build_project_graph(
         &peer_pyi_to_py,
         per_file_plugin_ids,
         counters,
+        &reload_log,
     )?;
     let t_assemble_elapsed = t_assemble.elapsed();
     counters.finish_phase(PHASE_ASSEMBLE);
@@ -605,6 +615,7 @@ pub(crate) fn build_project_graph(
         external_base_children,
         children_by_parent,
         topic_facts,
+        reload_log,
     })
 }
 
@@ -687,6 +698,7 @@ fn assemble_graph<'db>(
     peer_pyi_to_py: &FxHashMap<File, File>,
     per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
     counters: &Arc<ProgressCounters>,
+    reload_log: &ReloadLog,
 ) -> PyResult<AssembledGraph> {
     // `total_nodes` and `node_offsets` come from the fan-out's per-file
     // node-count prefix sum (see the populate phase). The exact total
@@ -939,7 +951,7 @@ fn assemble_graph<'db>(
         });
         let class_results: Vec<Option<(File, TextRange)>> =
             run_job(&pool, &class_work, |ldb, &(anchor, module, name)| {
-                resolve_member_def(ldb, module, name, anchor, 0)
+                resolve_member_def(ldb, module, name, anchor, 0, reload_log)
             });
 
         // Owned `(module, name, dir)` → resolved-base memo for the
@@ -2545,20 +2557,23 @@ impl ProjectContext {
             this.topic_registry = topic_reg;
         }
 
-        // The plugin pass can still reload individual files on demand:
-        // subclass resolution's `locate_class_seed` resolves an external base
-        // through ty (`resolve_member_def` → the module resolver + use-def
-        // chain), which loads the target module's `parsed_module` and
-        // rebuilds its semantic index's per-scope data to look up the
-        // member's binding, repopulating those files' salsa slots. Clear
-        // them again so the post-build resident set stays at the lean
-        // post-populate level instead of creeping back up — the same memory
-        // win `build_project_graph`'s populate phase secures.
+        // The assembly and plugin passes can still reload individual files
+        // on demand: class-base resolution and subclass resolution's
+        // `locate_class_seed` resolve members through ty
+        // (`resolve_member_def` → the module resolver + use-def chain),
+        // which loads the target module's `parsed_module` and rebuilds its
+        // semantic index's per-scope data, repopulating those files' salsa
+        // slots. Every such reload funnels through
+        // `resolve_member_in_file`, which records the file in
+        // `outputs.reload_log` — so the sweep re-clears exactly the touched
+        // set (typically a handful of base-defining files) instead of
+        // probing every project file's slots, and the post-build resident
+        // set stays at the lean post-populate level.
         {
             let this = slf.borrow(py);
             let outputs_ref = this.outputs.read();
             if let Some(outputs) = outputs_ref.as_ref() {
-                for &file in &outputs.project_files {
+                for file in outputs.reload_log.drain() {
                     ty_python_core::semantic_index(&this.db, file).clear();
                     parsed_module(&this.db, file).clear();
                 }
