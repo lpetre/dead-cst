@@ -31,7 +31,8 @@ use crate::file_extraction::{
     CallSiteFact, FileExtraction,
 };
 use crate::file_payload::{
-    file_to_nodes, parent_module_file, ClassBaseSpec, FileNodes, NodeKind, NodeRef,
+    file_to_nodes, parent_module_file, resolution_surface_fp, ClassBaseSpec, FileNodes, NodeKind,
+    NodeRef,
 };
 use crate::file_ref_edges::{file_to_refspecs, FileRefSpecs};
 use crate::flag_registry::FlagRegistry;
@@ -48,6 +49,7 @@ use crate::progress::{
 use crate::query::_path_re_matches;
 use crate::refspec::{
     resolve_dynamic, resolve_member, DynamicRef, MemberRef, MemberRole, ResolvedNode, Target,
+    Touched,
 };
 use crate::topic_registry::TopicRegistry;
 use compact_str::CompactString;
@@ -88,7 +90,16 @@ impl Project {
     /// Build the project-wide symbol graph (single-pass, no plugins).
     pub(crate) fn build(&mut self, py: Python<'_>) -> PyResult<NativeGraph> {
         let counters = Arc::new(ProgressCounters::new());
-        let outputs = build_project_graph(py, &mut self.db, false, None, &counters, &[])?;
+        let outputs = build_project_graph(
+            py,
+            &mut self.db,
+            false,
+            None,
+            &counters,
+            &[],
+            ResolveCache::default(),
+            None,
+        )?;
         let nodes = outputs
             .builder
             .nodes
@@ -199,6 +210,82 @@ pub(crate) struct BuildOutputs {
     /// On-demand reload tracking for the post-plugin-pass eviction
     /// sweep — see [`crate::helpers::ReloadLog`].
     pub(crate) reload_log: ReloadLog,
+    /// Cross-build resolution memo — see [`ResolveCache`]. Taken out
+    /// of the previous build's outputs by `materialize` and handed to
+    /// the next assemble, which reuses every entry whose read set is
+    /// untouched and stores the updated cache here.
+    pub(crate) resolve_cache: ResolveCache,
+    /// `(resolved, reused)` cross-file resolution counts from the most
+    /// recent assemble — the incremental-reuse observability hook
+    /// (`ProjectContext._last_resolve_counts`, the timing line, tests).
+    pub(crate) resolve_stats: (usize, usize),
+}
+
+/// Cross-build memo for the assemble pass's cross-file resolutions —
+/// the one piece of builder output that is *not* re-derived from
+/// scratch on every materialize. Everything global (node table, edge
+/// translation, fqname / class-hierarchy indices, the plugin pass) is
+/// refolded from the per-file parts on every build, so nothing can be
+/// stale; this cache only short-circuits the `resolve_member` /
+/// `resolve_dynamic` / `resolve_member_def` calls whose *inputs*
+/// provably didn't change.
+///
+/// Results are stored in **symbolic** terms ([`ResolvedNode`]: `File`
+/// / `DeclKey`, never dense graph indices), so reuse needs no target
+/// tracking at all — every build re-translates the memo against its
+/// own fresh `ref_to_global`.
+///
+/// Reuse is gated three ways (any failure ⇒ resolve everything, i.e.
+/// exactly today's full build):
+///
+/// 1. **Event scope.** The batch applied since the last build must be
+///    content-only: every event a `Changed` naming a known project
+///    file ([`ProjectContext::pending_scope`]). `Created` / `Deleted`
+///    / `Rescan` can flip module → file resolution project-wide,
+///    which read sets don't (and shouldn't) capture.
+/// 2. **Stable file list.** The sorted project file list must be
+///    identical to the previous build's (so per-ordinal rows and
+///    anchor-directory ids line up).
+/// 3. **Per-entry read sets.** A memo entry re-resolves iff a file in
+///    its recorded [`Touched`] read set is *effectively changed*:
+///    named by the event batch, or its salsa-tracked
+///    [`resolution_surface_fp`] differs from the previous build's.
+///    The fingerprint is what makes the read sets transitive without
+///    a hand-built dependency walk — `from X import *` importers'
+///    payloads are derived from X's exports, and salsa recomputes
+///    their fingerprints when X changes.
+///
+/// Entries whose refs disappear from the project keep their slots
+/// (ids must stay stable for the retained per-file `spec_ids`); the
+/// garbage is bounded by churn and clears with the next full resolve.
+///
+/// This is a deliberate, sanctioned exception to the crate's "no
+/// per-file cache" rule: resolution is anchor-directory-memoized
+/// cross-file work that salsa cannot track for us (it must run on
+/// plain snapshots, off the tracked-query graph).
+#[derive(Default)]
+pub(crate) struct ResolveCache {
+    /// False until the first build completes (or after an out-of-scope
+    /// batch invalidates the cache).
+    pub(crate) valid: bool,
+    /// The sorted project file list the cache was built against.
+    pub(crate) files: Vec<File>,
+    /// Per file ordinal: [`resolution_surface_fp`] at build time.
+    pub(crate) surface_fp: Vec<u64>,
+    /// Per file ordinal: the dense resolution id of each spec row,
+    /// parallel to `file_to_refspecs(file).specs` (`u32::MAX` = a
+    /// `Local` row with no cross-file resolution).
+    pub(crate) spec_ids: Vec<Box<[u32]>>,
+    /// `(ref, anchor-directory id) → member_results index`.
+    pub(crate) member_keys: FxHashMap<(MemberRef, u32), u32>,
+    /// Id-indexed symbolic results + each resolution's read set.
+    pub(crate) member_results: Vec<(crate::refspec::ResolvedMember, Touched)>,
+    pub(crate) dynamic_keys: FxHashMap<(DynamicRef, u32), u32>,
+    pub(crate) dynamic_results: Vec<(SmallVec<[ResolvedNode; 4]>, Touched)>,
+    /// Class-base resolution memo (shared with the class-hierarchy
+    /// fan-in) plus each entry's read set.
+    pub(crate) class_base_memo: ClassBaseMemo,
+    pub(crate) class_touched: FxHashMap<(CompactString, CompactString, u32), Touched>,
 }
 
 /// Run the three build phases (ingest → hierarchy+imports → references)
@@ -267,6 +354,7 @@ impl ProgressBars {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_project_graph(
     py: Python<'_>,
     db: &mut ProjectDatabase,
@@ -274,6 +362,8 @@ pub(crate) fn build_project_graph(
     stack_size: Option<usize>,
     counters: &Arc<ProgressCounters>,
     per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
+    cache: ResolveCache,
+    scope: Option<Vec<File>>,
 ) -> PyResult<BuildOutputs> {
     let timing = std::env::var_os("DEAD_CST_TIMING").is_some();
 
@@ -411,6 +501,11 @@ pub(crate) fn build_project_graph(
                             local_db.attach(|local_db| {
                                 let _ = file_to_nodes(local_db, file);
                                 let _ = file_to_refspecs(local_db, file);
+                                // Resolution-surface fingerprint: the
+                                // resolve cache's per-file change gate.
+                                // Warmed here so the assemble pass's
+                                // dirty-set derivation is memo reads.
+                                let _ = resolution_surface_fp(local_db, file);
                                 // Owned per-file facts for the project-wide
                                 // plugin queries. Warmed here, while the AST
                                 // is live, so the queries below run as cache
@@ -495,6 +590,8 @@ pub(crate) fn build_project_graph(
         per_file_plugin_ids,
         counters,
         &reload_log,
+        cache,
+        scope,
     )?;
     let t_assemble_elapsed = t_assemble.elapsed();
     counters.finish_phase(PHASE_ASSEMBLE);
@@ -505,7 +602,8 @@ pub(crate) fn build_project_graph(
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
     let topic_facts = assembled.topic_facts;
-    let class_base_memo = assembled.class_base_memo;
+    let resolve_cache = assembled.resolve_cache;
+    let resolve_stats = assembled.resolve_stats;
     let assemble_dir_ids = assembled.dir_ids;
 
     counters.start_phase(PHASE_FQNAME, Some(builder.nodes.len()));
@@ -527,16 +625,18 @@ pub(crate) fn build_project_graph(
         db,
         &project_files,
         &class_by_selection,
-        &class_base_memo,
+        &resolve_cache.class_base_memo,
         &assemble_dir_ids,
     );
     let t_hierarchy_elapsed = t_hierarchy.elapsed();
     if timing {
         eprintln!(
-            "[dead-cst-timing] files={} nodes={} edges={} enum={:?} populate={:?} assemble={:?} class_hier={:?} fqname={:?} total={:?} rss={}MB",
+            "[dead-cst-timing] files={} nodes={} edges={} resolved={} reused={} enum={:?} populate={:?} assemble={:?} class_hier={:?} fqname={:?} total={:?} rss={}MB",
             project_files.len(),
             builder.nodes.len(),
             builder.edges.len(),
+            resolve_stats.0,
+            resolve_stats.1,
             t_enum,
             t_populate_elapsed,
             t_assemble_elapsed,
@@ -583,6 +683,8 @@ pub(crate) fn build_project_graph(
         children_by_parent,
         topic_facts,
         reload_log,
+        resolve_cache,
+        resolve_stats,
     })
 }
 
@@ -614,9 +716,12 @@ struct AssembledGraph {
     class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
     topic_facts: FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>>,
-    /// Resolved class-base memo + the per-file anchor-dir ids that key
-    /// it, for the post-assembly class-hierarchy scatter.
-    class_base_memo: ClassBaseMemo,
+    /// The updated cross-build resolution memo (its class-base memo +
+    /// the per-file anchor-dir ids also feed the post-assembly
+    /// class-hierarchy scatter).
+    resolve_cache: ResolveCache,
+    /// `(resolved, reused)` cross-file resolution counts.
+    resolve_stats: (usize, usize),
     dir_ids: Vec<u32>,
 }
 
@@ -664,6 +769,8 @@ fn assemble_graph<'db>(
     per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
     counters: &Arc<ProgressCounters>,
     reload_log: &ReloadLog,
+    cache: ResolveCache,
+    scope: Option<Vec<File>>,
 ) -> PyResult<AssembledGraph> {
     // Pass 1: node mint.
     //
@@ -807,6 +914,45 @@ fn assemble_graph<'db>(
         dir_ids.push(id);
     }
 
+    // Incremental gate: per-file resolution-surface fingerprints
+    // (salsa-tracked — warmed in the populate fan-out, so this loop is
+    // memo reads) plus the *effectively dirty* file set. `Some(dirty)`
+    // means the resolve arm may reuse every cached entry whose read
+    // set avoids dirty files; `None` means resolve everything (first
+    // build, an out-of-scope event batch, or a changed file list).
+    // See [`ResolveCache`] for the full gating contract.
+    let new_fps: Vec<u64> = project_files
+        .iter()
+        .map(|&f| resolution_surface_fp(db, f))
+        .collect();
+    let ordinal_of: FxHashMap<File, usize> = project_files
+        .iter()
+        .enumerate()
+        .map(|(i, &f)| (f, i))
+        .collect();
+    let dirty_files: Option<Vec<bool>> = match &scope {
+        Some(scope_files) if cache.valid && cache.files.as_slice() == project_files => {
+            let mut dirty: Vec<bool> = (0..project_files.len())
+                .map(|pos| new_fps[pos] != cache.surface_fp[pos])
+                .collect();
+            let mut in_scope = true;
+            for f in scope_files {
+                match ordinal_of.get(f) {
+                    Some(&pos) => dirty[pos] = true,
+                    // A scoped file that's no longer in the project
+                    // contradicts the stable-file-list gate — bail to
+                    // the full path.
+                    None => {
+                        in_scope = false;
+                        break;
+                    }
+                }
+            }
+            in_scope.then_some(dirty)
+        }
+        _ => None,
+    };
+
     // Snapshot pool for the resolve fan-out, cloned here on the main
     // thread (a salsa clone must not race a worker mid-query — the
     // populate fan-out documents the same hazard). A recycled pool
@@ -833,13 +979,24 @@ fn assemble_graph<'db>(
     }
 
     /// Everything the resolve arm hands back across the pass-1 join.
-    /// All `'static` row data — no payload borrows escape the arm.
+    /// All `'static` row data — no payload borrows escape the arm. The
+    /// id-indexed result vecs are *complete*: on an incremental build
+    /// they are the previous build's vecs with the dirty / new entries
+    /// overwritten in place, so every downstream pass (external mint,
+    /// memo-slot translation, stamping) is identical for the full and
+    /// incremental paths.
     struct ResolveOutputs {
-        member_results: Vec<crate::refspec::ResolvedMember>,
-        dynamic_results: Vec<SmallVec<[ResolvedNode; 4]>>,
+        member_keys: FxHashMap<(MemberRef, u32), u32>,
+        member_results: Vec<(crate::refspec::ResolvedMember, Touched)>,
+        dynamic_keys: FxHashMap<(DynamicRef, u32), u32>,
+        dynamic_results: Vec<(SmallVec<[ResolvedNode; 4]>, Touched)>,
         parent_results: Vec<Option<File>>,
         spec_ids: Vec<Box<[u32]>>,
         class_base_memo: ClassBaseMemo,
+        class_touched: FxHashMap<(CompactString, CompactString, u32), Touched>,
+        /// `(resolved, reused)` across the member / dynamic / class
+        /// resolution families.
+        stats: (usize, usize),
         gather_time: std::time::Duration,
         resolve_time: std::time::Duration,
     }
@@ -853,6 +1010,8 @@ fn assemble_graph<'db>(
     let dir_ids_ref = &dir_ids;
     let dir_anchors_ref = &dir_anchors;
     let mints_for_arm = &mints;
+    let dirty_ref = &dirty_files;
+    let ordinal_of_ref = &ordinal_of;
     let resolve_arm = move || -> ResolveOutputs {
         // Gather: intern every `Member` / `Dynamic` spec row, exactly
         // once, into a dense id (`spec_ids[pos][i]` parallels
@@ -866,52 +1025,193 @@ fn assemble_graph<'db>(
         // itself. Hot imports repeated across a directory (or
         // project-wide, one entry per directory) resolve once, not
         // once per use site.
+        //
+        // Incremental builds (`dirty = Some`) skip the gather for
+        // clean files entirely — their cached id rows are reused — and
+        // hash only the dirty files' rows, interning against the
+        // *retained* key maps so existing memo entries keep their ids.
         let t_gather = std::time::Instant::now();
         const LOCAL_SPEC: u32 = u32::MAX;
-        let mut member_keys: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
-        let mut member_work: Vec<(File, &MemberRef)> = Vec::new();
-        let mut dynamic_keys: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
-        let mut dynamic_work: Vec<(File, &DynamicRef)> = Vec::new();
-        let mut spec_ids: Vec<Box<[u32]>> = Vec::with_capacity(spec_payloads_ref.len());
-        for (pos, payload) in spec_payloads_ref.iter().enumerate() {
-            let dir = dir_ids_ref[pos];
-            let anchor = dir_anchors_ref[dir as usize];
-            let mut ids: Vec<u32> = Vec::with_capacity(payload.specs.len());
-            for spec in payload.specs.iter() {
-                let id = match &spec.target {
-                    Target::Local(_) => LOCAL_SPEC,
-                    Target::Member(m) => *member_keys.entry((m, dir)).or_insert_with(|| {
-                        member_work.push((anchor, m));
-                        (member_work.len() - 1) as u32
-                    }),
-                    Target::Dynamic(d) => *dynamic_keys.entry((d, dir)).or_insert_with(|| {
-                        dynamic_work.push((anchor, d));
-                        (dynamic_work.len() - 1) as u32
-                    }),
-                };
-                ids.push(id);
-            }
-            spec_ids.push(ids.into_boxed_slice());
-        }
-        drop(member_keys);
-        drop(dynamic_keys);
+        let ResolveCache {
+            mut member_keys,
+            mut member_results,
+            mut dynamic_keys,
+            mut dynamic_results,
+            mut class_base_memo,
+            mut class_touched,
+            spec_ids: mut cached_spec_ids,
+            ..
+        } = cache;
 
-        // Class-base member gather: the unique `(module, name, dir)`
-        // rows the post-assembly class-hierarchy fan-in needs resolved.
-        let mut class_keys: FxHashMap<(&str, &str, u32), u32> = FxHashMap::default();
-        let mut class_work: Vec<(File, &str, &str)> = Vec::new();
-        for (pos, mint) in mints_for_arm.iter().enumerate() {
-            let dir = dir_ids_ref[pos];
-            let anchor = dir_anchors_ref[dir as usize];
-            for (_cls_rk, bases) in &mint.payload.class_bases {
-                for base in bases.iter() {
-                    if let ClassBaseSpec::ModuleMember { module, name } = base {
-                        class_keys
-                            .entry((module.as_str(), name.as_str(), dir))
-                            .or_insert_with(|| {
-                                class_work.push((anchor, module.as_str(), name.as_str()));
-                                (class_work.len() - 1) as u32
-                            });
+        let mut spec_ids: Vec<Box<[u32]>> = Vec::with_capacity(spec_payloads_ref.len());
+        // Ids needing a (re-)resolve this build, with the owned key +
+        // anchor the resolver wants. Indexed scatter: results land at
+        // `member_results[id]`, so work order is irrelevant.
+        let mut member_work: Vec<(u32, MemberRef, File)> = Vec::new();
+        let mut dynamic_work: Vec<(u32, DynamicRef, File)> = Vec::new();
+
+        match dirty_ref {
+            None => {
+                // Full resolve: drop any retained state and run the
+                // borrowed-key gather (zero clones per row; one owned
+                // clone per *unique* key at the end).
+                member_keys.clear();
+                member_results.clear();
+                dynamic_keys.clear();
+                dynamic_results.clear();
+                class_base_memo.clear();
+                class_touched.clear();
+                let mut bmember: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
+                let mut bdynamic: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
+                for (pos, payload) in spec_payloads_ref.iter().enumerate() {
+                    let dir = dir_ids_ref[pos];
+                    let anchor = dir_anchors_ref[dir as usize];
+                    let mut ids: Vec<u32> = Vec::with_capacity(payload.specs.len());
+                    for spec in payload.specs.iter() {
+                        let id = match &spec.target {
+                            Target::Local(_) => LOCAL_SPEC,
+                            Target::Member(m) => *bmember.entry((m, dir)).or_insert_with(|| {
+                                let id = member_work.len() as u32;
+                                member_work.push((id, m.clone(), anchor));
+                                id
+                            }),
+                            Target::Dynamic(d) => *bdynamic.entry((d, dir)).or_insert_with(|| {
+                                let id = dynamic_work.len() as u32;
+                                dynamic_work.push((id, d.clone(), anchor));
+                                id
+                            }),
+                        };
+                        ids.push(id);
+                    }
+                    spec_ids.push(ids.into_boxed_slice());
+                }
+                member_keys.reserve(bmember.len());
+                for ((m, dir), id) in bmember {
+                    member_keys.insert((m.clone(), dir), id);
+                }
+                dynamic_keys.reserve(bdynamic.len());
+                for ((d, dir), id) in bdynamic {
+                    dynamic_keys.insert((d.clone(), dir), id);
+                }
+                member_results.resize_with(member_work.len(), Default::default);
+                dynamic_results.resize_with(dynamic_work.len(), Default::default);
+            }
+            Some(dirty) => {
+                // Incremental: a retained entry re-resolves iff its
+                // read set touches an effectively-dirty file (files
+                // outside the project can't change under the
+                // content-only scope gate and count as clean).
+                let file_dirty = |f: &File| ordinal_of_ref.get(f).is_some_and(|&pos| dirty[pos]);
+                let mut member_redo: Vec<bool> = vec![false; member_results.len()];
+                for (id, (_res, touched)) in member_results.iter().enumerate() {
+                    if touched.0.iter().any(&file_dirty) {
+                        member_redo[id] = true;
+                    }
+                }
+                let mut dynamic_redo: Vec<bool> = vec![false; dynamic_results.len()];
+                for (id, (_res, touched)) in dynamic_results.iter().enumerate() {
+                    if touched.0.iter().any(&file_dirty) {
+                        dynamic_redo[id] = true;
+                    }
+                }
+                // Recover the (key, anchor) for read-set-dirty ids
+                // with one scan over the retained key maps (the only
+                // id → key mapping kept).
+                for ((m, dir), &id) in &member_keys {
+                    if member_redo[id as usize] {
+                        member_work.push((id, m.clone(), dir_anchors_ref[*dir as usize]));
+                    }
+                }
+                for ((d, dir), &id) in &dynamic_keys {
+                    if dynamic_redo[id as usize] {
+                        dynamic_work.push((id, d.clone(), dir_anchors_ref[*dir as usize]));
+                    }
+                }
+                // Row gather: clean files reuse their cached id rows
+                // verbatim; dirty files re-hash their rows. A
+                // per-build borrowed probe map keeps the owned-key
+                // probes (which clone) to one per unique (ref, dir).
+                let mut seen_member: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
+                let mut seen_dynamic: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
+                for (pos, payload) in spec_payloads_ref.iter().enumerate() {
+                    if !dirty[pos] {
+                        spec_ids.push(std::mem::take(&mut cached_spec_ids[pos]));
+                        continue;
+                    }
+                    let dir = dir_ids_ref[pos];
+                    let anchor = dir_anchors_ref[dir as usize];
+                    let mut ids: Vec<u32> = Vec::with_capacity(payload.specs.len());
+                    for spec in payload.specs.iter() {
+                        let id =
+                            match &spec.target {
+                                Target::Local(_) => LOCAL_SPEC,
+                                Target::Member(m) => *seen_member.entry((m, dir)).or_insert_with(
+                                    || match member_keys.get(&(m.clone(), dir)) {
+                                        Some(&id) => id,
+                                        None => {
+                                            let id = member_results.len() as u32;
+                                            member_keys.insert((m.clone(), dir), id);
+                                            member_results.push(Default::default());
+                                            member_work.push((id, m.clone(), anchor));
+                                            id
+                                        }
+                                    },
+                                ),
+                                Target::Dynamic(d) => {
+                                    *seen_dynamic.entry((d, dir)).or_insert_with(|| {
+                                        match dynamic_keys.get(&(d.clone(), dir)) {
+                                            Some(&id) => id,
+                                            None => {
+                                                let id = dynamic_results.len() as u32;
+                                                dynamic_keys.insert((d.clone(), dir), id);
+                                                dynamic_results.push(Default::default());
+                                                dynamic_work.push((id, d.clone(), anchor));
+                                                id
+                                            }
+                                        }
+                                    })
+                                }
+                            };
+                        ids.push(id);
+                    }
+                    spec_ids.push(ids.into_boxed_slice());
+                }
+            }
+        }
+
+        // Class-base member gather: every build scans all payloads'
+        // class_bases (cheap — per class, not per use site) and
+        // resolves the keys that are missing from the memo or whose
+        // read set touches a dirty file.
+        let mut class_work: Vec<(CompactString, CompactString, u32, File)> = Vec::new();
+        let mut class_reused: usize = 0;
+        {
+            let mut seen_class: FxHashSet<(&str, &str, u32)> = FxHashSet::default();
+            let file_dirty = |f: &File| match dirty_ref {
+                Some(dirty) => ordinal_of_ref.get(f).is_some_and(|&pos| dirty[pos]),
+                None => true,
+            };
+            for (pos, mint) in mints_for_arm.iter().enumerate() {
+                let dir = dir_ids_ref[pos];
+                let anchor = dir_anchors_ref[dir as usize];
+                for (_cls_rk, bases) in &mint.payload.class_bases {
+                    for base in bases.iter() {
+                        let ClassBaseSpec::ModuleMember { module, name } = base else {
+                            continue;
+                        };
+                        if !seen_class.insert((module.as_str(), name.as_str(), dir)) {
+                            continue;
+                        }
+                        let key = (module.clone(), name.clone(), dir);
+                        let redo = match class_touched.get(&key) {
+                            Some(touched) => touched.0.iter().any(&file_dirty),
+                            None => true,
+                        };
+                        if redo {
+                            class_work.push((key.0, key.1, dir, anchor));
+                        } else {
+                            class_reused += 1;
+                        }
                     }
                 }
             }
@@ -919,44 +1219,59 @@ fn assemble_graph<'db>(
         let gather_time = t_gather.elapsed();
 
         let t_resolve = std::time::Instant::now();
-        let member_results: Vec<crate::refspec::ResolvedMember> =
-            run_job(&pool, &member_work, |ldb, &(anchor, m)| {
-                resolve_member(ldb, anchor, m)
+        let resolved = member_work.len() + dynamic_work.len() + class_work.len();
+        // Retained-and-clean entry count: the id-indexed vecs already
+        // include this build's new placeholder slots, so subtracting
+        // the work lists leaves exactly the reused entries.
+        let reused = (member_results.len() - member_work.len())
+            + (dynamic_results.len() - dynamic_work.len())
+            + class_reused;
+        let member_done: Vec<(u32, crate::refspec::ResolvedMember, Touched)> =
+            run_job(&pool, &member_work, |ldb, (id, m, anchor)| {
+                let mut touched = Touched::default();
+                let res = resolve_member(ldb, *anchor, m, &mut touched);
+                (*id, res, touched)
             });
-        let dynamic_results: Vec<SmallVec<[ResolvedNode; 4]>> =
-            run_job(&pool, &dynamic_work, |ldb, &(anchor, d)| {
-                resolve_dynamic(ldb, anchor, d)
+        for (id, res, touched) in member_done {
+            member_results[id as usize] = (res, touched);
+        }
+        let dynamic_done: Vec<(u32, SmallVec<[ResolvedNode; 4]>, Touched)> =
+            run_job(&pool, &dynamic_work, |ldb, (id, d, anchor)| {
+                let mut touched = Touched::default();
+                let res = resolve_dynamic(ldb, *anchor, d, &mut touched);
+                (*id, res, touched)
             });
+        for (id, res, touched) in dynamic_done {
+            dynamic_results[id as usize] = (res, touched);
+        }
         let parent_results: Vec<Option<File>> = run_job(&pool, project_files, |ldb, &file| {
             parent_module_file(ldb, file)
         });
-        let class_results: Vec<Option<(File, TextRange)>> =
-            run_job(&pool, &class_work, |ldb, &(anchor, module, name)| {
-                resolve_member_def(ldb, module, name, anchor, 0, reload_log)
+        let class_done: Vec<(Option<(File, TextRange)>, Touched)> =
+            run_job(&pool, &class_work, |ldb, (module, name, _dir, anchor)| {
+                let mut touched = Touched::default();
+                let res =
+                    resolve_member_def(ldb, module, name, *anchor, 0, reload_log, &mut touched);
+                (res, touched)
             });
-
-        // Owned `(module, name, dir)` → resolved-base memo for the
-        // post-assembly class-hierarchy fan-in (scatter-only; the
-        // resolves just ran, overlapped with the node fill).
-        let mut class_base_memo: ClassBaseMemo =
-            FxHashMap::with_capacity_and_hasher(class_work.len(), Default::default());
-        for ((module, name, dir), id) in &class_keys {
-            class_base_memo.insert(
-                (
-                    CompactString::from(*module),
-                    CompactString::from(*name),
-                    *dir,
-                ),
-                class_results[*id as usize],
-            );
+        for ((res, touched), (module, name, dir, _anchor)) in
+            class_done.into_iter().zip(&class_work)
+        {
+            let key = (module.clone(), name.clone(), *dir);
+            class_base_memo.insert(key.clone(), res);
+            class_touched.insert(key, touched);
         }
 
         ResolveOutputs {
+            member_keys,
             member_results,
+            dynamic_keys,
             dynamic_results,
             parent_results,
             spec_ids,
             class_base_memo,
+            class_touched,
+            stats: (resolved, reused),
             gather_time,
             resolve_time: t_resolve.elapsed(),
         }
@@ -1121,11 +1436,15 @@ fn assemble_graph<'db>(
     fill_result?;
 
     let ResolveOutputs {
+        member_keys,
         member_results,
+        dynamic_keys,
         dynamic_results,
         parent_results,
         spec_ids,
         class_base_memo,
+        class_touched,
+        stats: resolve_stats,
         gather_time,
         resolve_time,
     } = resolve_outputs;
@@ -1161,8 +1480,10 @@ fn assemble_graph<'db>(
     // the pre-minted nodes.
     {
         let mut externals: Vec<(&str, String, File)> = Vec::new();
-        let member_nodes = member_results.iter().flat_map(|res| res.targets.iter());
-        let dynamic_nodes = dynamic_results.iter().flatten();
+        let member_nodes = member_results
+            .iter()
+            .flat_map(|(res, _)| res.targets.iter());
+        let dynamic_nodes = dynamic_results.iter().flat_map(|(res, _)| res.iter());
         for node in member_nodes.chain(dynamic_nodes) {
             if let ResolvedNode::External { fqname, file } = node {
                 externals.push((fqname.as_str(), file_path_string(db, *file), *file));
@@ -1182,7 +1503,7 @@ fn assemble_graph<'db>(
         start_file: Option<File>,
     }
     let mut member_slots: Vec<MemberSlot> = Vec::with_capacity(member_results.len());
-    for res in &member_results {
+    for (res, _touched) in &member_results {
         let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
         for node in &res.targets {
             if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
@@ -1196,7 +1517,7 @@ fn assemble_graph<'db>(
         });
     }
     let mut dynamic_slots: Vec<SmallVec<[usize; 4]>> = Vec::with_capacity(dynamic_results.len());
-    for nodes in &dynamic_results {
+    for (nodes, _touched) in &dynamic_results {
         let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
         for node in nodes {
             if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
@@ -1405,7 +1726,19 @@ fn assemble_graph<'db>(
         class_by_selection,
         decl_by_name_range,
         topic_facts,
-        class_base_memo,
+        resolve_cache: ResolveCache {
+            valid: true,
+            files: project_files.to_vec(),
+            surface_fp: new_fps,
+            spec_ids,
+            member_keys,
+            member_results,
+            dynamic_keys,
+            dynamic_results,
+            class_base_memo,
+            class_touched,
+        },
+        resolve_stats,
         dir_ids,
     })
 }
@@ -2104,6 +2437,16 @@ pub(crate) struct ProjectContext {
     /// `facts_for_topic` getters; not serialized (facts are an in-memory
     /// build-time channel, not graph-file content).
     pub(crate) topic_registry: TopicRegistry,
+    /// Accumulated change scope since the last completed
+    /// ``materialize``: ``Some(files)`` while every applied event has
+    /// been a content-only ``Changed`` naming a known project file (the
+    /// precondition for [`ResolveCache`] reuse); ``None`` once any
+    /// out-of-scope event (``Created`` / ``Deleted`` / ``Rescan``, or an
+    /// unknown path) arrives, which makes the next build resolve
+    /// everything. Reset to ``Some(vec![])`` after each successful
+    /// build; merged (never narrowed) by every ``apply_changes`` call in
+    /// between.
+    pub(crate) pending_scope: Option<Vec<File>>,
 }
 
 #[pymethods]
@@ -2142,6 +2485,7 @@ impl ProjectContext {
             node_flag_registry: FlagRegistry::with_node_builtins(),
             edge_flag_registry: FlagRegistry::with_edge_builtins(),
             topic_registry: TopicRegistry::new(),
+            pending_scope: Some(Vec::new()),
         })
     }
 
@@ -2296,6 +2640,36 @@ impl ProjectContext {
     /// ``re_materialize`` skip the rebuild entirely.
     pub(crate) fn apply_changes(&mut self, events: Vec<Py<ChangeEvent>>, py: Python<'_>) -> bool {
         use salsa::plumbing::ZalsaDatabase as _;
+        // Fold the batch into the pending incremental scope. A batch
+        // is in scope iff every event is a content-only `Changed`
+        // naming a file the previous build knows; anything else makes
+        // the next materialize resolve everything (module → file
+        // resolution can flip under file-set / config changes, which
+        // per-resolution read sets deliberately don't model).
+        let batch_scope: Option<Vec<File>> = {
+            let guard = self.outputs.read();
+            guard.as_ref().and_then(|outputs| {
+                events
+                    .iter()
+                    .map(|e| {
+                        let ev = e.borrow(py);
+                        if !matches!(ev.kind, ChangeEventKind::Changed) {
+                            return None;
+                        }
+                        ev.path
+                            .as_ref()
+                            .and_then(|p| outputs.path_to_file.get(&p.to_string()).copied())
+                    })
+                    .collect::<Option<Vec<File>>>()
+            })
+        };
+        self.pending_scope = match (self.pending_scope.take(), batch_scope) {
+            (Some(mut acc), Some(batch)) => {
+                acc.extend(batch);
+                Some(acc)
+            }
+            _ => None,
+        };
         let ty_events: Vec<TyChangeEvent> =
             events.iter().map(|e| e.borrow(py).to_ty_event()).collect();
         let before = self.db.zalsa().current_revision();
@@ -2344,6 +2718,16 @@ impl ProjectContext {
         self.progress = Arc::new(ProgressCounters::new());
     }
 
+    /// ``(resolved, reused)`` cross-file resolution counts from the
+    /// most recent build — the observability hook for the
+    /// [`ResolveCache`]'s incremental reuse (a full build reports
+    /// ``reused == 0``; an incremental rebuild after a small content
+    /// edit should report ``resolved`` close to the edit's blast
+    /// radius). Diagnostic only — not part of the supported surface.
+    pub(crate) fn _last_resolve_counts(&self) -> PyResult<(usize, usize)> {
+        Ok(self.materialized("_last_resolve_counts")?.resolve_stats)
+    }
+
     /// Build the project-wide graph, run every registered plugin, then
     /// snapshot the final state.
     ///
@@ -2367,6 +2751,19 @@ impl ProjectContext {
         let build_result = {
             let mut this = slf.borrow_mut(py);
             let per_file_ids = extract_per_file_plugin_ids(py, &this.plugins);
+            // Hand the previous build's resolve cache + the
+            // accumulated change scope to the new build. The cache
+            // moves out (the old outputs keep an invalid Default);
+            // taking the scope leaves `None`, so a failed build can't
+            // under-scope the retry — the post-build reset below only
+            // runs on success.
+            let scope = this.pending_scope.take();
+            let cache = this
+                .outputs
+                .write()
+                .as_mut()
+                .map(|o| std::mem::take(&mut o.resolve_cache))
+                .unwrap_or_default();
             build_project_graph(
                 py,
                 &mut this.db,
@@ -2374,6 +2771,8 @@ impl ProjectContext {
                 stack_size,
                 &counters,
                 &per_file_ids,
+                cache,
+                scope,
             )
         };
         let outputs = match build_result {
@@ -2401,6 +2800,10 @@ impl ProjectContext {
                 .name("dead-cst-drop-outputs".into())
                 .spawn(move || drop(old));
         }
+        // The build completed: the new outputs (and their resolve
+        // cache) reflect every change applied so far, so the next
+        // incremental scope starts empty.
+        slf.borrow_mut(py).pending_scope = Some(Vec::new());
 
         // Project-wide plugin pass — fan out across a GIL-free
         // ``rayon`` scope, one task per plugin, mirroring the per-file

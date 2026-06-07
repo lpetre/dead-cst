@@ -624,6 +624,16 @@ class ProjectContext:
         """
         ...
 
+    def _last_resolve_counts(self) -> tuple[int, int]:
+        """``(resolved, reused)`` cross-file resolution counts from the
+        most recent build — the observability hook for the resolve
+        cache's incremental reuse (a full build reports ``reused == 0``;
+        a ``re_materialize`` after a small content-only edit should
+        report ``resolved`` close to the edit's blast radius).
+        Diagnostic only — not part of the supported surface.
+        """
+        ...
+
     def materialize(self) -> NativeGraph:
         """Build the project-wide graph, run every registered plugin,
         then snapshot the final state.

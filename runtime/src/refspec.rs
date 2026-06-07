@@ -106,6 +106,42 @@ pub(crate) struct DynamicRef {
     pub(crate) fromlist: Vec<CompactString>,
 }
 
+/// Files whose *content* a resolution read on its way to an answer —
+/// every `file_to_nodes` payload load, including star-reexport chain
+/// hops and member lookups that missed. Module resolution itself is
+/// deliberately *not* recorded: it's path-set-based, and the resolve
+/// cache that consumes this record is only reused for content-only
+/// (`Changed`) event batches, under which the module → file mapping is
+/// invariant. The record is the eviction key for
+/// [`crate::project::ResolveCache`]: a memoized resolution re-runs iff
+/// a file in its read set effectively changed (the standard
+/// incremental-replay argument — a computation whose entire read set
+/// is unchanged replays identically). Targets need no tracking at
+/// all: results are stored in symbolic (`File` / `DeclKey`) terms and
+/// re-translated against each build's fresh `ref_to_global`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Touched(pub(crate) SmallVec<[File; 4]>);
+
+impl Touched {
+    pub(crate) fn record(&mut self, file: File) {
+        if !self.0.contains(&file) {
+            self.0.push(file);
+        }
+    }
+}
+
+/// Load a file's payload for resolution, recording the content read.
+/// Every `file_to_nodes` access inside this module funnels through
+/// here so the [`Touched`] record is complete by construction.
+fn nodes_payload<'db>(
+    db: &'db dyn ProjectDb,
+    file: File,
+    touched: &mut Touched,
+) -> &'db crate::file_payload::FileNodes {
+    touched.record(file);
+    file_to_nodes(db, file)
+}
+
 /// A resolved cross-file target, in `'static` terms, so resolution can
 /// run on rayon workers against per-worker db snapshots and hand
 /// results back to the main thread.
@@ -157,10 +193,11 @@ pub(crate) fn resolve_member(
     db: &dyn ProjectDb,
     anchor: File,
     member: &MemberRef,
+    touched: &mut Touched,
 ) -> ResolvedMember {
     match member.role {
-        MemberRole::Binding => resolve_binding(db, anchor, &member.spec),
-        MemberRole::Use => resolve_use(db, anchor, member),
+        MemberRole::Binding => resolve_binding(db, anchor, &member.spec, touched),
+        MemberRole::Use => resolve_use(db, anchor, member, touched),
     }
 }
 
@@ -168,7 +205,12 @@ pub(crate) fn resolve_member(
 /// resolution. Emits `Module(target)` + (for from-imports) the decl
 /// reached through [`walk_exports_chain`]; classifies stdlib (silent),
 /// site-packages (External), and unresolved (flag) targets.
-fn resolve_binding(db: &dyn ProjectDb, anchor: File, spec: &ImportPayload) -> ResolvedMember {
+fn resolve_binding(
+    db: &dyn ProjectDb,
+    anchor: File,
+    spec: &ImportPayload,
+    touched: &mut Touched,
+) -> ResolvedMember {
     let mut out = ResolvedMember::default();
     if spec.module.is_empty() {
         return out;
@@ -189,7 +231,11 @@ fn resolve_binding(db: &dyn ProjectDb, anchor: File, spec: &ImportPayload) -> Re
                 let namespace_has_decl = ModuleName::new(&spec.module)
                     .and_then(|mn| resolve_module(db, anchor, &mn))
                     .and_then(|m| m.file(db))
-                    .map(|f| file_to_nodes(db, f).exports_by_name.contains_key(decl))
+                    .map(|f| {
+                        nodes_payload(db, f, touched)
+                            .exports_by_name
+                            .contains_key(decl)
+                    })
                     .unwrap_or(false);
                 if namespace_has_decl {
                     (spec.module.clone(), Some(decl.clone()))
@@ -259,7 +305,7 @@ fn resolve_binding(db: &dyn ProjectDb, anchor: File, spec: &ImportPayload) -> Re
     // memoizes each file's payload on the way through, so the
     // chain walk is hashmap lookups + a `seen` set.
     if let Some(decl_name) = decl_name {
-        for target_ref in walk_exports_chain(db, target_file, &decl_name) {
+        for target_ref in walk_exports_chain(db, target_file, &decl_name, touched) {
             out.targets.push(ResolvedNode::from_node_ref(target_ref));
         }
     }
@@ -271,7 +317,12 @@ fn resolve_binding(db: &dyn ProjectDb, anchor: File, spec: &ImportPayload) -> Re
 /// module reached plus any terminal decl — *without* skipping past
 /// star-reexport aliases (the use side keeps the intermediary star
 /// import alive; see [`MemberRole`]).
-fn resolve_use(db: &dyn ProjectDb, anchor: File, member: &MemberRef) -> ResolvedMember {
+fn resolve_use(
+    db: &dyn ProjectDb,
+    anchor: File,
+    member: &MemberRef,
+    touched: &mut Touched,
+) -> ResolvedMember {
     let mut out = ResolvedMember::default();
     let spec = &member.spec;
     let bound_name = member.bound_name.as_str();
@@ -376,7 +427,7 @@ fn resolve_use(db: &dyn ProjectDb, anchor: File, member: &MemberRef) -> Resolved
     // alias itself.
     if let Some(decl_name) = decl_tail {
         out.targets.push(ResolvedNode::Module(start_file));
-        let target_nodes = file_to_nodes(db, start_file);
+        let target_nodes = nodes_payload(db, start_file, touched);
         if let Some(locals) = target_nodes.exports_by_name.get(&decl_name) {
             for &local_idx in locals {
                 out.targets.push(ResolvedNode::from_node_ref(
@@ -404,7 +455,7 @@ fn resolve_use(db: &dyn ProjectDb, anchor: File, member: &MemberRef) -> Resolved
             continue;
         }
         // Not a submodule — check for decl in current_file's exports.
-        let target_nodes = file_to_nodes(db, current_file);
+        let target_nodes = nodes_payload(db, current_file, touched);
         if let Some(locals) = target_nodes.exports_by_name.get(*seg) {
             for &local_idx in locals {
                 terminal_decl_refs.push(ResolvedNode::from_node_ref(
@@ -427,6 +478,7 @@ pub(crate) fn resolve_dynamic(
     db: &dyn ProjectDb,
     anchor: File,
     dynamic: &DynamicRef,
+    touched: &mut Touched,
 ) -> SmallVec<[ResolvedNode; 4]> {
     let mut out: SmallVec<[ResolvedNode; 4]> = SmallVec::new();
     resolve_module_target(db, anchor, &dynamic.target, &mut out);
@@ -445,7 +497,7 @@ pub(crate) fn resolve_dynamic(
             .and_then(|n| resolve_module(db, anchor, &n))
             .and_then(|m| m.file(db));
         if let Some(target_file) = target_file {
-            let target_nodes = file_to_nodes(db, target_file);
+            let target_nodes = nodes_payload(db, target_file, touched);
             if let Some(locals) = target_nodes.exports_by_name.get(entry.as_str()) {
                 for &local_idx in locals {
                     out.push(ResolvedNode::from_node_ref(

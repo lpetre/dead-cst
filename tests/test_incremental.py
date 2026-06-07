@@ -312,3 +312,312 @@ def test_re_materialize_zero_change_skips_rebuild(tmp_path):
     assert ctx2 is ctx1
     assert _edges(ctx2) == edges_before
     _assert_matches_fresh(analysis, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Incremental resolve-cache scenarios.
+#
+# ``re_materialize`` with explicit content-only ``Changed`` events takes
+# the incremental resolve path: everything global is refolded from the
+# per-file parts, but cross-file resolutions whose read set avoids the
+# effectively-changed file set are reused from the previous build. Each
+# scenario asserts the rebuilt graph matches a fresh ground-truth build
+# (edges, node keys + flags, dead set) — the refold makes the output
+# bit-identical by construction, so the comparison is exact.
+# ---------------------------------------------------------------------------
+
+
+def _node_flags(ctx) -> list[tuple[str, str, int, int]]:
+    keys = [(n.fqname, n.kind, n.start_line, int(n.flags)) for n in ctx.nodes()]
+    keys.sort()
+    return keys
+
+
+def _changed(tmp_path, *names):
+    return [native.ChangeEvent.changed(str(tmp_path / n)) for n in names]
+
+
+#: (initial tree, edits, files-to-signal) per incremental scenario.
+#: Edits are content-only — every scenario stays on the resolve-cache
+#: reuse path.
+_INCREMENTAL_SCENARIOS = {
+    "add_decl": (
+        {"a.py": "def f(): pass\n", "b.py": "from a import f\nf()\n"},
+        {"a.py": "def f(): pass\ndef g(): pass\n"},
+        ["a.py"],
+    ),
+    "remove_decl": (
+        {"a.py": "def f(): pass\ndef g(): pass\n", "b.py": "from a import f\nf()\n"},
+        {"a.py": "def f(): pass\n"},
+        ["a.py"],
+    ),
+    "rename_decl": (
+        {"a.py": "def f(): pass\n", "b.py": "from a import f\nf()\n"},
+        {"a.py": "def g(): pass\n"},
+        ["a.py"],
+    ),
+    "unresolved_becomes_resolved": (
+        {"a.py": "def other(): pass\n", "b.py": "from a import f\nf()\n"},
+        {"a.py": "def other(): pass\ndef f(): pass\n"},
+        ["a.py"],
+    ),
+    "decl_moves_lines": (
+        {"a.py": "def f(): pass\n", "b.py": "from a import f\nf()\n"},
+        {"a.py": "# pad\n# pad\n\ndef f(): pass\n"},
+        ["a.py"],
+    ),
+    "star_chain_origin_change": (
+        # c -> (star) b -> (star) a: editing the chain ORIGIN must
+        # re-resolve the unchanged consumer c's binding through the
+        # unchanged intermediary b. The reuse gate sees b as
+        # effectively changed via its salsa-recomputed resolution-
+        # surface fingerprint (b's payload derives from a's exports),
+        # not via any hand-built dependency walk.
+        {
+            "a.py": "def f(): pass\n",
+            "b.py": "from a import *\n",
+            "c.py": "from b import f\nf()\n",
+        },
+        {"a.py": "def f(): pass\ndef extra(): pass\n"},
+        ["a.py"],
+    ),
+    "star_origin_loses_name": (
+        {
+            "a.py": "def f(): pass\n",
+            "b.py": "from a import *\n",
+            "c.py": "from b import f\nf()\n",
+        },
+        {"a.py": "def other(): pass\n"},
+        ["a.py"],
+    ),
+    "import_added_to_changed_file": (
+        {"a.py": "def f(): pass\n", "b.py": "x = 1\n"},
+        {"b.py": "from a import f\nf()\n"},
+        ["b.py"],
+    ),
+    "shadowed_decl": (
+        {"a.py": "def f(): pass\ndef f(): pass\n", "b.py": "from a import f\nf()\n"},
+        {"a.py": "def f(): pass\ndef f(): pass\ndef f(): pass\n"},
+        ["a.py"],
+    ),
+    "multi_file_batch": (
+        {
+            "a.py": "def f(): pass\n",
+            "b.py": "from a import f\nf()\n",
+            "c.py": "import b\n",
+        },
+        {"a.py": "def f(): pass\ndef g(): pass\n", "c.py": "import b\nimport a\n"},
+        ["a.py", "c.py"],
+    ),
+    "package_init_change": (
+        {
+            "pkg/__init__.py": "x = 1\n",
+            "pkg/sub.py": "y = 2\n",
+            "main.py": "from pkg import sub\n",
+        },
+        {"pkg/__init__.py": "x = 1\nz = 3\n"},
+        ["pkg/__init__.py"],
+    ),
+    "class_base_change": (
+        {
+            "base.py": "class Base: pass\nclass Other: pass\n",
+            "kid.py": "from base import Base\nclass Kid(Base): pass\n",
+        },
+        {"base.py": "class Base: pass\nclass Other: pass\nclass Third: pass\n"},
+        ["base.py"],
+    ),
+    "class_base_alias_retarget": (
+        # `Alias = Base` rebinding to another class is invisible to the
+        # export *surface* (same name, same target range) — the event
+        # scope is what dirties the class-base read set here.
+        {
+            "base.py": "class A: pass\nclass B: pass\nAlias = A\n",
+            "kid.py": "from base import Alias\nclass Kid(Alias): pass\n",
+        },
+        {"base.py": "class A: pass\nclass B: pass\nAlias = B\n"},
+        ["base.py"],
+    ),
+    "dynamic_import_change": (
+        {
+            "a.py": "def f(): pass\n",
+            "b.py": "import importlib\nm = importlib.import_module('a')\n",
+        },
+        {"a.py": "def f(): pass\ndef g(): pass\n"},
+        ["a.py"],
+    ),
+    "pyi_twin_changed": (
+        # impl.py gains an export the stub also declares: the stub's
+        # stub-only ENTRYPOINT flag for that name must drop (the node
+        # fill re-derives it from the twin's fresh exports every pass).
+        {
+            "impl.py": "def f(): pass\n",
+            "impl.pyi": "def f() -> None: ...\ndef g() -> None: ...\n",
+            "use.py": "from impl import f\nf()\n",
+        },
+        {"impl.py": "def f(): pass\ndef g(): pass\n"},
+        ["impl.py"],
+    ),
+    "noqa_pin_toggles": (
+        {"a.py": "def f(): pass\n", "b.py": "from a import f  # noqa: F401\n"},
+        {"b.py": "from a import f\n"},
+        ["b.py"],
+    ),
+}
+
+
+@pytest.mark.parametrize("scenario", sorted(_INCREMENTAL_SCENARIOS))
+def test_incremental_resolve_matches_fresh(tmp_path, scenario):
+    initial, edits, signal = _INCREMENTAL_SCENARIOS[scenario]
+    for name, src in initial.items():
+        _write(tmp_path / name, src)
+    analysis = Analysis(tmp_path)
+    analysis.materialize_all()
+
+    for name, src in edits.items():
+        _write(tmp_path / name, src)
+    ctx = analysis.re_materialize(_changed(tmp_path, *signal))
+
+    _assert_matches_fresh(analysis, tmp_path)
+    fresh = _build_fresh(tmp_path)
+    assert _node_flags(ctx) == _node_flags(fresh.materialize_all())
+
+
+def test_incremental_resolve_reuses_clean_entries(tmp_path):
+    """The observability contract: a content edit scoped by explicit
+    ``Changed`` events re-resolves only entries whose read set touches
+    the effectively-changed files, and reuses the rest."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    for i in range(5):
+        _write(tmp_path / f"leaf{i}.py", "import json\nx = json.dumps\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+    resolved_full, reused_full = ctx._last_resolve_counts()
+    assert resolved_full > 0
+    assert reused_full == 0
+
+    # Edit a leaf: its rows re-gather, but every memo entry's read set
+    # avoids the changed file (stdlib imports read nothing), so nothing
+    # re-resolves.
+    _write(tmp_path / "leaf3.py", "import json\nx = json.dumps\ny = 1\n")
+    analysis.re_materialize(_changed(tmp_path, "leaf3.py"))
+    resolved, reused = ctx._last_resolve_counts()
+    assert resolved < resolved_full
+    assert reused > 0
+    _assert_matches_fresh(analysis, tmp_path)
+
+    # Edit the imported module: b's entries (read set touches a.py)
+    # re-resolve, the leaves' don't.
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    analysis.re_materialize(_changed(tmp_path, "a.py"))
+    resolved, reused = ctx._last_resolve_counts()
+    assert 0 < resolved < resolved_full
+    assert reused > 0
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_incremental_resolve_rescan_takes_full_path(tmp_path):
+    """A ``Rescan`` (or any non-``Changed`` event) cannot bound the
+    blast radius — module resolution may flip — so the next build
+    resolves everything (``reused == 0``) and is correct."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    analysis.re_materialize([native.ChangeEvent.rescan()])
+    _resolved, reused = ctx._last_resolve_counts()
+    assert reused == 0
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_incremental_resolve_created_file_takes_full_path(tmp_path):
+    """File-set changes invalidate the cache: a new file can shadow a
+    module name project-wide, which read sets don't model."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+
+    _write(tmp_path / "new.py", "from a import f\nf()\n")
+    analysis.re_materialize([native.ChangeEvent.created(str(tmp_path / "new.py"))])
+    _resolved, reused = ctx._last_resolve_counts()
+    assert reused == 0
+    _assert_matches_fresh(analysis, tmp_path)
+    assert any(n.fqname == "new" for n in ctx.nodes())
+
+
+def test_incremental_resolve_unknown_path_takes_full_path(tmp_path):
+    """A ``Changed`` naming a non-project path (config files) drops to
+    the full path rather than guessing."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    events = _changed(tmp_path, "a.py") + [native.ChangeEvent.changed(str(tmp_path / "x.toml"))]
+    analysis.re_materialize(events)
+    _resolved, reused = ctx._last_resolve_counts()
+    assert reused == 0
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_incremental_resolve_scope_accumulates_across_batches(tmp_path):
+    """Two ``apply_changes`` batches before one rebuild merge their
+    scopes — the rebuild sees both files as changed."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    _write(tmp_path / "c.py", "import b\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    assert ctx.apply_changes(_changed(tmp_path, "a.py")) is True
+    _write(tmp_path / "c.py", "import b\nimport a\n")
+    ctx2 = analysis.re_materialize(_changed(tmp_path, "c.py"))
+    assert ctx2 is ctx
+    _resolved, reused = ctx._last_resolve_counts()
+    assert reused > 0
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_incremental_resolve_with_plugins(tmp_path):
+    """The plugin pass refolds from scratch every build, so plugin
+    flags/edges track the incremental rebuild exactly."""
+    plugins = (native.NativePlugin.main_block(),)
+    _write(tmp_path / "a.py", "def f(): pass\n\nif __name__ == '__main__':\n    f()\n")
+    _write(tmp_path / "b.py", "from a import f\n")
+    analysis = Analysis(tmp_path, plugins=plugins)
+    analysis.materialize_all()
+
+    # Remove the main block: the old entrypoint flag must not survive.
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    ctx = analysis.re_materialize(_changed(tmp_path, "a.py"))
+    _assert_matches_fresh(analysis, tmp_path, plugins=plugins)
+    fresh = _build_fresh(tmp_path, plugins=plugins)
+    assert _node_flags(ctx) == _node_flags(fresh.materialize_all())
+
+    # And add one back in the other file.
+    _write(tmp_path / "b.py", "from a import f\n\nif __name__ == '__main__':\n    f()\n")
+    ctx = analysis.re_materialize(_changed(tmp_path, "b.py"))
+    _assert_matches_fresh(analysis, tmp_path, plugins=plugins)
+    fresh = _build_fresh(tmp_path, plugins=plugins)
+    assert _node_flags(ctx) == _node_flags(fresh.materialize_all())
+
+
+def test_incremental_resolve_repeated_edits(tmp_path):
+    """Three consecutive incremental rebuilds stay exact."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    _write(tmp_path / "b.py", "from a import f\nf()\n")
+    analysis = Analysis(tmp_path)
+    analysis.materialize_all()
+
+    for body in (
+        "def f(): pass\ndef g(): pass\n",
+        "def g(): pass\n",
+        "def f(): pass\n",
+    ):
+        _write(tmp_path / "a.py", body)
+        analysis.re_materialize(_changed(tmp_path, "a.py"))
+        _assert_matches_fresh(analysis, tmp_path)

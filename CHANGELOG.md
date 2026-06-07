@@ -11,6 +11,25 @@ two versions.
 
 ### Added
 
+- **Incremental cross-file resolution on `re_materialize`.** The assemble
+  pass now retains a per-`File` resolution memo across builds
+  (`ResolveCache`): every memoized member / dynamic / class-base resolution
+  records the set of files whose *content* it read, and a rebuild driven by
+  content-only `ChangeEvent.changed` batches re-resolves only the entries
+  whose read set touches an effectively-changed file — everything else is
+  reused. "Effectively changed" combines the event scope with a new
+  salsa-tracked per-file resolution-surface fingerprint, so `from X import *`
+  importers (whose payloads derive from X's exports) propagate dirtiness
+  through salsa itself, with no hand-built dependency walk. Everything global
+  — the node table, edge translation, fqname / class-hierarchy indices, the
+  plugin pass — is still refolded from the per-file parts on every build, so
+  the incremental output is bit-identical to a fresh build by construction.
+  `Created` / `Deleted` / `Rescan` events (or paths the project doesn't know)
+  invalidate the cache and resolve everything, exactly as before. The
+  diagnostic `ProjectContext._last_resolve_counts()` reports `(resolved,
+  reused)` for the most recent build; `DEAD_CST_TIMING=1` prints the same
+  counts.
+
 - **Topic/fact channel for native plugins.** A per-file native plugin can
   now hand structured facts up to its project-wide reader. A plugin declares
   topics with `ExternalPlugin::declare_topics() -> Vec<TopicSpec>` (same

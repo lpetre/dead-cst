@@ -30,6 +30,12 @@ swaps would otherwise cost a full re-parse; here, ty's Salsa database
 already gives us incremental re-analysis. Don't reintroduce a
 parallel `VisitorPayload`-style cache, a per-file pickled blob, or
 any other "snapshot the visitor output" layer. Trust the Salsa db.
+The one sanctioned exception is `ResolveCache` (`project.rs`): the
+assemble pass's cross-file resolutions run on plain salsa snapshots
+off the tracked-query graph, so salsa cannot memoize them — the cache
+retains their results across builds, gated by recorded read sets plus
+the salsa-tracked `resolution_surface_fp`. Anything salsa *can* track
+must stay a tracked query, not a cache entry.
 
 ### 2. Every import binds a local declaration
 
