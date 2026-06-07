@@ -255,6 +255,15 @@ two versions.
 
 ### Changed
 
+- **Builder file-identity layer; populate-side node counting removed.**
+  `GraphBuilder` now records `node_file` (dense node idx → owning-file
+  ordinal, `NO_FILE` for synthetic nodes) and `file_blocks` (per-file
+  contiguous `(start, len)` block) — the in-memory foundation graph
+  surgery will tombstone/append per-file blocks against. The per-file
+  node-count atomics and offset prefix-sum in the populate fan-out are
+  gone: assembly derives the offsets from the cached payload lengths
+  during its existing serial prefetch.
+
 - **Graph-file path table (`FORMAT_VERSION` 2 → 3).** Node paths in the
   `.dcg` file are stored once in a path table with a per-node `path_idx`
   indirection, instead of one owned string per node. Old graph files are
