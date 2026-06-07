@@ -271,3 +271,44 @@ def test_re_materialize_requires_prior_materialize(tmp_path):
     analysis = Analysis(tmp_path)
     with pytest.raises(RuntimeError, match="prior materialize_all"):
         analysis.re_materialize([])
+
+
+def test_apply_changes_reports_zero_change(tmp_path):
+    """``apply_changes`` returns whether any salsa revision advanced.
+
+    A ``Changed`` event for an untouched file is a no-op (ty only
+    bumps the file's revision when mtime / size differ) and reports
+    ``False`` — the signal ``re_materialize`` uses to skip the rebuild
+    entirely on the watcher/LSP hot path. A content edit reports
+    ``True``. ``Rescan`` is conservatively always ``True`` today (the
+    project re-walk sets inputs unconditionally), so rescan-driven
+    callers never skip.
+    """
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    analysis = Analysis(tmp_path)
+    ctx = analysis.materialize_all()
+
+    noop = [native.ChangeEvent.changed(str(tmp_path / "a.py"))]
+    assert ctx.apply_changes(noop) is False
+
+    _write(tmp_path / "a.py", "def f(): pass\ndef g(): pass\n")
+    assert ctx.apply_changes(noop) is True
+    # Bring the graph current again (apply_changes alone doesn't
+    # rebuild) so the analysis isn't left stale for later asserts.
+    analysis.re_materialize([native.ChangeEvent.rescan()])
+    _assert_matches_fresh(analysis, tmp_path)
+
+
+def test_re_materialize_zero_change_skips_rebuild(tmp_path):
+    """A no-op re_materialize early-returns without re-running the
+    build, and the graph it hands back matches a fresh build of the
+    unchanged tree."""
+    _write(tmp_path / "a.py", "def f(): pass\n")
+    analysis = Analysis(tmp_path)
+    ctx1 = analysis.materialize_all()
+    edges_before = _edges(ctx1)
+
+    ctx2 = analysis.re_materialize([native.ChangeEvent.changed(str(tmp_path / "a.py"))])
+    assert ctx2 is ctx1
+    assert _edges(ctx2) == edges_before
+    _assert_matches_fresh(analysis, tmp_path)

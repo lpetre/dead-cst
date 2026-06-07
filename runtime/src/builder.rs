@@ -132,6 +132,13 @@ pub(crate) struct GraphBuilder {
     /// block. Initial builds mint exactly one block per file; surgery
     /// appends replacement blocks at the tail and tombstones old ones.
     pub(crate) file_blocks: Vec<(u32, u32)>,
+    /// Dense indices tombstoned by graph surgery: the node slot stays
+    /// in place (untouched files' dense ids — and so their edges —
+    /// never remap) but is dead. Surgery removes a tombstone's edges,
+    /// so reachability never visits one; iteration surfaces (`nodes()`
+    /// exposure, fqname-index build, serialization) skip members, and
+    /// `len()` is the compaction trigger. Empty until surgery runs.
+    pub(crate) tombstoned: FxHashSet<u32>,
     pub(crate) node_index: FxHashMap<NodeKey, usize>,
     pub(crate) edges: Vec<(usize, usize, u8)>,
     pub(crate) edge_set: FxHashSet<(usize, usize, u8)>,
@@ -177,7 +184,7 @@ impl GraphBuilder {
     pub(crate) fn with_capacity(expected_nodes: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(expected_nodes),
-            node_index: FxHashMap::with_capacity_and_hasher(expected_nodes, Default::default()),
+            node_index: FxHashMap::default(),
             edges: Vec::new(),
             edge_set: FxHashSet::default(),
             forward_adj: Vec::with_capacity(expected_nodes),
@@ -186,6 +193,7 @@ impl GraphBuilder {
             external_nodes: FxHashMap::default(),
             node_file: Vec::new(),
             file_blocks: Vec::new(),
+            tombstoned: FxHashSet::default(),
         }
     }
 
@@ -218,7 +226,6 @@ impl GraphBuilder {
         self.nodes.resize_with(total_nodes, GraphNode::default);
         self.forward_adj.resize_with(total_nodes, Vec::new);
         self.reverse_adj.resize_with(total_nodes, Vec::new);
-        self.node_index.reserve(total_nodes);
     }
 
     /// Get (or mint) the deduplicated `kind="external"` node for a
@@ -242,6 +249,10 @@ impl GraphBuilder {
     }
 
     pub(crate) fn add_edge(&mut self, src: usize, dst: usize, flags: u8) {
+        debug_assert!(
+            !self.tombstoned.contains(&(src as u32)) && !self.tombstoned.contains(&(dst as u32)),
+            "edge endpoint references a tombstoned node ({src} -> {dst})"
+        );
         let triple = (src, dst, flags);
         if self.edge_set.insert(triple) {
             self.edges.push(triple);

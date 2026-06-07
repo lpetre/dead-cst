@@ -594,8 +594,11 @@ class Analysis:
         the :class:`Analysis`.
 
         Returns the same (now-rebuilt) :class:`native.ProjectContext`
-        instance that :meth:`materialize_all` returned. Callers that
-        cached :class:`SymbolNode` objects from the previous build
+        instance that :meth:`materialize_all` returned. When the
+        events change nothing (no file's mtime / size differs — ty
+        leaves every salsa revision untouched), the rebuild is skipped
+        entirely and the existing graph is returned as-is. Callers
+        that cached :class:`SymbolNode` objects from a rebuilt graph
         must re-fetch them — node identities are rebuilt by the
         assemble pass.
 
@@ -606,7 +609,12 @@ class Analysis:
             raise RuntimeError(
                 "re_materialize() requires a prior materialize_all() call to construct the ctx"
             )
-        self._ctx.apply_changes(list(events))
+        if not self._ctx.apply_changes(list(events)):
+            # Zero change: no analysis input's salsa revision advanced
+            # (ty only bumps file revisions when mtime / size actually
+            # changed), so the existing graph is already current —
+            # skip the rebuild entirely.
+            return self._ctx
         self._ctx.reset_progress()
         self._drive_build(self._ctx)
         return self._ctx
