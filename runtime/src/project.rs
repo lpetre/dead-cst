@@ -24,8 +24,7 @@ use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
 
 use crate::builder::{
-    apply_prepared_batch, bfs, not_materialized, Direction, GraphBuilder, GraphNode, NodeKey,
-    PreparedOp,
+    apply_prepared_batch, bfs, not_materialized, Direction, GraphBuilder, GraphNode, PreparedOp,
 };
 use crate::file_extraction::{
     file_extraction, imports_local_from_facts, match_callee_chain, match_callee_descriptor,
@@ -973,18 +972,16 @@ fn assemble_graph<'db>(
     let module_nodes_mut = &mut module_nodes_by_file;
     let class_by_selection_mut = &mut class_by_selection;
     let decl_by_name_range_mut = &mut decl_by_name_range;
-    let ((key_rows, ()), resolve_outputs) = py.allow_threads(move || {
+    let ((fill_result, ()), resolve_outputs) = py.allow_threads(move || {
         use rayon::prelude::*;
         rayon::join(
             || {
                 rayon::join(
-                    move || -> PyResult<Vec<Vec<(NodeKey, usize)>>> {
+                    move || -> PyResult<()> {
                         mints_ref
                             .par_iter()
                             .zip_eq(file_slices)
-                            .map(|(mint, slots)| {
-                                let mut keys: Vec<(NodeKey, usize)> =
-                                    Vec::with_capacity(mint.payload.nodes.len());
+                            .try_for_each(|(mint, slots)| {
                                 for (local_idx, node_data) in mint.payload.nodes.iter().enumerate()
                                 {
                                     let node_ref = mint.payload.refs[local_idx];
@@ -1024,13 +1021,11 @@ fn assemble_graph<'db>(
                                         is_overload: node_data.is_overload,
                                         imports: node_data.imports.clone(),
                                     };
-                                    keys.push((node.key(mint.file), mint.base + local_idx));
                                     slots[local_idx] = node;
                                 }
                                 counters_ref.assemble_inc();
-                                Ok(keys)
+                                Ok(())
                             })
-                            .collect()
                     },
                     move || {
                         // Each index fold is a serial insert loop over `Copy`
@@ -1043,7 +1038,12 @@ fn assemble_graph<'db>(
                                     for (local_idx, &node_ref) in
                                         mint.payload.refs.iter().enumerate()
                                     {
-                                        ref_to_global_mut.insert(node_ref, mint.base + local_idx);
+                                        let prev = ref_to_global_mut
+                                            .insert(node_ref, mint.base + local_idx);
+                                        // Position-distinct invariant
+                                        // (`CLAUDE.md` principle 3): no two
+                                        // payload nodes share a NodeRef.
+                                        debug_assert!(prev.is_none());
                                     }
                                 }
                             },
@@ -1110,21 +1110,15 @@ fn assemble_graph<'db>(
         )
     });
 
-    // 1c: fold the parallel fill's key rows into `node_index`. Payload
-    // nodes are position-distinct (`CLAUDE.md` principle 3), so no two
-    // ever share a `NodeKey`; the assert — kept on in release too,
-    // since a collision would silently corrupt the index map — guards
-    // that invariant.
-    for rows in key_rows? {
-        for (key, global_idx) in rows {
-            let prev = builder.node_index.insert(key, global_idx);
-            assert!(
-                prev.is_none(),
-                "payload node key collision at index {global_idx}: \
-                 assembly must mint each NodeKey once"
-            );
-        }
-    }
+    // Payload nodes are NOT interned into `node_index`: their identity
+    // is `(file, local)` by construction (position-distinct per
+    // `CLAUDE.md` principle 3 — `ref_to_global`'s fold debug-asserts
+    // it), nothing ever resolves a payload node by content key, and at
+    // graph scale the per-node `NodeKey` (a cloned fqname + position)
+    // was pure overhead. `node_index` now holds only synthetic nodes
+    // (`intern_external` / future plugin mints), whose content key is
+    // their identity.
+    fill_result?;
 
     let ResolveOutputs {
         member_results,
@@ -2293,10 +2287,20 @@ impl ProjectContext {
     /// dirty set; callers with explicit knowledge of what changed
     /// (e.g. an LSP integration) can build :class:`ChangeEvent` lists
     /// directly via the classmethods on :class:`ChangeEvent`.
-    pub(crate) fn apply_changes(&mut self, events: Vec<Py<ChangeEvent>>, py: Python<'_>) {
+    /// Returns ``True`` when the events changed any analysis input —
+    /// i.e. the salsa revision advanced. ty's ``apply_changes`` only
+    /// bumps file revisions when mtime / size actually changed (and
+    /// only re-registers metadata when it differs), so a no-op event
+    /// batch — including a ``Rescan`` over an unchanged tree — leaves
+    /// the revision untouched and returns ``False``, letting
+    /// ``re_materialize`` skip the rebuild entirely.
+    pub(crate) fn apply_changes(&mut self, events: Vec<Py<ChangeEvent>>, py: Python<'_>) -> bool {
+        use salsa::plumbing::ZalsaDatabase as _;
         let ty_events: Vec<TyChangeEvent> =
             events.iter().map(|e| e.borrow(py).to_ty_event()).collect();
+        let before = self.db.zalsa().current_revision();
         self.db.apply_changes(&ty_events, None);
+        self.db.zalsa().current_revision() != before
     }
 
     /// Return a list of :class:`ChangeEvent`\\s that, when passed to

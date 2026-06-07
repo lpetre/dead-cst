@@ -579,7 +579,7 @@ class ProjectContext:
         double-register plugins on the rust-serial path."""
         ...
 
-    def apply_changes(self, events: Iterable[ChangeEvent]) -> None:
+    def apply_changes(self, events: Iterable[ChangeEvent]) -> bool:
         """Apply a batch of file-system change events to the salsa db.
 
         Forwards to ty_project's ``ProjectDatabase::apply_changes``,

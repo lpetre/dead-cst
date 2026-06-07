@@ -255,6 +255,16 @@ two versions.
 
 ### Changed
 
+- **`re_materialize` early-returns on zero change.** `apply_changes` now
+  reports whether any salsa revision advanced; when explicit
+  `Changed`/`Created`/`Deleted` events touch nothing (mtime/size
+  unchanged), the rebuild is skipped entirely. `Rescan` is conservatively
+  always treated as changed today. Payload nodes are also no longer
+  interned into `node_index` (their `(file, local)` identity makes the
+  content-keyed map pure overhead — it now holds synthetic nodes only),
+  and the builder gains the `tombstoned` index set the surgery work will
+  populate.
+
 - **Builder file-identity layer; populate-side node counting removed.**
   `GraphBuilder` now records `node_file` (dense node idx → owning-file
   ordinal, `NO_FILE` for synthetic nodes) and `file_blocks` (per-file
