@@ -34,12 +34,20 @@ pub(crate) const MAGIC: &[u8; 8] = b"DEADCSTG";
 /// [`GraphFileBody`]; the loader rejects mismatched values outright
 /// (graphs are cheap to rebuild — no migration logic). Bumped 1 → 2
 /// when the flag registries were added to the body and edge flags
-/// narrowed to `u8`.
-pub(crate) const FORMAT_VERSION: u32 = 2;
+/// narrowed to `u8`; 2 → 3 when node paths moved behind the
+/// [`GraphFileBody::paths`] table indirection.
+pub(crate) const FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct GraphFileBody {
     metadata: GraphMetadataRecord,
+    /// Path table: every distinct node path, in first-encounter order
+    /// (assembled graphs write nodes file-contiguously, so this is the
+    /// build's file order). [`NodeRecord::path_idx`] indexes into it.
+    /// Besides deduplicating what was one owned string per node, the
+    /// table gives the file an explicit file-identity axis — the
+    /// foundation graph surgery keys per-file node blocks on.
+    paths: Vec<String>,
     nodes: Vec<NodeRecord>,
     edges: Vec<(u32, u32, u8)>,
     /// Node-flag registry (engine built-ins + plugin declarations) so a
@@ -105,7 +113,8 @@ struct GraphMetadataRecord {
 struct NodeRecord {
     fqname: String,
     kind: String,
-    path: String,
+    /// Index into [`GraphFileBody::paths`].
+    path_idx: u32,
     start_line: u32,
     start_column: u32,
     end_line: u32,
@@ -164,29 +173,6 @@ impl GraphMetadata {
     }
 }
 
-fn distinct_files_and_lines<I, F>(nodes: I, get: F) -> (u64, u64)
-where
-    I: IntoIterator,
-    F: Fn(&I::Item) -> (Option<String>, u32),
-{
-    use std::collections::HashMap;
-    let mut max_line: HashMap<String, u32> = HashMap::new();
-    for node in nodes {
-        let (path, end_line) = get(&node);
-        let Some(path) = path else { continue };
-        if path.is_empty() {
-            continue;
-        }
-        let slot = max_line.entry(path).or_insert(0);
-        if end_line > *slot {
-            *slot = end_line;
-        }
-    }
-    let files = max_line.len() as u64;
-    let lines: u64 = max_line.values().map(|v| *v as u64).sum();
-    (files, lines)
-}
-
 /// Write a project graph to `path`.
 ///
 /// `nodes` / `edges` are the same payload `NativeGraph` exposes —
@@ -208,6 +194,8 @@ pub(crate) fn write_graph(
     py: Python<'_>,
 ) -> PyResult<()> {
     let mut node_records: Vec<NodeRecord> = Vec::with_capacity(nodes.len());
+    let mut paths: Vec<String> = Vec::new();
+    let mut path_to_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for node in &nodes {
         let n = node.borrow(py);
         let imports = if let Some(imp) = &n.imports {
@@ -220,10 +208,14 @@ pub(crate) fn write_graph(
         } else {
             None
         };
+        let path_idx = *path_to_idx.entry(n.path.clone()).or_insert_with(|| {
+            paths.push(n.path.clone());
+            (paths.len() - 1) as u32
+        });
         node_records.push(NodeRecord {
             fqname: n.fqname.clone(),
             kind: n.kind.to_string(),
-            path: n.path.clone(),
+            path_idx,
             start_line: n.start_line as u32,
             start_column: n.start_column as u32,
             end_line: n.end_line as u32,
@@ -233,9 +225,20 @@ pub(crate) fn write_graph(
         });
     }
 
-    let (file_count, line_count) = distinct_files_and_lines(&node_records, |n: &&NodeRecord| {
-        (Some(n.path.clone()), n.end_line)
-    });
+    // The path table IS the distinct-file set; per-file line counts
+    // fold over `path_idx` instead of re-hashing path strings.
+    let file_count = paths.iter().filter(|p| !p.is_empty()).count() as u64;
+    let mut max_line: Vec<u32> = vec![0; paths.len()];
+    for n in &node_records {
+        let slot = &mut max_line[n.path_idx as usize];
+        *slot = (*slot).max(n.end_line);
+    }
+    let line_count: u64 = paths
+        .iter()
+        .zip(&max_line)
+        .filter(|(p, _)| !p.is_empty())
+        .map(|(_, &l)| l as u64)
+        .sum();
 
     let created_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -251,6 +254,7 @@ pub(crate) fn write_graph(
             line_count,
             user_meta: meta,
         },
+        paths,
         nodes: node_records,
         edges,
         node_flag_registry: node_flag_registry
@@ -322,6 +326,7 @@ pub(crate) fn read_graph(
 
     let GraphFileBody {
         metadata,
+        paths,
         nodes,
         edges,
         node_flag_registry,
@@ -342,10 +347,20 @@ pub(crate) fn read_graph(
             }
             None => None,
         };
+        let path = paths
+            .get(rec.path_idx as usize)
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "{path:?}: node path_idx {} out of range ({} paths)",
+                    rec.path_idx,
+                    paths.len()
+                ))
+            })?
+            .clone();
         let node = SymbolNode {
             fqname: rec.fqname,
             kind,
-            path: rec.path,
+            path,
             start_line: rec.start_line as usize,
             start_column: rec.start_column as usize,
             end_line: rec.end_line as usize,

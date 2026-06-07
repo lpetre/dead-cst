@@ -255,6 +255,14 @@ two versions.
 
 ### Changed
 
+- **Graph-file path table (`FORMAT_VERSION` 2 → 3).** Node paths in the
+  `.dcg` file are stored once in a path table with a per-node `path_idx`
+  indirection, instead of one owned string per node. Old graph files are
+  rejected (rebuild them — no migration logic, as before). Besides
+  shrinking the file, the table gives the format an explicit
+  file-identity axis: the foundation the upcoming `re_materialize`
+  graph-surgery work keys per-file node blocks on.
+
 - **Per-file semantic indices are evicted after extraction.** The vendored
   ty fork now follows the `parsed_module` pattern for the semantic index:
   the salsa query returns a cheap handle, consumers `load()` a guard, and
