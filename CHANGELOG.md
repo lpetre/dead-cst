@@ -255,6 +255,21 @@ two versions.
 
 ### Changed
 
+- **Per-file semantic indices are evicted after extraction.** The vendored
+  ty fork now follows the `parsed_module` pattern for the semantic index:
+  the salsa query returns a cheap handle, consumers `load()` a guard, and
+  `clear()` drops the per-scope analysis data (place tables, use-def maps,
+  AST ids) for lazy, ingredient-reusing rebuild on the next `load()`. The
+  populate fan-out clears each file's index (alongside its parsed AST) as
+  soon as the per-file extraction queries have memoized their owned
+  payloads, and the post-plugin-pass sweep re-clears the files the
+  assembly / plugin passes reloaded on demand — tracked precisely via a
+  reload log on `resolve_member_in_file` (the one reload chokepoint), so
+  the sweep touches the handful of base-defining files instead of probing
+  every project file's salsa slots. On large projects the
+  resident semantic indices were the dominant share of peak memory
+  (~16 GB at 200k files); they are now transient per-file working state.
+
 - **File-local reference specs; cross-file resolution moved to assembly.**
   The two per-file salsa edge queries (`file_to_edges` / `file_to_ref_edges`)
   are consolidated into one combined walk (`file_to_refspecs`) that emits
