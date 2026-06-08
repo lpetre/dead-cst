@@ -677,6 +677,40 @@ impl<'db> FileContext<'db> {
         out
     }
 
+    /// Per-file twin of `find_handler_decorators_via`: `(owner name, file-local
+    /// idx)` for every decl carrying a two-level `@<owner>.<via_attr>.<attr>(...)`
+    /// decorator whose `attr` is one of `decorator_attrs` — one row per distinct
+    /// owner in source order.
+    fn handler_decorators_via_local(
+        &self,
+        via_attr: &str,
+        decorator_attrs: &[&str],
+    ) -> Vec<(String, u32)> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let attrs: rustc_hash::FxHashSet<&str> = decorator_attrs.iter().copied().collect();
+        let by_range = self.name_range_to_local();
+        let mut out: Vec<(String, u32)> = Vec::new();
+        for (rk, descriptors) in &facts.decorator_rows {
+            let Some(&local) = by_range.get(rk) else {
+                continue;
+            };
+            let mut seen_owners: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+            for desc in descriptors {
+                let [via, outer] = desc.attrs.as_slice() else {
+                    continue;
+                };
+                if via.as_str() != via_attr || !attrs.contains(outer.as_str()) {
+                    continue;
+                }
+                if !seen_owners.insert(desc.root_name.as_str()) {
+                    continue;
+                }
+                out.push((desc.root_name.to_string(), local));
+            }
+        }
+        out
+    }
+
     /// Visit every call site in this file (decl-owned and module-scope),
     /// yielding the *file-local* owner index (module-scope → 0). The per-file
     /// twin of [`for_each_call_site`](crate::project) keyed on local indices.
@@ -1249,7 +1283,7 @@ impl NativePlugin {
     /// may live in different files; Cog subclasses span files).
     #[staticmethod]
     fn discordpy() -> Self {
-        Self::project_wide(Arc::new(DiscordPyPluginImpl))
+        Self::dual_mode(Arc::new(DiscordPyPluginImpl))
     }
 
     /// Native `PytestPlugin` (port of `dead_cst.contrib.pytest`). Seed
@@ -1363,7 +1397,7 @@ impl NativePlugin {
     /// Wrap a [`DispatchAppConfig`] in a project-wide native plugin. Shared by
     /// the per-framework factories and the custom `dispatch_app` factory.
     fn from_dispatch_config(name: String, config: DispatchAppConfig) -> Self {
-        Self::project_wide(Arc::new(DispatchAppPluginImpl { name, config }))
+        Self::dual_mode(Arc::new(DispatchAppPluginImpl { name, config }))
     }
 }
 
@@ -2596,6 +2630,17 @@ pub mod plugin_api {
             self.inner.handler_decorators_local(decorator_attrs)
         }
 
+        /// `(owner name, file-local idx)` for two-level
+        /// `@<owner>.<via_attr>.<attr>(...)`-decorated decls.
+        pub(crate) fn handler_decorators_via_local(
+            &self,
+            via_attr: &str,
+            decorator_attrs: &[&str],
+        ) -> Vec<(String, u32)> {
+            self.inner
+                .handler_decorators_via_local(via_attr, decorator_attrs)
+        }
+
         /// `(local owner, literal)` for calls to `name` imported from one of
         /// `modules`, taking the `arg_index` positional string literal.
         pub(crate) fn calls_to_imported_local(
@@ -3146,6 +3191,36 @@ impl DispatchAppPluginImpl {
         }
         false
     }
+
+    /// Per-instance topic for this framework's `@<owner>.<reg_decorator>`
+    /// handler facts. Namespaced by `self.name` (one instance per framework)
+    /// so flask's handlers never bleed into fastapi's resolve.
+    fn handler_topic(&self) -> String {
+        format!("dispatch/{}/handler", self.name)
+    }
+}
+
+impl plugin_api::PerFilePlugin for DispatchAppPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        // Detecting `@<owner>.<reg_decorator>(...)` handlers is a pure
+        // syntactic, file-local read — publish one fact per handler, pinned to
+        // the decorated decl, value = the owner (receiver) name. The
+        // project-wide `run` reconstructs the handler list and does the
+        // cross-file wiring (subclass-expanded constructions, factory walk).
+        // No import gate here: the old plugin gated the *whole* pass on a
+        // project-level `is_active`, so a handler in a file that doesn't itself
+        // import the framework must still surface — `run` applies that gate.
+        let reg_ref: Vec<&str> = self
+            .config
+            .registration_decorators
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let topic = self.handler_topic();
+        for (owner, local) in file.handler_decorators_local(&reg_ref) {
+            ops.emit_fact(topic.clone(), Some(local), owner);
+        }
+    }
 }
 
 /// Trailing path component (`Path(path).name`) for the celery shared-task
@@ -3164,6 +3239,20 @@ fn simple_name(fqname: &str) -> &str {
 impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: self.handler_topic(),
+            description: "A `@<owner>.<registration_decorator>(...)` handler decl, pinned \
+                          to the decorated decl, value = the owner (receiver) name; the \
+                          project-wide pass wires it to its owning app instance."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
     }
 
     fn run(
@@ -3245,13 +3334,17 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
             }
         }
 
-        // handlers: `@<owner>.<reg_decorator>(...)`-decorated functions.
-        let reg_ref: Vec<&str> = cfg
-            .registration_decorators
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let handlers: Vec<(String, usize)> = ctx.handler_decorators(&reg_ref);
+        // handlers: `@<owner>.<reg_decorator>(...)`-decorated functions,
+        // reconstructed from the per-file facts (value = owner name, pinned to
+        // the decorated decl) the salsa-cached per-file pass published.
+        let handlers: Vec<(String, usize)> = match ctx.topic(&self.handler_topic()) {
+            Some(handle) => ctx
+                .facts_for_topic(handle)
+                .into_iter()
+                .filter_map(|fact| fact.decl_idx.map(|idx| (fact.value, idx)))
+                .collect(),
+            None => Vec::new(),
+        };
 
         // factory_reachers (seed + factory): union of every factory decl's
         // direct predecessors. Inverts step 6's question (is this var's
@@ -3736,11 +3829,46 @@ const DISCORD_BOT_DECORATORS: [&str; 10] = [
 const DISCORD_TREE_DECORATORS: [&str; 2] = ["command", "context_menu"];
 const DISCORD_COG_BASES: [&str; 2] = ["discord.ext.commands.Cog", "discord.ext.commands.GroupCog"];
 
+/// Topic carrying discord.py handler decls — both single-attr `@<bot>.<verb>`
+/// and two-level `@<bot>.tree.<verb>` slash commands (the project-wide pass
+/// wires both identically). Value = the owner (bot) name, pinned to the
+/// decorated decl.
+const DISCORD_TOPIC_HANDLER: &str = "discord/handler";
+
 pub(crate) struct DiscordPyPluginImpl;
+
+impl plugin_api::PerFilePlugin for DiscordPyPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        // Handler-decorator detection is syntactic + file-local. Publish one
+        // fact per handler (single-attr and two-level alike); the project-wide
+        // `run` reconstructs the list and wires each to its bot var (which the
+        // cross-file Bot/Client construction walk discovers). No import gate —
+        // `run`'s project-level discord-presence check applies it.
+        for (owner, local) in file.handler_decorators_local(&DISCORD_BOT_DECORATORS) {
+            ops.emit_fact(DISCORD_TOPIC_HANDLER, Some(local), owner);
+        }
+        for (owner, local) in file.handler_decorators_via_local("tree", &DISCORD_TREE_DECORATORS) {
+            ops.emit_fact(DISCORD_TOPIC_HANDLER, Some(local), owner);
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
     fn name(&self) -> &str {
         "DiscordPyPlugin"
+    }
+
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: DISCORD_TOPIC_HANDLER.to_string(),
+            description: "A discord.py `@<bot>.<verb>` / `@<bot>.tree.<verb>` handler decl, \
+                          pinned to the decorated decl, value = the bot (owner) name."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
     }
 
     fn run(
@@ -3786,11 +3914,18 @@ impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
         let client_names_ref: Vec<&str> = client_names.iter().map(String::as_str).collect();
         bot_var_idxs.extend(ctx.constructions(&["discord"], &client_names_ref));
 
-        // 2 + 3. Handler decorators: single-attr `@<bot>.<verb>` and
-        // two-level `@<bot>.tree.<verb>` slash commands.
-        let bot_handlers: Vec<(String, usize)> = ctx.handler_decorators(&DISCORD_BOT_DECORATORS);
-        let tree_handlers: Vec<(String, usize)> =
-            ctx.handler_decorators_via("tree", &DISCORD_TREE_DECORATORS);
+        // 2 + 3. Handler decorators (single-attr `@<bot>.<verb>` and two-level
+        // `@<bot>.tree.<verb>` slash commands), reconstructed from the per-file
+        // facts the salsa-cached per-file pass published. Both shapes share one
+        // topic — the wiring below treats them identically.
+        let handlers: Vec<(String, usize)> = match ctx.topic(DISCORD_TOPIC_HANDLER) {
+            Some(handle) => ctx
+                .facts_for_topic(handle)
+                .into_iter()
+                .filter_map(|fact| fact.decl_idx.map(|idx| (fact.value, idx)))
+                .collect(),
+            None => Vec::new(),
+        };
 
         // 4. Cog subclasses + their files; module setup/teardown hooks.
         let mut cogs_by_path: FxHashMap<String, Vec<usize>> = FxHashMap::default();
@@ -3856,17 +3991,13 @@ impl plugin_api::ExternalPlugin for DiscordPyPluginImpl {
         }
 
         // Wire single-attr + two-level handler decorators to their bot.
-        let handler_idxs: Vec<usize> = bot_handlers
-            .iter()
-            .chain(tree_handlers.iter())
-            .map(|(_, idx)| *idx)
-            .collect();
+        let handler_idxs: Vec<usize> = handlers.iter().map(|(_, idx)| *idx).collect();
         let handler_paths: FxHashMap<usize, String> = handler_idxs
             .iter()
             .copied()
             .zip(ctx.node_paths(&handler_idxs))
             .collect();
-        for (owner, decorated_idx) in bot_handlers.iter().chain(tree_handlers.iter()) {
+        for (owner, decorated_idx) in &handlers {
             let Some(path) = handler_paths.get(decorated_idx) else {
                 continue;
             };
