@@ -203,28 +203,16 @@ pub(crate) fn extract_plugin_jobs(
             }
         }
         let (job, name) = match &native_ref.kind {
-            NativePluginKind::External {
-                plugin,
-                per_file_id: None,
-                name,
-                ..
-            } => (PluginJob::External(Arc::clone(plugin)), name.clone()),
-            NativePluginKind::PerFile(id) => (PluginJob::Noop, id.name()),
-            NativePluginKind::External {
-                plugin,
-                per_file_id: Some(_),
-                name,
-                ..
-            } => {
-                // Dual-mode plugins emit facts per-file (salsa-cached) *and*
-                // run project-wide to resolve them; a pure per-file plugin
-                // keeps the historical skip (its `run` is a no-op anyway).
-                if plugin.resolves_facts() {
-                    (PluginJob::External(Arc::clone(plugin)), name.clone())
-                } else {
-                    (PluginJob::Noop, name.clone())
-                }
+            // Every `ExternalPlugin` runs its project-wide `run` — including
+            // one that also opts into per-file dispatch (`per_file_id: Some`),
+            // which additionally emits facts during the build walk. The two
+            // phases compose: the per-file pass publishes, `run` resolves. A
+            // plugin with no project-wide work just inherits the no-op default
+            // `run`, so this costs it nothing.
+            NativePluginKind::External { plugin, name, .. } => {
+                (PluginJob::External(Arc::clone(plugin)), name.clone())
             }
+            NativePluginKind::PerFile(id) => (PluginJob::Noop, id.name()),
         };
         jobs.push(job);
         names.push(name);
@@ -1321,15 +1309,15 @@ impl NativePlugin {
 
     /// Wrap a curated **dual-mode** built-in: it emits facts per-file
     /// (salsa-cached via [`per_file_plugin_ops`], so a clean file's facts are
-    /// reused with zero re-run) and resolves them in a project-wide `run`.
-    /// Registers the plugin for per-file dispatch and keeps it `External` so
-    /// the project-wide pass still runs it (gated by
-    /// [`plugin_api::ExternalPlugin::resolves_facts`]). The plugin must return
-    /// `Some` from `per_file()` and `true` from `resolves_facts()`.
+    /// reused with zero re-run) and resolves them in its project-wide `run`.
+    /// Registers the plugin for per-file dispatch and keeps it `External`, so
+    /// the host runs *both* phases (every `ExternalPlugin` runs its `run`; a
+    /// `Some` `per_file()` adds the build-walk emit). The plugin must return
+    /// `Some` from `per_file()`.
     fn dual_mode(plugin: Arc<dyn plugin_api::ExternalPlugin>) -> Self {
         debug_assert!(
-            plugin.per_file().is_some() && plugin.resolves_facts(),
-            "dual_mode plugin must implement per_file() and resolves_facts()"
+            plugin.per_file().is_some(),
+            "dual_mode plugin must implement per_file()"
         );
         let per_file_id = Some(register_external_per_file(Arc::clone(&plugin)));
         Self {
@@ -1596,14 +1584,17 @@ pub mod plugin_api {
     /// [`run`](ExternalPlugin::run) once per materialize against the frozen
     /// graph, then folds the emitted ops in as a single batch.
     ///
-    /// A plugin can optionally opt into **per-file** dispatch by also
+    /// A plugin can additionally opt into **per-file** dispatch by also
     /// implementing [`PerFilePlugin`] and returning `Some(self)` from
-    /// [`per_file`](ExternalPlugin::per_file). When it does, the host ignores
-    /// [`run`](ExternalPlugin::run) and instead invokes
+    /// [`per_file`](ExternalPlugin::per_file): the host then invokes
     /// [`PerFilePlugin::run_on_file`] once per project file through a
     /// salsa-cached query — so an unchanged file's ops are reused across a
-    /// `re_materialize` with zero re-run. (Same fast-path the in-tree
-    /// `MainBlockPlugin` rides.)
+    /// `re_materialize` with zero re-run (same fast-path the in-tree
+    /// `MainBlockPlugin` rides) — **and still calls [`run`](ExternalPlugin::run)**
+    /// for the project-wide pass. The two compose: the per-file pass typically
+    /// emits facts ([`FileOps::emit_fact`]) and `run` resolves them
+    /// ([`PluginCtx::facts_for_topic`]). A plugin with no project-wide work
+    /// simply leaves `run` as the no-op default, which costs nothing.
     pub trait ExternalPlugin: Send + Sync {
         /// Human-readable name (surfaced in progress logs).
         fn name(&self) -> &str;
@@ -1612,35 +1603,21 @@ pub mod plugin_api {
         /// frozen-graph contract as every built-in. Return
         /// `Err(`[`PluginError`]`)` to fail the whole materialize with that
         /// message; the host raises the mapped Python exception. Default no-op
-        /// (`Ok(())`) so a pure per-file plugin needn't implement it — the host
-        /// skips it entirely when [`per_file`](ExternalPlugin::per_file) is
-        /// `Some`.
+        /// (`Ok(())`), so a pure per-file plugin needn't implement it — the host
+        /// still calls it, but the default does nothing.
         fn run(&self, _ctx: &PluginCtx<'_>, _ops: &mut PluginOps) -> Result<(), PluginError> {
             Ok(())
         }
 
         /// Opt into per-file (salsa-cached) dispatch by returning
-        /// `Some(self)`. The default `None` keeps the plugin project-wide.
+        /// `Some(self)`, *in addition to* the project-wide [`run`](Self::run)
+        /// the host always calls. The default `None` keeps the plugin
+        /// project-wide only.
         ///
         /// Whether a plugin is per-file is read **once, at load** — it must
         /// not depend on runtime state.
         fn per_file(&self) -> Option<&dyn PerFilePlugin> {
             None
-        }
-
-        /// Opt into **dual-mode** dispatch: the plugin's per-file capability
-        /// ([`per_file`](Self::per_file) returning `Some`) emits facts under
-        /// its declared topics during the salsa-cached build walk, and its
-        /// project-wide [`run`](Self::run) is *still* invoked afterward to
-        /// resolve those facts (`facts_for_topic`) into graph edges / flags.
-        ///
-        /// Default `false` keeps the historical contract — a per-file
-        /// plugin's `run` is skipped, so a pure per-file plugin (e.g.
-        /// `MainBlock`) is unaffected. Only meaningful alongside a `Some`
-        /// [`per_file`](Self::per_file); a pure project-wide plugin
-        /// (`per_file() == None`) runs its `run` regardless.
-        fn resolves_facts(&self) -> bool {
-            false
         }
 
         /// Pre-graph hook, mirroring the Python `Plugin.prepare` contract:
@@ -2883,10 +2860,6 @@ impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
         Some(self)
     }
 
-    fn resolves_facts(&self) -> bool {
-        true
-    }
-
     fn run(
         &self,
         ctx: &plugin_api::PluginCtx<'_>,
@@ -3035,10 +3008,6 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
 
     fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
         Some(self)
-    }
-
-    fn resolves_facts(&self) -> bool {
-        true
     }
 
     fn run(
@@ -3676,10 +3645,6 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
 
     fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
         Some(self)
-    }
-
-    fn resolves_facts(&self) -> bool {
-        true
     }
 
     fn run(
@@ -4518,10 +4483,6 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
 
     fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
         Some(self)
-    }
-
-    fn resolves_facts(&self) -> bool {
-        true
     }
 
     fn run(

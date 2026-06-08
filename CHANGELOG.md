@@ -74,10 +74,10 @@ two versions.
   was ~325 ms on a 50k-file project and is now microseconds; the
   module-hook wiring that rescanned every node became a file-local edge.
   Output is byte-identical to before for every converted plugin (A/B-verified
-  on cross-file corpora). New scaffolding: `ExternalPlugin::resolves_facts()`
-  opts a `per_file` plugin into also running its project-wide `run` to
-  resolve the facts it emitted (pure per-file plugins are unaffected). No
-  public API or CLI change. The dispatch-app family (flask / fastapi / … /
+  on cross-file corpora). The host now always calls a plugin's project-wide
+  `run` *and* (when it returns `Some` from `per_file()`) its salsa-cached
+  per-file emitter — the two compose, and a plugin with no project-wide work
+  just inherits the no-op default `run`. No public API or CLI change. The dispatch-app family (flask / fastapi / … /
   celery), discord.py, and click plugins are unchanged, pending a follow-up.
 - **Assemble hill-climb (every build, biggest on incremental).** Four
   structural cuts, output byte-identical throughout: (1) memo-slot
