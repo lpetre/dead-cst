@@ -13,10 +13,19 @@ back to ``len(ctx.nodes())`` / ``len(ctx.edges())`` only when ``--count``
 is passed (those allocate the full Python lists -- many GB at full scale,
 so they default off).
 
-``--incremental`` additionally times a zero-change rescan and a
-one-file-change re_materialize on the same ctx. NOTE: the corpus must
-live OUTSIDE this repo (see gen_bench_corpus.py) or the rescan re-roots
-at the repo and rebuilds the wrong file set; this script resolves the
+``--incremental`` additionally runs an LSP-style edit loop on the same
+ctx: pay the cold build once, then a series of small one-file edits,
+each applied via an explicit ``ChangeEvent.changed(path)`` and timed
+individually. Explicit content events are the incremental fast path —
+the resolve cache reuses every cross-file resolution whose read set
+avoids the edit, and only the touched files re-mint/re-translate.
+(``rescan`` / ``detect_changes`` deliberately take the full-resolve
+path: a rescan can't bound the blast radius.) The loop edits scattered
+files first, then hammers one file repeatedly (the hot-loop shape), and
+finishes with a no-op event (the early-return path). Per-round walls,
+``(resolved, reused)`` counters, and the tombstone count are reported.
+NOTE: the corpus must live OUTSIDE this repo (see gen_bench_corpus.py)
+or rescan-style rebuilds re-root at the repo; this script resolves the
 path to absolute, but it cannot move it out of a nesting project.
 
 Usage::
@@ -97,46 +106,83 @@ def _cold_build(corpus: Path, plugins: list) -> tuple[float, Analysis, native.Pr
 
 
 def _incremental(
-    analysis: Analysis, ctx: native.ProjectContext, corpus: Path
-) -> tuple[float, float, int, int]:
-    """Time two re_materialize passes on the already-built ctx and prove
-    the edit registered.
+    analysis: Analysis, ctx: native.ProjectContext, corpus: Path, edits: int
+) -> list[tuple[str, float, tuple[int, int], int]]:
+    """LSP-style edit loop on the already-built ctx.
 
-    Zero-change: an explicit rescan with nothing touched on disk -- a
-    pure salsa cache hit for per-file work (the assemble + fqname passes
-    still rebuild the whole graph from cached per-file outputs).
+    Each round appends a fresh top-level decl to one module and
+    re-materializes via an explicit ``ChangeEvent.changed(path)`` — the
+    incremental fast path (the resolve cache reuses every entry whose
+    read set avoids the edit; only the touched files re-mint). The first
+    ``edits`` rounds scatter across packages (cold per-file state each
+    time), the next ``edits`` rounds hammer one file (the hot loop), and
+    a final round applies a no-op event (early return). Every round
+    asserts the node count moved (or, for the no-op, didn't).
 
-    One-file change: append a top-level decl to one module, then
-    ``detect_changes()`` + re_materialize. NOTE: a targeted
-    ``ChangeEvent.changed(path)`` does *not* invalidate the file in this
-    ty integration (verified -- the node count doesn't move); only the
-    rescan path (which ``detect_changes`` returns) picks edits up, so
-    salsa re-parses just the changed file under a full-project re-stat.
-
-    Returns ``(zero_s, one_s, nodes_before, nodes_after)``; the node
-    delta proves the edit took. Restores the file afterwards."""
+    Returns ``[(label, wall_s, (resolved, reused), tombstones), ...]``.
+    Edited files are restored afterwards."""
 
     def _nodes() -> int:
-        return ctx.read_progress_snapshot()["fqname_total"]
+        # Live node count: the raw total includes tombstoned slots (a
+        # re-minted file's old block stays in place so live dense ids
+        # never remap), so subtract them — an edit that adds one decl
+        # grows the *live* count by exactly one.
+        return ctx.read_progress_snapshot()["fqname_total"] - len(ctx.tombstoned_indices())
 
-    # Zero-change: force a rebuild with nothing actually modified.
-    t = time.perf_counter()
-    analysis.re_materialize([native.ChangeEvent.rescan()])
-    zero = time.perf_counter() - t
-    nodes_before = _nodes()
-
-    # One-file change: append a fresh top-level decl, then autodetect.
-    target = (corpus / "pkg_0000" / "mod_0000.py").resolve()
-    original = target.read_text()
+    manifest = sorted((corpus).glob("pkg_*"))
+    rows: list[tuple[str, float, tuple[int, int], int]] = []
+    originals: dict[Path, str] = {}
     try:
-        target.write_text(original + "\n\ndef _bench_touch():\n    pass\n")
+        # Scattered edits: one file per round, spread across packages.
+        for i in range(edits):
+            pkg = manifest[(i * 97) % len(manifest)]
+            target = sorted(pkg.glob("mod_*.py"))[i % 3]
+            originals.setdefault(target, target.read_text())
+            target.write_text(target.read_text() + f"\n\ndef _bench_s{i}():\n    pass\n")
+            before = _nodes()
+            t = time.perf_counter()
+            analysis.re_materialize([native.ChangeEvent.changed(str(target))])
+            wall = time.perf_counter() - t
+            assert _nodes() == before + 1, "edit did not register"
+            rows.append(
+                (
+                    f"scatter {target.relative_to(corpus)}",
+                    wall,
+                    ctx._last_resolve_counts(),
+                    len(ctx.tombstoned_indices()),
+                )
+            )
+
+        # Hot loop: repeated edits to one file.
+        target = (corpus / "pkg_0000" / "mod_0000.py").resolve()
+        originals.setdefault(target, target.read_text())
+        for i in range(edits):
+            target.write_text(target.read_text() + f"\n\ndef _bench_h{i}():\n    pass\n")
+            before = _nodes()
+            t = time.perf_counter()
+            analysis.re_materialize([native.ChangeEvent.changed(str(target))])
+            wall = time.perf_counter() - t
+            assert _nodes() == before + 1, "edit did not register"
+            rows.append(
+                (
+                    f"hot     {target.relative_to(corpus)}",
+                    wall,
+                    ctx._last_resolve_counts(),
+                    len(ctx.tombstoned_indices()),
+                )
+            )
+
+        # No-op: event on an untouched file -> early return.
+        before = _nodes()
         t = time.perf_counter()
-        analysis.re_materialize(ctx.detect_changes())
-        one = time.perf_counter() - t
-        nodes_after = _nodes()
+        analysis.re_materialize([native.ChangeEvent.changed(str(target))])
+        wall = time.perf_counter() - t
+        assert _nodes() == before, "no-op event rebuilt something"
+        rows.append(("no-op  (early return)", wall, (0, 0), len(ctx.tombstoned_indices())))
     finally:
-        target.write_text(original)
-    return zero, one, nodes_before, nodes_after
+        for path, text in originals.items():
+            path.write_text(text)
+    return rows
 
 
 def main() -> None:
@@ -160,8 +206,15 @@ def main() -> None:
     parser.add_argument(
         "--incremental",
         action="store_true",
-        help="After the cold build, time a zero-change rescan and a "
-        "one-file-change re_materialize on the same ctx.",
+        help="After the cold build, run an LSP-style edit loop: a series "
+        "of small one-file edits applied via explicit Changed events, "
+        "each timed individually.",
+    )
+    parser.add_argument(
+        "--edits",
+        type=int,
+        default=5,
+        help="Edit rounds per --incremental shape (scattered + hot loop).",
     )
     args = parser.parse_args()
 
@@ -189,17 +242,16 @@ def main() -> None:
     snap = ctx.read_progress_snapshot()
     best = min(walls)
 
-    zero_wall = one_wall = None
-    nodes_before = nodes_after = 0
+    edit_rows: list[tuple[str, float, tuple[int, int], int]] = []
     if args.incremental:
         assert analysis is not None
-        zero_wall, one_wall, nodes_before, nodes_after = _incremental(analysis, ctx, args.corpus)
-        print(f"  zero-change re_materialize:     {zero_wall:.2f}s", flush=True)
-        print(
-            f"  one-file-change re_materialize: {one_wall:.2f}s "
-            f"(nodes {nodes_before:,} -> {nodes_after:,})",
-            flush=True,
-        )
+        edit_rows = _incremental(analysis, ctx, args.corpus, args.edits)
+        for label, wall, (resolved, reused), tombs in edit_rows:
+            print(
+                f"  edit {label:<38} {wall:7.3f}s  "
+                f"resolved={resolved:,} reused={reused:,} tombstones={tombs:,}",
+                flush=True,
+            )
 
     peak = _maxrss_bytes()
 
@@ -224,12 +276,14 @@ def main() -> None:
     print(f"  best wall   {best:.2f}s  (median {statistics.median(walls):.2f}s of {args.repeats})")
     if files and best:
         print(f"  throughput  {files / best:,.0f} files/s")
-    if zero_wall is not None:
-        print(f"  re_mat 0chg {zero_wall:.2f}s  ({best / zero_wall:.1f}x faster than cold)")
-        delta = nodes_after - nodes_before
+    if edit_rows:
+        # The no-op row is the early-return path; summarize the edits.
+        edit_walls = [w for label, w, _, _ in edit_rows if not label.startswith("no-op")]
+        med = statistics.median(edit_walls)
         print(
-            f"  re_mat 1chg {one_wall:.2f}s  ({best / one_wall:.1f}x faster than cold; "
-            f"+{delta} node{'s' if delta != 1 else ''} from the edit)"
+            f"  edit loop   median {med:.3f}s  best {min(edit_walls):.3f}s  "
+            f"worst {max(edit_walls):.3f}s  over {len(edit_walls)} edits  "
+            f"({best / med:.0f}x faster than cold)"
         )
 
     print("\n  per-phase (best-effort, from last run's snapshot):")
