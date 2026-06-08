@@ -1306,6 +1306,17 @@ fn assemble_graph<'db>(
                             |mut acc, pos| {
                                 if !dirty[pos] {
                                     let ids = &cached_ref[pos];
+                                    // Guard the zip: a clean file's retained row
+                                    // must match this build's spec count (clean ⇒
+                                    // content unchanged ⇒ identical refspecs memo).
+                                    // A mismatch means the dirtiness gate let a
+                                    // changed file through — fail loudly instead
+                                    // of silently truncating the sweep.
+                                    assert_eq!(
+                                        ids.len(),
+                                        spec_payloads_ref[pos].specs.len(),
+                                        "clean-file spec row out of sync at pos {pos}"
+                                    );
                                     for (spec, &id) in
                                         spec_payloads_ref[pos].specs.iter().zip(ids.iter())
                                     {
@@ -1350,7 +1361,18 @@ fn assemble_graph<'db>(
                 let mut seen_dynamic: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
                 for (pos, payload) in spec_payloads_ref.iter().enumerate() {
                     if !dirty[pos] {
-                        spec_ids.push(std::mem::take(&mut cached_spec_ids[pos]));
+                        let ids = std::mem::take(&mut cached_spec_ids[pos]);
+                        // Same guard at the adoption point: every later
+                        // consumer (redo detection, slot demand, edge
+                        // emission) zips or indexes this row against
+                        // `payload.specs`, so a length drift here would
+                        // corrupt the graph silently.
+                        assert_eq!(
+                            ids.len(),
+                            payload.specs.len(),
+                            "clean-file spec row out of sync at pos {pos}"
+                        );
+                        spec_ids.push(ids);
                         continue;
                     }
                     let dir = dir_ids_ref[pos];
