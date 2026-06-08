@@ -1343,36 +1343,34 @@ fn assemble_graph<'db>(
                     dtotal += st.items.len() as u32;
                 }
                 type Parts<K> = Vec<(Vec<(u32, K, File)>, Vec<((K, u32), u32)>)>;
-                let mparts: Parts<MemberRef> =
-                    mshards
-                        .par_iter()
-                        .enumerate()
-                        .map(|(sh, st)| {
-                            let mut work = Vec::with_capacity(st.items.len());
-                            let mut keys = Vec::with_capacity(st.items.len());
-                            for (local, &(m, dir)) in st.items.iter().enumerate() {
-                                let id = mbase[sh] + local as u32;
-                                work.push((id, m.clone(), dir_anchors_ref[dir as usize]));
-                                keys.push(((m.clone(), dir), id));
-                            }
-                            (work, keys)
-                        })
-                        .collect();
-                let dparts: Parts<DynamicRef> =
-                    dshards
-                        .par_iter()
-                        .enumerate()
-                        .map(|(sh, st)| {
-                            let mut work = Vec::with_capacity(st.items.len());
-                            let mut keys = Vec::with_capacity(st.items.len());
-                            for (local, &(d, dir)) in st.items.iter().enumerate() {
-                                let id = dbase[sh] + local as u32;
-                                work.push((id, d.clone(), dir_anchors_ref[dir as usize]));
-                                keys.push(((d.clone(), dir), id));
-                            }
-                            (work, keys)
-                        })
-                        .collect();
+                let mparts: Parts<MemberRef> = mshards
+                    .par_iter()
+                    .enumerate()
+                    .map(|(sh, st)| {
+                        let mut work = Vec::with_capacity(st.items.len());
+                        let mut keys = Vec::with_capacity(st.items.len());
+                        for (local, &(m, dir)) in st.items.iter().enumerate() {
+                            let id = mbase[sh] + local as u32;
+                            work.push((id, m.clone(), dir_anchors_ref[dir as usize]));
+                            keys.push(((m.clone(), dir), id));
+                        }
+                        (work, keys)
+                    })
+                    .collect();
+                let dparts: Parts<DynamicRef> = dshards
+                    .par_iter()
+                    .enumerate()
+                    .map(|(sh, st)| {
+                        let mut work = Vec::with_capacity(st.items.len());
+                        let mut keys = Vec::with_capacity(st.items.len());
+                        for (local, &(d, dir)) in st.items.iter().enumerate() {
+                            let id = dbase[sh] + local as u32;
+                            work.push((id, d.clone(), dir_anchors_ref[dir as usize]));
+                            keys.push(((d.clone(), dir), id));
+                        }
+                        (work, keys)
+                    })
+                    .collect();
                 member_work.reserve(total as usize);
                 member_keys.reserve(total as usize);
                 for (work, keys) in mparts {
