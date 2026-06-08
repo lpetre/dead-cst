@@ -61,6 +61,24 @@ two versions.
 
 ### Changed
 
+- **Project-wide plugins moved onto per-file facts + a project-wide resolve.**
+  The `pytest`, `init_subclass`, `unittest`, and `mock_patch` built-ins are
+  now *dual-mode*: their file-local observations (test/fixture/conftest
+  decls and test parameters; `__init_subclass__` definers; `unittest`
+  imports + module-lifecycle hooks; the four `patch` / `monkeypatch` call
+  shapes) are emitted as facts during the salsa-cached build walk and reused
+  verbatim for a clean file on `re_materialize`, while only the genuinely
+  cross-file work (fixture-name matching, transitive subclass walks, patch
+  target resolution) runs in the project-wide pass. The old versions
+  re-scanned the whole graph every build — pytest's project-wide phase alone
+  was ~325 ms on a 50k-file project and is now microseconds; the
+  module-hook wiring that rescanned every node became a file-local edge.
+  Output is byte-identical to before for every converted plugin (A/B-verified
+  on cross-file corpora). New scaffolding: `ExternalPlugin::resolves_facts()`
+  opts a `per_file` plugin into also running its project-wide `run` to
+  resolve the facts it emitted (pure per-file plugins are unaffected). No
+  public API or CLI change. The dispatch-app family (flask / fastapi / … /
+  celery), discord.py, and click plugins are unchanged, pending a follow-up.
 - **Assemble hill-climb (every build, biggest on incremental).** Four
   structural cuts, output byte-identical throughout: (1) memo-slot
   translation is demand-driven — only the ids the re-translate set's rows
