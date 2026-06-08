@@ -549,13 +549,12 @@ impl<'db> FileContext<'db> {
     /// `decl_by_name_range`'s per-file restriction: the decl rows in
     /// [`file_extraction`] (`decorator_rows`, `function_params`, …) are keyed
     /// by the same `name_range`, so this is the local-space join table.
-    fn name_range_to_local(&self) -> rustc_hash::FxHashMap<(u32, u32), u32> {
-        self.nodes()
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| !matches!(n.kind, NodeKind::Module | NodeKind::Import))
-            .map(|(i, n)| (n.name_range, i as u32))
-            .collect()
+    ///
+    /// Delegates to the salsa-cached [`decl_name_range_to_local`] so the many
+    /// per-file plugins (and the several helpers a single plugin calls) share
+    /// one computation per file rather than each rebuilding the map.
+    fn name_range_to_local(&self) -> &'db rustc_hash::FxHashMap<(u32, u32), u32> {
+        decl_name_range_to_local(self.db, self.file)
     }
 
     /// Per-file twin of `find_decorated_decls(extract_args = true)`: file-local
@@ -1055,6 +1054,26 @@ fn per_file_set(set_id: u32) -> Option<Arc<[PerFilePluginId]>> {
         .sets
         .get(set_id as usize)
         .map(Arc::clone)
+}
+
+/// `name_range → file-local idx` for every non-module / non-import node,
+/// salsa-cached. Several per-file plugins — and several helpers within one
+/// plugin — need this join table (to map a [`file_extraction`] row's range
+/// key to a file-local index); caching it here means the per-file pass builds
+/// it once per file and every consumer reads the memo, instead of each
+/// rebuilding an O(nodes) map. Re-runs only when ``file_to_nodes`` changes.
+#[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
+pub(crate) fn decl_name_range_to_local(
+    db: &dyn ProjectDb,
+    file: File,
+) -> rustc_hash::FxHashMap<(u32, u32), u32> {
+    file_to_nodes(db, file)
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| !matches!(n.kind, NodeKind::Module | NodeKind::Import))
+        .map(|(i, n)| (n.name_range, i as u32))
+        .collect()
 }
 
 /// Run one per-file plugin (configless builtin, configured builtin, or
