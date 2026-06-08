@@ -193,7 +193,16 @@ pub(crate) struct GraphBuilder {
     pub(crate) base_flags: Vec<u32>,
     pub(crate) node_index: FxHashMap<NodeKey, usize>,
     pub(crate) edges: Vec<(usize, usize, u8)>,
-    pub(crate) edge_set: FxHashSet<(usize, usize, u8)>,
+    /// Length of the sorted bulk prefix of `edges` installed by
+    /// [`Self::init_edges_bulk`]. Membership tests binary-search that
+    /// prefix; the (few) edges inserted after the bulk — peer-stub
+    /// extends, plugin replays, the project-plugin apply — land in
+    /// `edge_overflow`. Together they replace the old all-edges
+    /// `edge_set`, whose 1-hash-insert-per-edge fold dominated the
+    /// per-build edge refold at millions of edges.
+    pub(crate) bulk_len: usize,
+    /// Post-bulk inserts, for O(1) dedup of repeat `add_edge` calls.
+    pub(crate) edge_overflow: FxHashSet<(usize, usize, u8)>,
     /// Per-node forward / reverse adjacency lists kept in sync with
     /// ``edges``. ``bfs`` reads these so traversals are O(deg(i)) per
     /// pop instead of O(|edges|).
@@ -238,7 +247,8 @@ impl GraphBuilder {
             nodes: Vec::with_capacity(expected_nodes),
             node_index: FxHashMap::default(),
             edges: Vec::new(),
-            edge_set: FxHashSet::default(),
+            bulk_len: 0,
+            edge_overflow: FxHashSet::default(),
             forward_adj: Vec::with_capacity(expected_nodes),
             reverse_adj: Vec::with_capacity(expected_nodes),
             peer_pyi_to_py: FxHashMap::default(),
@@ -251,14 +261,15 @@ impl GraphBuilder {
         }
     }
 
-    /// Clear every **derived** edge structure (`edges`, `edge_set`,
-    /// both adjacency tables) and re-size the adjacency tables to the
-    /// current node count, ready for the per-build refold from
+    /// Clear every **derived** edge structure (`edges`, the dedup
+    /// state, both adjacency tables) and re-size the adjacency tables
+    /// to the current node count, ready for the per-build refold from
     /// `part_edges`. The persistent state — nodes, parts, blocks,
     /// tombstones, externals — is untouched.
     pub(crate) fn reset_derived_edges(&mut self) {
         self.edges.clear();
-        self.edge_set.clear();
+        self.bulk_len = 0;
+        self.edge_overflow.clear();
         self.forward_adj.clear();
         self.reverse_adj.clear();
         self.forward_adj.resize_with(self.nodes.len(), Vec::new);
@@ -342,13 +353,22 @@ impl GraphBuilder {
         idx
     }
 
+    /// Whether `triple` is already present: binary search over the
+    /// sorted bulk prefix, then the overflow set.
+    #[inline]
+    fn has_edge(&self, triple: (usize, usize, u8)) -> bool {
+        self.edges[..self.bulk_len].binary_search(&triple).is_ok()
+            || self.edge_overflow.contains(&triple)
+    }
+
     pub(crate) fn add_edge(&mut self, src: usize, dst: usize, flags: u8) {
         debug_assert!(
             !self.tombstoned.contains(&(src as u32)) && !self.tombstoned.contains(&(dst as u32)),
             "edge endpoint references a tombstoned node ({src} -> {dst})"
         );
         let triple = (src, dst, flags);
-        if self.edge_set.insert(triple) {
+        if !self.has_edge(triple) {
+            self.edge_overflow.insert(triple);
             self.edges.push(triple);
             self.forward_adj[src].push((dst, flags));
             self.reverse_adj[dst].push((src, flags));
@@ -358,21 +378,21 @@ impl GraphBuilder {
     /// Bulk-insert a batch of pre-sorted, pre-deduplicated edge triples.
     ///
     /// The caller is responsible for ordering / dedup'ing `triples`
-    /// (e.g. via `sort_unstable` + `dedup`); this method still probes
-    /// `edge_set` per triple to merge against any edges already present
+    /// (e.g. via `sort_unstable` + `dedup`); this method still checks
+    /// membership per triple to merge against any edges already present
     /// (so a second `extend_edges` call won't double-insert). Compared
     /// with looping `add_edge`, the win is amortising the per-edge
-    /// branch / hash overhead and pre-reserving capacity on `edges`
-    /// and the per-node adjacency vectors.
+    /// branch overhead and pre-reserving capacity on `edges` and the
+    /// per-node adjacency vectors.
     pub(crate) fn extend_edges(&mut self, triples: Vec<(usize, usize, u8)>) {
         if triples.is_empty() {
             return;
         }
-        self.edge_set.reserve(triples.len());
         self.edges.reserve(triples.len());
         for triple in triples {
-            if self.edge_set.insert(triple) {
+            if !self.has_edge(triple) {
                 let (src, dst, flags) = triple;
+                self.edge_overflow.insert(triple);
                 self.edges.push(triple);
                 self.forward_adj[src].push((dst, flags));
                 self.reverse_adj[dst].push((src, flags));
@@ -387,10 +407,11 @@ impl GraphBuilder {
     /// storage is derived from `triples` independently, on concurrent
     /// rayon tasks. Callers should release the GIL around this.
     ///
-    /// * `edges` is the triple list itself (moved in, no copy).
-    /// * `edge_set` is folded by a sibling task — still needed, since
-    ///   later `add_edge` / `extend_edges` calls (peer-stub edges, the
-    ///   plugin apply pass) dedup against it.
+    /// * `edges` is the triple list itself (moved in, no copy); its
+    ///   length is recorded as the sorted bulk prefix, so later
+    ///   `add_edge` / `extend_edges` calls (peer-stub edges, the
+    ///   plugin apply pass) dedup via binary search over it plus the
+    ///   small post-bulk overflow set — no all-edges hash fold.
     /// * `forward_adj`: `triples` is sorted by `(src, dst, flags)`, so
     ///   each node's out-list is one contiguous run; [`scatter_adjacency`]
     ///   partitions the runs into worker chunks and writes each chunk's
@@ -402,7 +423,7 @@ impl GraphBuilder {
     /// identical to looping the same triples through [`extend_edges`].
     pub(crate) fn init_edges_bulk(&mut self, triples: Vec<(usize, usize, u8)>) {
         debug_assert!(
-            self.edges.is_empty() && self.edge_set.is_empty(),
+            self.edges.is_empty() && self.edge_overflow.is_empty(),
             "init_edges_bulk requires an edge-less builder"
         );
         debug_assert!(
@@ -412,34 +433,23 @@ impl GraphBuilder {
         if triples.is_empty() {
             return;
         }
-        let mut edge_set = std::mem::take(&mut self.edge_set);
         let forward = self.forward_adj.as_mut_slice();
         let reverse = self.reverse_adj.as_mut_slice();
         let triples_ref = &triples;
         rayon::join(
             || {
-                edge_set.reserve(triples_ref.len());
-                edge_set.extend(triples_ref.iter().copied());
+                scatter_adjacency(forward, triples_ref, |&(src, dst, flags)| {
+                    (src, (dst, flags))
+                })
             },
             || {
-                rayon::join(
-                    || {
-                        scatter_adjacency(forward, triples_ref, |&(src, dst, flags)| {
-                            (src, (dst, flags))
-                        })
-                    },
-                    || {
-                        use rayon::prelude::*;
-                        let mut by_dst = triples_ref.clone();
-                        by_dst.par_sort_unstable_by_key(|&(src, dst, flags)| (dst, src, flags));
-                        scatter_adjacency(reverse, &by_dst, |&(src, dst, flags)| {
-                            (dst, (src, flags))
-                        });
-                    },
-                );
+                use rayon::prelude::*;
+                let mut by_dst = triples_ref.clone();
+                by_dst.par_sort_unstable_by_key(|&(src, dst, flags)| (dst, src, flags));
+                scatter_adjacency(reverse, &by_dst, |&(src, dst, flags)| (dst, (src, flags)));
             },
         );
-        self.edge_set = edge_set;
+        self.bulk_len = triples.len();
         self.edges = triples;
     }
 }
@@ -743,7 +753,7 @@ mod tests {
         assert!(b.nodes.is_empty());
         assert!(b.node_index.is_empty());
         assert!(b.edges.is_empty());
-        assert!(b.edge_set.is_empty());
+        assert!(b.edge_overflow.is_empty());
         assert!(b.forward_adj.is_empty());
         assert!(b.reverse_adj.is_empty());
         assert!(b.external_nodes.is_empty());
@@ -765,7 +775,7 @@ mod tests {
 
     /// Append a forward+reverse adjacency entry. The plain `Vec::push`
     /// path is enough because `bfs` only reads `forward_adj` /
-    /// `reverse_adj` — it never inspects `edges` / `edge_set` / `nodes`.
+    /// `reverse_adj` — it never inspects `edges` / the dedup state / `nodes`.
     fn add_edge_manual(b: &mut GraphBuilder, src: usize, dst: usize, flags: u8) {
         b.forward_adj[src].push((dst, flags));
         b.reverse_adj[dst].push((src, flags));
@@ -897,7 +907,6 @@ mod tests {
     /// per-node adjacency order (the documented bit-for-bit contract).
     fn assert_same_edges(a: &GraphBuilder, b: &GraphBuilder) {
         assert_eq!(a.edges, b.edges);
-        assert_eq!(a.edge_set, b.edge_set);
         assert_eq!(a.forward_adj, b.forward_adj);
         assert_eq!(a.reverse_adj, b.reverse_adj);
     }
@@ -919,7 +928,7 @@ mod tests {
         let mut b = empty_builder_with_n_slots(3);
         b.init_edges_bulk(Vec::new());
         assert!(b.edges.is_empty());
-        assert!(b.edge_set.is_empty());
+        assert!(b.edge_overflow.is_empty());
         assert!(b.forward_adj.iter().all(Vec::is_empty));
         assert!(b.reverse_adj.iter().all(Vec::is_empty));
     }
@@ -937,8 +946,8 @@ mod tests {
 
     #[test]
     fn init_edges_bulk_seeds_edge_set_for_later_extend() {
-        // A later extend_edges (the pass-3 / plugin path) must dedup
-        // against the bulk-initialized edge_set.
+        // A later extend_edges (the peer / plugin path) must dedup
+        // against the bulk-initialized sorted prefix.
         let mut b = empty_builder_with_n_slots(3);
         b.init_edges_bulk(vec![(0, 1, 0), (1, 2, 0)]);
         b.extend_edges(vec![(0, 1, 0), (2, 0, 0)]);

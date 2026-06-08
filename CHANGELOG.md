@@ -59,6 +59,25 @@ two versions.
   builds (event scope ∪ fingerprint-moved files) instead of every project
   file.
 
+### Changed
+
+- **Assemble hill-climb (every build, biggest on incremental).** Four
+  structural cuts, output byte-identical throughout: (1) memo-slot
+  translation is demand-driven — only the ids the re-translate set's rows
+  reference are translated (a one-file edit translates dozens of entries,
+  not the whole memo) — and runs as a GIL-free parallel fan-out; (2) the
+  project-wide `ref_to_global` map is gone — symbolic targets carry their
+  `File`, so translation goes `ordinal → block base +
+  payload.ref_to_local[ref]` (peer-stub edges are pure arithmetic:
+  `twin base + local`); (3) the all-edges `edge_set` is gone — post-bulk
+  dedup binary-searches the sorted bulk prefix plus a small overflow set,
+  deleting a hash insert per edge from every build (and ~8% of peak RSS at
+  the benchmark scale); (4) `ProjectContext.materialize()` returns `None`
+  instead of a `NativeGraph` snapshot — the snapshot allocated one
+  `Py<SymbolNode>` per node per rebuild and its only caller discarded it
+  (query the live graph through the context). On the 50k-file benchmark
+  corpus the incremental edit loop's median dropped 4.63s → 1.81s.
+
 - **Topic/fact channel for native plugins.** A per-file native plugin can
   now hand structured facts up to its project-wide reader. A plugin declares
   topics with `ExternalPlugin::declare_topics() -> Vec<TopicSpec>` (same

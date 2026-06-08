@@ -644,18 +644,12 @@ class ProjectContext:
         """
         ...
 
-    def materialize(self) -> NativeGraph:
+    def materialize(self) -> None:
         """Build the project-wide graph, run every registered plugin,
-        then snapshot the final state.
-
-        The build pass runs first; project-wide plugins then fan out
-        across a GIL-free ``rayon`` scope (one task per plugin, each
-        with its own salsa-db snapshot), while per-file plugins are
-        folded inline during the build's own parallel file walk. Every
-        plugin observes the same frozen base-graph state — its own
-        emissions are invisible to its own queries and to other
-        plugins' — and the collected ops fold into the graph in
-        registration order in one end-of-pass apply.
+        and leave the live graph on this context (query it via
+        ``nodes()`` / ``edges()`` / the index-returning queries — no
+        ``NativeGraph`` snapshot is materialized; that cost one
+        ``Py<SymbolNode>`` per node on every rebuild).
         """
         ...
 

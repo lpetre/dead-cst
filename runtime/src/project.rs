@@ -9,7 +9,7 @@ use parking_lot::lock_api::RawRwLockRecursive;
 use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyOSError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 use ruff_db::files::File;
@@ -901,6 +901,9 @@ fn assemble_graph<'db>(
         /// twin, only decls whose name isn't in the twin's exports
         /// need it.
         twin_payload: Option<&'db FileNodes>,
+        /// The `.py` twin itself, for the peer-edge translation
+        /// (`ordinal_of[twin] → twin block base`).
+        twin_file: Option<File>,
         /// Whether this file's node block is (re-)minted this build.
         /// Clean incremental files keep their block and skip the fill.
         fill: bool,
@@ -934,6 +937,7 @@ fn assemble_graph<'db>(
                     path_str,
                     is_stub,
                     twin_payload,
+                    twin_file: peer_pyi_to_py.get(&file).copied(),
                     fill: true,
                 });
                 total_nodes += payload.nodes.len();
@@ -991,6 +995,7 @@ fn assemble_graph<'db>(
                     path_str,
                     is_stub,
                     twin_payload,
+                    twin_file: peer_pyi_to_py.get(&file).copied(),
                     fill: dirty[pos],
                 });
             }
@@ -1027,8 +1032,6 @@ fn assemble_graph<'db>(
         FxHashMap::with_capacity_and_hasher(total_decls / 4 + 1, Default::default());
     let mut decl_by_name_range: FxHashMap<(File, (u32, u32)), usize> =
         FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
-    let mut ref_to_global: FxHashMap<NodeRef, usize> =
-        FxHashMap::with_capacity_and_hasher(total_nodes, Default::default());
     let mut all_warnings: Vec<String> = Vec::new();
 
     // Pass 0: serial-only resolution prep — fetch the spec payloads
@@ -1494,7 +1497,6 @@ fn assemble_graph<'db>(
     // refs every pass.
     let mints_ref = &mints;
     let counters_ref: &ProgressCounters = counters;
-    let ref_to_global_mut = &mut ref_to_global;
     let global_index_mut = &mut global_index;
     let module_nodes_mut = &mut module_nodes_by_file;
     let class_by_selection_mut = &mut class_by_selection;
@@ -1556,22 +1558,31 @@ fn assemble_graph<'db>(
                             })
                     },
                     move || {
-                        // Each index fold is a serial insert loop over `Copy`
-                        // keys — cheap enough per map that one task per map
-                        // (rather than per-file sharding + merge) hides them
-                        // behind the node fill.
+                        // Two serial insert loops over `Copy` keys on
+                        // sibling rayon tasks — each cheap enough to
+                        // hide behind the node fill / resolve arm.
+                        // (There is no project-wide NodeRef → idx map
+                        // any more: symbolic targets carry their
+                        // `File`, so translation goes
+                        // `ordinal_of[file] → block base +
+                        // payload.ref_to_local[ref]`. The
+                        // position-distinct invariant — `CLAUDE.md`
+                        // principle 3 — is enforced per file by the
+                        // payload's own `ref_to_local`, and the
+                        // `File` inside every key rules out
+                        // cross-file collisions by construction.)
                         rayon::join(
                             move || {
                                 for mint in mints_ref {
                                     for (local_idx, &node_ref) in
                                         mint.payload.refs.iter().enumerate()
                                     {
-                                        let prev = ref_to_global_mut
-                                            .insert(node_ref, mint.base + local_idx);
-                                        // Position-distinct invariant
-                                        // (`CLAUDE.md` principle 3): no two
-                                        // payload nodes share a NodeRef.
-                                        debug_assert!(prev.is_none());
+                                        if let NodeRef::Def(d) = node_ref {
+                                            // `d` is already the `(file,
+                                            // place_id, name_range)` triple
+                                            // `global_index` keys on.
+                                            global_index_mut.insert(d, mint.base + local_idx);
+                                        }
                                     }
                                 }
                             },
@@ -1585,11 +1596,7 @@ fn assemble_graph<'db>(
                                             NodeRef::Module(_) => {
                                                 module_nodes_mut.insert(mint.file, global_idx);
                                             }
-                                            NodeRef::Def(d) => {
-                                                // `d` is already the `(file,
-                                                // place_id, name_range)` triple
-                                                // `global_index` keys on.
-                                                global_index_mut.insert(d, global_idx);
+                                            NodeRef::Def(_) => {
                                                 let node_data = &mint.payload.nodes[local_idx];
                                                 let rk = node_data.name_range;
                                                 if matches!(node_data.kind, NodeKind::Class) {
@@ -1600,11 +1607,9 @@ fn assemble_graph<'db>(
                                                     .insert((mint.file, rk), global_idx);
                                             }
                                             NodeRef::StarStmt(_, _) => {
-                                                // The kept `*<src>` star-statement
-                                                // node. Not a real decl, so it
-                                                // contributes nothing to the decl
-                                                // indices; the `ref_to_global`
-                                                // fold already wired it up.
+                                                // Star-statement node: not a
+                                                // decl, contributes nothing to
+                                                // the decl indices.
                                             }
                                         }
                                     }
@@ -1716,52 +1721,7 @@ fn assemble_graph<'db>(
         }
     }
 
-    // Memo slots indexed by the dense resolution ids — the stamping
-    // and translation passes below never hash a key. Rebuilt for every
-    // entry each pass (cheap — per unique resolution, not per row):
-    // dense node ids only move for re-minted files, and the symbolic
-    // memo never goes stale.
-    let mut member_slots: Vec<MemberSlot> = Vec::with_capacity(member_results.len());
-    for ((res, _touched), &live) in member_results.iter().zip(&member_live) {
-        if !live {
-            // Stale entry: no current row references this id, so the
-            // slot is never read — and translating it could mint
-            // phantom externals. Push an empty placeholder to keep the
-            // id space aligned.
-            member_slots.push(MemberSlot {
-                idxs: SmallVec::new(),
-                unresolved: false,
-                start_file: None,
-            });
-            continue;
-        }
-        let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
-        for node in &res.targets {
-            if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
-                idxs.push(idx);
-            }
-        }
-        member_slots.push(MemberSlot {
-            idxs,
-            unresolved: res.unresolved,
-            start_file: res.start_file,
-        });
-    }
-    let mut dynamic_slots: Vec<SmallVec<[usize; 4]>> = Vec::with_capacity(dynamic_results.len());
-    for ((nodes, _touched), &live) in dynamic_results.iter().zip(&dynamic_live) {
-        if !live {
-            dynamic_slots.push(SmallVec::new());
-            continue;
-        }
-        let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
-        for node in nodes {
-            if let Some(idx) = translate_resolved(db, &mut builder, &ref_to_global, node) {
-                idxs.push(idx);
-            }
-        }
-        dynamic_slots.push(idxs);
-    }
-
+    let t_detect = std::time::Instant::now();
     // Re-translate set: the files whose part must be rebuilt this
     // build. Dirty (re-minted) files always; plus files whose
     // cross-file answers changed — a spec row whose memo entry
@@ -1787,9 +1747,10 @@ fn assemble_graph<'db>(
                         Target::Member(_) => member_redo[id as usize],
                         Target::Dynamic(_) => dynamic_redo[id as usize],
                     })
-                    || builder.part_edges[pos]
-                        .iter_all()
-                        .any(|&(_, d, _)| newly_tombstoned.contains(&d));
+                    || (!newly_tombstoned.is_empty()
+                        && builder.part_edges[pos]
+                            .iter_all()
+                            .any(|&(_, d, _)| newly_tombstoned.contains(&d)));
                 if hit {
                     r[pos] = true;
                 }
@@ -1798,6 +1759,123 @@ fn assemble_graph<'db>(
         }
     };
 
+    let t_detect = t_detect.elapsed();
+    let t_slots = std::time::Instant::now();
+    // Slot demand: the memo-slot translations are only ever read by
+    // the re-translate set's rows (spec-edge emission + UNRESOLVED
+    // stamping), so translate exactly the ids those rows reference —
+    // on a one-file edit that's a few dozen entries instead of the
+    // whole memo; a full build needs every live entry.
+    let (needed_member, needed_dynamic): (Vec<bool>, Vec<bool>) = match &dirty_files {
+        None => (member_live.clone(), dynamic_live.clone()),
+        Some(_) => {
+            let mut nm = vec![false; member_results.len()];
+            let mut nd = vec![false; dynamic_results.len()];
+            for pos in 0..n_files {
+                if !retranslate[pos] {
+                    continue;
+                }
+                for (spec, &id) in spec_payloads[pos].specs.iter().zip(spec_ids[pos].iter()) {
+                    match &spec.target {
+                        Target::Local(_) => {}
+                        Target::Member(_) => nm[id as usize] = true,
+                        Target::Dynamic(_) => nd[id as usize] = true,
+                    }
+                }
+            }
+            (nm, nd)
+        }
+    };
+
+    // Memo-slot translation: symbolic targets to this build's dense
+    // ids. Every target carries its `File`, so translation is
+    // `ordinal_of[file] → block base + payload.ref_to_local[ref]` —
+    // no project-wide NodeRef map, no db, no builder mutation (the
+    // external pre-mint above already interned every live anchor), so
+    // the fan-out is GIL-free and embarrassingly parallel. Un-needed
+    // ids keep an empty placeholder to hold the id space aligned.
+    let external_nodes_ref = &builder.external_nodes;
+    let mints_for_slots = &mints;
+    let ordinal_for_slots = &ordinal_of;
+    let member_results_ref = &member_results;
+    let dynamic_results_ref = &dynamic_results;
+    let needed_member_ref = &needed_member;
+    let needed_dynamic_ref = &needed_dynamic;
+    let (member_slots, dynamic_slots): (Vec<MemberSlot>, Vec<SmallVec<[usize; 4]>>) = py
+        .allow_threads(move || {
+            use rayon::prelude::*;
+            let translate = |node: &ResolvedNode| -> Option<usize> {
+                match node {
+                    ResolvedNode::Module(f) => {
+                        // Every payload's index 0 is its synthetic
+                        // module node.
+                        ordinal_for_slots
+                            .get(f)
+                            .map(|&pos| mints_for_slots[pos].base)
+                    }
+                    ResolvedNode::Def(k) => {
+                        let &pos = ordinal_for_slots.get(&k.0)?;
+                        let mint = &mints_for_slots[pos];
+                        mint.payload
+                            .ref_to_local
+                            .get(&NodeRef::Def(*k))
+                            .map(|&l| mint.base + l as usize)
+                    }
+                    ResolvedNode::StarStmt(f, rk) => {
+                        let &pos = ordinal_for_slots.get(f)?;
+                        let mint = &mints_for_slots[pos];
+                        mint.payload
+                            .ref_to_local
+                            .get(&NodeRef::StarStmt(*f, *rk))
+                            .map(|&l| mint.base + l as usize)
+                    }
+                    ResolvedNode::External { fqname, .. } => {
+                        external_nodes_ref.get(fqname.as_str()).copied()
+                    }
+                }
+            };
+            let member_slots: Vec<MemberSlot> = member_results_ref
+                .par_iter()
+                .enumerate()
+                .with_min_len(2048)
+                .map(|(id, (res, _touched))| {
+                    if !needed_member_ref[id] {
+                        return MemberSlot::default();
+                    }
+                    let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
+                    for node in &res.targets {
+                        if let Some(idx) = translate(node) {
+                            idxs.push(idx);
+                        }
+                    }
+                    MemberSlot {
+                        idxs,
+                        unresolved: res.unresolved,
+                        start_file: res.start_file,
+                    }
+                })
+                .collect();
+            let dynamic_slots: Vec<SmallVec<[usize; 4]>> = dynamic_results_ref
+                .par_iter()
+                .enumerate()
+                .with_min_len(2048)
+                .map(|(id, (nodes, _touched))| {
+                    if !needed_dynamic_ref[id] {
+                        return SmallVec::new();
+                    }
+                    let mut idxs: SmallVec<[usize; 4]> = SmallVec::new();
+                    for node in nodes {
+                        if let Some(idx) = translate(node) {
+                            idxs.push(idx);
+                        }
+                    }
+                    idxs
+                })
+                .collect();
+            (member_slots, dynamic_slots)
+        });
+
+    let t_slots = t_slots.elapsed();
     // Re-stamp `NodeFlags::UNRESOLVED` on every import alias in the
     // re-translate set whose upstream module didn't resolve — the flag
     // rides the alias node directly. Only `Binding`-role refs are
@@ -1908,9 +1986,10 @@ fn assemble_graph<'db>(
     let mints_ref2 = &mints;
     let parent_results_ref = &parent_results;
     let module_nodes_ref = &module_nodes_by_file;
-    let ref_to_global_ref = &ref_to_global;
+    let ordinal_of_ref2 = &ordinal_of;
     let plugin_ops_ref = &plugin_ops;
     let retranslate_pos: Vec<usize> = (0..n_files).filter(|&pos| retranslate[pos]).collect();
+    let t_parts = std::time::Instant::now();
     /// One re-translated part: `(file ordinal, sectioned triples)`.
     type NewPart = (usize, PartEdges);
     let new_parts: Vec<NewPart> = py.allow_threads(move || {
@@ -1963,24 +2042,29 @@ fn assemble_graph<'db>(
                 // runtime decl. Own section — the old pipeline's
                 // pass 3 extended these after the bulk init.
                 if mint.is_stub {
-                    if let Some(py_payload) = mint.twin_payload {
-                        for (name, pyi_locals) in &mint.payload.exports_by_name {
-                            let Some(py_locals) = py_payload.exports_by_name.get(name) else {
-                                continue;
-                            };
-                            for &pyi_local in pyi_locals {
-                                let pyi_idx = base + pyi_local as usize;
-                                for &py_local in py_locals {
-                                    let py_ref = py_payload.refs[py_local as usize];
-                                    let Some(&py_idx) = ref_to_global_ref.get(&py_ref) else {
-                                        continue;
-                                    };
-                                    part.peer.push((pyi_idx as u32, py_idx as u32, 0));
+                    if let (Some(py_payload), Some(twin_file)) = (mint.twin_payload, mint.twin_file)
+                    {
+                        // A per-file local index *is* the offset into
+                        // the twin's block — no map probe needed.
+                        let twin_base = ordinal_of_ref2
+                            .get(&twin_file)
+                            .map(|&pos| mints_ref2[pos].base);
+                        if let Some(twin_base) = twin_base {
+                            for (name, pyi_locals) in &mint.payload.exports_by_name {
+                                let Some(py_locals) = py_payload.exports_by_name.get(name) else {
+                                    continue;
+                                };
+                                for &pyi_local in pyi_locals {
+                                    let pyi_idx = base + pyi_local as usize;
+                                    for &py_local in py_locals {
+                                        let py_idx = twin_base + py_local as usize;
+                                        part.peer.push((pyi_idx as u32, py_idx as u32, 0));
+                                    }
                                 }
                             }
+                            part.peer.sort_unstable();
+                            part.peer.dedup();
                         }
-                        part.peer.sort_unstable();
-                        part.peer.dedup();
                     }
                 }
                 // Per-file plugin edge ops (file-local endpoints). Own
@@ -2015,6 +2099,8 @@ fn assemble_graph<'db>(
         builder.part_edges[pos] = part;
     }
 
+    let t_parts = t_parts.elapsed();
+    let t_refold = std::time::Instant::now();
     // Global edge refold, replaying the historical assemble's phases
     // so a full build's edge order is **byte-identical** to the old
     // pipeline (and an incremental build's order follows the same
@@ -2084,8 +2170,12 @@ fn assemble_graph<'db>(
 
     if std::env::var_os("DEAD_CST_TIMING").is_some() {
         eprintln!(
-            "[dead-cst-timing] pass2={:?} retranslated={} tombstoned={}",
+            "[dead-cst-timing] pass2={:?} (detect={:?} slots={:?} parts={:?} refold={:?}) retranslated={} tombstoned={}",
             t_pass2_start.elapsed(),
+            t_detect,
+            t_slots,
+            t_parts,
+            t_refold.elapsed(),
             retranslate.iter().filter(|&&r| r).count(),
             builder.tombstoned.len(),
         );
@@ -2127,6 +2217,7 @@ fn assemble_graph<'db>(
 /// indices for this build. Rebuilt from the symbolic
 /// [`ResolveCache`] memo every pass (`assemble_graph` 2c), so the
 /// translation can never go stale across re-minted blocks.
+#[derive(Default)]
 struct MemberSlot {
     idxs: SmallVec<[usize; 4]>,
     unresolved: bool,
@@ -2197,27 +2288,6 @@ fn spec_edges(
         }
     }
     out
-}
-
-/// Translate one `'static` resolution output node to its global graph
-/// index. `Module` / `Def` / `StarStmt` probe `ref_to_global` (built
-/// in pass 1; a miss means the owning file wasn't enumerated — drop).
-/// `External` interns into the builder, which dedups by fqname, so the
-/// first (sorted-key-order) encounter pins the node deterministically.
-fn translate_resolved(
-    db: &ProjectDatabase,
-    builder: &mut GraphBuilder,
-    ref_to_global: &FxHashMap<NodeRef, usize>,
-    node: &ResolvedNode,
-) -> Option<usize> {
-    match node {
-        ResolvedNode::Module(f) => ref_to_global.get(&NodeRef::Module(*f)).copied(),
-        ResolvedNode::Def(k) => ref_to_global.get(&NodeRef::Def(*k)).copied(),
-        ResolvedNode::StarStmt(f, rk) => ref_to_global.get(&NodeRef::StarStmt(*f, *rk)).copied(),
-        ResolvedNode::External { fqname, file } => {
-            Some(builder.intern_external(fqname.to_string(), file_path_string(db, *file), *file))
-        }
-    }
 }
 
 /// Fixed pool of salsa snapshots for the resolve fan-out, cloned on
@@ -3112,7 +3182,7 @@ impl ProjectContext {
     /// folds the lot into the graph. A plugin's own emissions are
     /// invisible to its own queries (and to other plugins' queries)
     /// during ``run``.
-    pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<NativeGraph> {
+    pub(crate) fn materialize(slf: Py<Self>, py: Python<'_>) -> PyResult<()> {
         let show_progress = slf.borrow(py).show_progress;
         let stack_size = slf.borrow(py).stack_size;
         let counters = Arc::clone(&slf.borrow(py).progress);
@@ -3342,23 +3412,12 @@ impl ProjectContext {
             }
         }
 
-        // Snapshot a fresh ``NativeGraph`` from the builder's
-        // interned node + edge vecs; the originals stay put.
-        let this = slf.borrow(py);
-        let outputs_ref = this.outputs.read();
-        let outputs = outputs_ref
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("ProjectContext lost its outputs"))?;
-        let nodes = outputs
-            .builder
-            .nodes
-            .iter()
-            .map(|n| n.to_symbol(py))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(NativeGraph {
-            nodes,
-            edges: outputs.builder.edges.clone(),
-        })
+        // No snapshot: the live graph is queried through the context
+        // (`nodes()` / `edges()` / the index-returning queries).
+        // Materializing a `NativeGraph` here cost one `Py<SymbolNode>`
+        // per node on every (re)build — many GB of Python objects at
+        // scale — and the only caller discarded it.
+        Ok(())
     }
 
     /// Atomic snapshot of the build-progress counters as a Python
