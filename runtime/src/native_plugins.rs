@@ -644,6 +644,20 @@ impl<'db> FileContext<'db> {
             .filter_map(|(rk, names)| by_range.get(rk).map(|&local| (local, names.clone())))
             .collect()
     }
+
+    /// File-local indices of top-level classes that define a method named
+    /// `method_name`, from the salsa-cached `class_method_defs` rows — the
+    /// per-file twin of `find_classes_defining_method_indices`.
+    fn classes_defining_method(&self, method_name: &str) -> Vec<u32> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let by_range = self.name_range_to_local();
+        facts
+            .class_method_defs
+            .iter()
+            .filter(|(_, methods)| methods.iter().any(|m| m == method_name))
+            .filter_map(|(rk, _)| by_range.get(rk).copied())
+            .collect()
+    }
 }
 
 /// Salsa cache-key discriminant for a *configless* per-file plugin. A cheap
@@ -970,7 +984,7 @@ impl NativePlugin {
     /// `__init_subclass__`-defining classes alive via a marker node.
     #[staticmethod]
     fn init_subclass() -> Self {
-        Self::project_wide(Arc::new(InitSubclassPluginImpl))
+        Self::dual_mode(Arc::new(InitSubclassPluginImpl))
     }
 
     /// Native `ServerConfigPlugin` — mark conventional WSGI/ASGI server
@@ -2461,6 +2475,11 @@ pub mod plugin_api {
         ) -> rustc_hash::FxHashMap<u32, Vec<compact_str::CompactString>> {
             self.inner.class_method_params_by_local()
         }
+
+        /// File-local indices of classes defining a method named `method_name`.
+        pub(crate) fn classes_defining_method(&self, method_name: &str) -> Vec<u32> {
+            self.inner.classes_defining_method(method_name)
+        }
     }
 
     /// File-local op sink for a [`PerFilePlugin`]. Emits in this file's
@@ -2707,11 +2726,43 @@ const UNITTEST_BASE_FQNAMES: [&str; 2] = ["unittest.TestCase", "unittest.Isolate
 /// Port of `dead_cst.plugins.init_subclass.InitSubclassPlugin`: for each
 /// class defining `__init_subclass__`, emit a marker node reachable from the
 /// parent that keeps every transitive subclass alive.
+/// Topic pinning each class that defines `__init_subclass__` (file-local
+/// detection); the project-wide resolve walks its subclasses.
+const INIT_SUBCLASS_TOPIC_PARENT: &str = "init_subclass/parent";
+
+/// Init-subclass, decomposed: the per-file pass detects `__init_subclass__`
+/// definers (a pure file-local read of `class_method_defs`); the project-wide
+/// resolve does the cross-file subclass walk those parents need.
 pub(crate) struct InitSubclassPluginImpl;
+
+impl plugin_api::PerFilePlugin for InitSubclassPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        for local in file.classes_defining_method("__init_subclass__") {
+            ops.emit_fact(INIT_SUBCLASS_TOPIC_PARENT, Some(local), "");
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
     fn name(&self) -> &str {
         "InitSubclassPlugin"
+    }
+
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: INIT_SUBCLASS_TOPIC_PARENT.to_string(),
+            description: "A class defining __init_subclass__, pinned to the class decl; \
+                          its transitive subclasses are kept reachable from it."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
+    }
+
+    fn resolves_facts(&self) -> bool {
+        true
     }
 
     fn run(
@@ -2719,10 +2770,15 @@ impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
-        let parents = ctx.classes_defining_method("__init_subclass__");
-        for parent_idx in &parents {
-            for subclass_idx in ctx.find_subclasses_of(*parent_idx) {
-                ops.add_edge(*parent_idx, subclass_idx, plugin_api::FLAG_INIT_SUBCLASS);
+        let Some(handle) = ctx.topic(INIT_SUBCLASS_TOPIC_PARENT) else {
+            return Ok(());
+        };
+        for fact in ctx.facts_for_topic(handle) {
+            let Some(parent_idx) = fact.decl_idx else {
+                continue;
+            };
+            for subclass_idx in ctx.find_subclasses_of(parent_idx) {
+                ops.add_edge(parent_idx, subclass_idx, plugin_api::FLAG_INIT_SUBCLASS);
             }
         }
         Ok(())
