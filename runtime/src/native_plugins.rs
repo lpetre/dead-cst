@@ -647,6 +647,36 @@ impl<'db> FileContext<'db> {
             .collect()
     }
 
+    /// Per-file twin of `find_handler_decorators`: `(owner name, file-local
+    /// idx)` for every decl carrying an `@<owner>.<attr>(...)` decorator whose
+    /// `attr` is one of `decorator_attrs` — one row per distinct owner in
+    /// source order. Reads the salsa-cached `decorator_rows` directly.
+    fn handler_decorators_local(&self, decorator_attrs: &[&str]) -> Vec<(String, u32)> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let attrs: rustc_hash::FxHashSet<&str> = decorator_attrs.iter().copied().collect();
+        let by_range = self.name_range_to_local();
+        let mut out: Vec<(String, u32)> = Vec::new();
+        for (rk, descriptors) in &facts.decorator_rows {
+            let Some(&local) = by_range.get(rk) else {
+                continue;
+            };
+            let mut seen_owners: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+            for desc in descriptors {
+                let [attr] = desc.attrs.as_slice() else {
+                    continue;
+                };
+                if !attrs.contains(attr.as_str()) {
+                    continue;
+                }
+                if !seen_owners.insert(desc.root_name.as_str()) {
+                    continue;
+                }
+                out.push((desc.root_name.to_string(), local));
+            }
+        }
+        out
+    }
+
     /// Visit every call site in this file (decl-owned and module-scope),
     /// yielding the *file-local* owner index (module-scope → 0). The per-file
     /// twin of [`for_each_call_site`](crate::project) keyed on local indices.
@@ -1264,7 +1294,7 @@ impl NativePlugin {
     /// group declared in one file may collect handlers registered in another.
     #[staticmethod]
     fn click() -> Self {
-        Self::project_wide(Arc::new(ClickPluginImpl))
+        Self::dual_mode(Arc::new(ClickPluginImpl))
     }
 
     /// Native `MockPatchPlugin` (port of `dead_cst.contrib.mock_patch`).
@@ -2621,6 +2651,15 @@ pub mod plugin_api {
             self.inner.classes_defining_method(method_name)
         }
 
+        /// `(owner name, file-local idx)` for `@<owner>.<attr>(...)`-decorated
+        /// decls whose `attr` is one of `decorator_attrs`.
+        pub(crate) fn handler_decorators_local(
+            &self,
+            decorator_attrs: &[&str],
+        ) -> Vec<(String, u32)> {
+            self.inner.handler_decorators_local(decorator_attrs)
+        }
+
         /// `(local owner, literal)` for calls to `name` imported from one of
         /// `modules`, taking the `arg_index` positional string literal.
         pub(crate) fn calls_to_imported_local(
@@ -3535,95 +3574,67 @@ const CLICK_SUBGROUP_DECORATOR: &str = "group";
 
 pub(crate) struct ClickPluginImpl;
 
-impl plugin_api::ExternalPlugin for ClickPluginImpl {
-    fn name(&self) -> &str {
-        "click"
-    }
-
-    fn run(
-        &self,
-        ctx: &plugin_api::PluginCtx<'_>,
-        ops: &mut plugin_api::PluginOps,
-    ) -> Result<(), plugin_api::PluginError> {
-        // Cheap import-presence guard (`has_imports_of("click")`).
-        if !ctx.has_imports_of("click") {
-            return Ok(());
+impl plugin_api::PerFilePlugin for ClickPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        // Cheap import-presence guard.
+        if !file.imports_any_module(&["click"]) {
+            return;
         }
 
-        // --- Phase 1: gather indices. ---
+        // --- Phase 1: gather file-local indices. ---
 
         // Groups via `@click.group` / `@click.Group`-decorated decls.
-        let group_decls: Vec<usize> = ctx.decorated_decls(&["click"], &CLICK_GROUP_DECORATORS);
-
+        let group_decls = file.decorated_decls(&["click"], &CLICK_GROUP_DECORATORS);
         // Groups via `X = click.Group(...)` constructions.
-        let group_ctors: Vec<usize> = ctx.constructions(&["click"], &["Group"]);
-
+        let group_ctors = file.constructions(&["click"], &["Group"]);
         // No groups => no wiring to do (the fixpoint would no-op anyway).
         if group_decls.is_empty() && group_ctors.is_empty() {
-            return Ok(());
+            return;
         }
 
         // Handlers: `@<owner>.{command,group,result_callback}(...)`.
-        let handlers: Vec<(String, usize)> = ctx.handler_decorators(&CLICK_REGISTRATION_DECORATORS);
-
+        let handlers = file.handler_decorators_local(&CLICK_REGISTRATION_DECORATORS);
         // Subgroup links: handlers decorated specifically with
-        // `@<owner>.group(...)`. Wiring such a handler promotes it to a
-        // group so its own `@<handler>.command()` handlers wire next pass.
-        let subgroup_links: FxHashSet<(usize, String)> = ctx
-            .handler_decorators(&[CLICK_SUBGROUP_DECORATOR])
+        // `@<owner>.group(...)`. Wiring such a handler promotes it to a group
+        // so its own `@<handler>.command()` handlers wire next pass.
+        let subgroup_links: FxHashSet<(u32, String)> = file
+            .handler_decorators_local(&[CLICK_SUBGROUP_DECORATOR])
             .into_iter()
             .map(|(owner, idx)| (idx, owner))
             .collect();
 
-        // --- Phase 2: resolve paths/fqnames + run the group->handler
-        // fixpoint. Pre-fetch (path, simple name) for every group + handler
-        // node up front so the loop needs no random node access. ---
+        // --- Phase 2: group->handler fixpoint. Everything is keyed within
+        // this one file, so the old `(path, name)` key reduces to the simple
+        // name (path is constant), and every wired edge is file-local. ---
 
-        // groups_by_owner: (path, simple name) -> [group idx, ...].
-        let group_idxs: Vec<usize> = group_decls
-            .iter()
-            .chain(group_ctors.iter())
-            .copied()
-            .collect();
-        let mut groups_by_owner: FxHashMap<(String, String), Vec<usize>> = FxHashMap::default();
-        for nv in ctx.nodes_at(&group_idxs) {
-            let simple = simple_name(&nv.fqname).to_string();
-            groups_by_owner
-                .entry((nv.path, simple))
-                .or_default()
-                .push(nv.idx);
+        // Local idx -> simple name, for every node in the file.
+        let nodes = file.nodes();
+        let simple_of = |idx: u32| -> String {
+            nodes
+                .get(idx as usize)
+                .map(|n| simple_name(&n.fqname).to_string())
+                .unwrap_or_default()
+        };
+
+        // groups_by_name: simple name -> [group local idx, ...].
+        let mut groups_by_name: FxHashMap<String, Vec<u32>> = FxHashMap::default();
+        for &g in group_decls.iter().chain(group_ctors.iter()) {
+            groups_by_name.entry(simple_of(g)).or_default().push(g);
         }
 
-        // decorated_idx -> (path, simple name) for every handler decl.
-        let handler_idxs: Vec<usize> = handlers.iter().map(|(_, idx)| *idx).collect();
-        let handler_attr: FxHashMap<usize, (String, String)> = ctx
-            .nodes_at(&handler_idxs)
-            .into_iter()
-            .map(|nv| {
-                let simple = simple_name(&nv.fqname).to_string();
-                (nv.idx, (nv.path, simple))
-            })
-            .collect();
-
         // Fixpoint: wire each handler to its owning group(s); a newly wired
-        // subgroup handler becomes a group, exposing its own handlers on the
-        // next pass. `emitted` dedups edges so the loop terminates once no
-        // new group is discovered. Verbatim port of `ClickPlugin.run`'s loop.
-        let mut emitted: FxHashSet<(usize, usize)> = FxHashSet::default();
+        // subgroup handler becomes a group, exposing its own handlers next
+        // pass. `emitted` dedups edges so the loop terminates once no new group
+        // is discovered. Verbatim port of `ClickPlugin.run`'s loop.
+        let mut emitted: FxHashSet<(u32, u32)> = FxHashSet::default();
         let mut changed = true;
         while changed {
             changed = false;
             for (owner_name, decorated_idx) in &handlers {
-                let Some((path, decorated_simple)) = handler_attr.get(decorated_idx).cloned()
-                else {
-                    continue;
-                };
-                // Snapshot the owner's group idxs: the insert below may
-                // mutate `groups_by_owner`, and the dedup + outer loop make
-                // deferring a same-pass insertion to the next pass
-                // fixpoint-equivalent.
-                let Some(owner_idxs) = groups_by_owner.get(&(path.clone(), owner_name.clone()))
-                else {
+                // Snapshot the owner's group idxs: the insert below may mutate
+                // `groups_by_name`, and the dedup + outer loop make deferring a
+                // same-pass insertion to the next pass fixpoint-equivalent.
+                let Some(owner_idxs) = groups_by_name.get(owner_name) else {
                     continue;
                 };
                 for owner_idx in owner_idxs.clone() {
@@ -3632,8 +3643,8 @@ impl plugin_api::ExternalPlugin for ClickPluginImpl {
                     }
                     ops.add_edge(owner_idx, *decorated_idx, 0);
                     if subgroup_links.contains(&(*decorated_idx, owner_name.clone())) {
-                        groups_by_owner
-                            .entry((path.clone(), decorated_simple.clone()))
+                        groups_by_name
+                            .entry(simple_of(*decorated_idx))
                             .or_default()
                             .push(*decorated_idx);
                         changed = true;
@@ -3641,8 +3652,16 @@ impl plugin_api::ExternalPlugin for ClickPluginImpl {
                 }
             }
         }
+    }
+}
 
-        Ok(())
+impl plugin_api::ExternalPlugin for ClickPluginImpl {
+    fn name(&self) -> &str {
+        "click"
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
     }
 }
 
