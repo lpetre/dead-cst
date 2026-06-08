@@ -203,18 +203,16 @@ pub(crate) fn extract_plugin_jobs(
             }
         }
         let (job, name) = match &native_ref.kind {
-            NativePluginKind::External {
-                plugin,
-                per_file_id: None,
-                name,
-                ..
-            } => (PluginJob::External(Arc::clone(plugin)), name.clone()),
+            // Every `ExternalPlugin` runs its project-wide `run` — including
+            // one that also opts into per-file dispatch (`per_file_id: Some`),
+            // which additionally emits facts during the build walk. The two
+            // phases compose: the per-file pass publishes, `run` resolves. A
+            // plugin with no project-wide work just inherits the no-op default
+            // `run`, so this costs it nothing.
+            NativePluginKind::External { plugin, name, .. } => {
+                (PluginJob::External(Arc::clone(plugin)), name.clone())
+            }
             NativePluginKind::PerFile(id) => (PluginJob::Noop, id.name()),
-            NativePluginKind::External {
-                per_file_id: Some(_),
-                name,
-                ..
-            } => (PluginJob::Noop, name.clone()),
         };
         jobs.push(job);
         names.push(name);
@@ -535,6 +533,216 @@ impl<'db> FileContext<'db> {
                 }
             }
         }
+        out
+    }
+
+    // --- fact-emission helpers (dual-mode per-file plugins) -----------------
+    //
+    // These read the same salsa-cached [`file_extraction`] rows the
+    // project-wide finders join against `decl_by_name_range`, but key the
+    // result on *file-local* indices (via each node's `name_range`, which is
+    // exactly `range_key(def.name.range())` — the key those rows carry). So a
+    // dual-mode plugin's per-file fact emission matches its old project-wide
+    // walk decl-for-decl, while riding the per-file salsa cache.
+
+    /// `name_range → file-local idx` for every non-module / non-import node.
+    /// `decl_by_name_range`'s per-file restriction: the decl rows in
+    /// [`file_extraction`] (`decorator_rows`, `function_params`, …) are keyed
+    /// by the same `name_range`, so this is the local-space join table.
+    fn name_range_to_local(&self) -> rustc_hash::FxHashMap<(u32, u32), u32> {
+        self.nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| !matches!(n.kind, NodeKind::Module | NodeKind::Import))
+            .map(|(i, n)| (n.name_range, i as u32))
+            .collect()
+    }
+
+    /// Per-file twin of `find_decorated_decls(extract_args = true)`: file-local
+    /// indices of decls decorated by one of `names` from one of `modules`,
+    /// paired with the decorator's captured kwargs. Mirrors
+    /// `find_decorated_decls_core`'s inner loop (first matching decorator wins).
+    fn decorated_decls_with_args(&self, modules: &[&str], names: &[&str]) -> Vec<(u32, CallArgs)> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let names_set: FxHashSet<&str> = names.iter().copied().collect();
+        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+        let imports = crate::file_extraction::imports_local_from_facts(
+            &facts.import_facts,
+            &modules_owned,
+            &names_set,
+        );
+        if imports.is_empty() {
+            return Vec::new();
+        }
+        let by_range = self.name_range_to_local();
+        let mut out: Vec<(u32, CallArgs)> = Vec::new();
+        for (rk, descriptors) in &facts.decorator_rows {
+            let Some(&local) = by_range.get(rk) else {
+                continue;
+            };
+            for desc in descriptors {
+                let matched = match desc.attrs.as_slice() {
+                    [] => imports
+                        .get(&desc.root_name)
+                        .is_some_and(|target| names_set.contains(target.as_str())),
+                    [attr] => {
+                        imports
+                            .get(&desc.root_name)
+                            .map(compact_str::CompactString::as_str)
+                            == Some(crate::helpers::MODULE_ALIAS_MARKER)
+                            && names_set.contains(attr.as_str())
+                    }
+                    _ => false,
+                };
+                if matched {
+                    out.push((local, desc.kwargs.clone()));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// `file-local idx → parameter names` for this file's top-level functions,
+    /// read from the salsa-cached `function_params` rows (the same data
+    /// `ProjectContext::function_parameters` serves project-wide).
+    fn function_params_by_local(
+        &self,
+    ) -> rustc_hash::FxHashMap<u32, Vec<compact_str::CompactString>> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let by_range = self.name_range_to_local();
+        facts
+            .function_params
+            .iter()
+            .filter_map(|(rk, names)| by_range.get(rk).map(|&local| (local, names.clone())))
+            .collect()
+    }
+
+    /// `file-local idx → method parameter names` for this file's top-level
+    /// classes (every method's parameters, the union pytest matches against),
+    /// read from the salsa-cached `class_method_params` rows.
+    fn class_method_params_by_local(
+        &self,
+    ) -> rustc_hash::FxHashMap<u32, Vec<compact_str::CompactString>> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let by_range = self.name_range_to_local();
+        facts
+            .class_method_params
+            .iter()
+            .filter_map(|(rk, names)| by_range.get(rk).map(|&local| (local, names.clone())))
+            .collect()
+    }
+
+    /// File-local indices of top-level classes that define a method named
+    /// `method_name`, from the salsa-cached `class_method_defs` rows — the
+    /// per-file twin of `find_classes_defining_method_indices`.
+    fn classes_defining_method(&self, method_name: &str) -> Vec<u32> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let by_range = self.name_range_to_local();
+        facts
+            .class_method_defs
+            .iter()
+            .filter(|(_, methods)| methods.iter().any(|m| m == method_name))
+            .filter_map(|(rk, _)| by_range.get(rk).copied())
+            .collect()
+    }
+
+    /// Visit every call site in this file (decl-owned and module-scope),
+    /// yielding the *file-local* owner index (module-scope → 0). The per-file
+    /// twin of [`for_each_call_site`](crate::project) keyed on local indices.
+    fn for_each_call_site_local(
+        &self,
+        mut f: impl FnMut(u32, &crate::file_extraction::CallSiteFact),
+    ) {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let by_range = self.name_range_to_local();
+        for (rk, sites) in &facts.call_sites_by_decl {
+            // A call site whose enclosing decl isn't a node falls back to the
+            // module node (idx 0) — same `.or(module_idx)` the global walk uses.
+            let owner = by_range.get(rk).copied().unwrap_or(0);
+            for site in sites {
+                f(owner, site);
+            }
+        }
+        for site in &facts.module_call_sites {
+            f(0, site);
+        }
+    }
+
+    /// Per-file twin of `find_calls_to_imported`: `(local owner, literal)` for
+    /// calls to `name` imported from one of `modules`, taking the `arg_index`
+    /// positional string literal.
+    fn calls_to_imported_local(
+        &self,
+        modules: &[&str],
+        name: &str,
+        arg_index: usize,
+    ) -> Vec<(u32, String)> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+        let allowed: rustc_hash::FxHashSet<&str> = [name].into_iter().collect();
+        let imports = crate::file_extraction::imports_local_from_facts(
+            &facts.import_facts,
+            &modules_owned,
+            &allowed,
+        );
+        if imports.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<(u32, String)> = Vec::new();
+        self.for_each_call_site_local(|owner, site| {
+            let Some(chain) = &site.callee else {
+                return;
+            };
+            if crate::file_extraction::match_callee_chain(
+                &chain.root_name,
+                &chain.attrs,
+                &imports,
+                &modules_owned,
+                &allowed,
+            )
+            .is_none()
+            {
+                return;
+            }
+            if let Some(arg) = site.nth_positional_string(arg_index) {
+                out.push((owner, arg.to_string()));
+            }
+        });
+        out
+    }
+
+    /// Per-file twin of `find_calls_on_var`: `(local owner, literal)` for
+    /// `<owner>.<attr>(...)` calls (bare-name receiver), taking the
+    /// `arg_index` positional string literal, optionally gated on an exact
+    /// positional-argument count.
+    fn calls_on_var_local(
+        &self,
+        owner_name: &str,
+        attr: &str,
+        arg_index: usize,
+        required_positional: Option<usize>,
+    ) -> Vec<(u32, String)> {
+        let mut out: Vec<(u32, String)> = Vec::new();
+        self.for_each_call_site_local(|owner, site| {
+            let Some(chain) = &site.callee else {
+                return;
+            };
+            let [only] = chain.attrs.as_slice() else {
+                return;
+            };
+            if chain.root_name.as_str() != owner_name || only.as_str() != attr {
+                return;
+            }
+            if let Some(expected) = required_positional {
+                if site.positional_len != expected {
+                    return;
+                }
+            }
+            if let Some(arg) = site.nth_positional_string(arg_index) {
+                out.push((owner, arg.to_string()));
+            }
+        });
         out
     }
 }
@@ -863,7 +1071,7 @@ impl NativePlugin {
     /// `__init_subclass__`-defining classes alive via a marker node.
     #[staticmethod]
     fn init_subclass() -> Self {
-        Self::project_wide(Arc::new(InitSubclassPluginImpl))
+        Self::dual_mode(Arc::new(InitSubclassPluginImpl))
     }
 
     /// Native `ServerConfigPlugin` — mark conventional WSGI/ASGI server
@@ -892,7 +1100,7 @@ impl NativePlugin {
     /// lifecycle hooks alive. Project-wide (the subclass walk spans files).
     #[staticmethod]
     fn unittest() -> Self {
-        Self::project_wide(Arc::new(UnittestPluginImpl))
+        Self::dual_mode(Arc::new(UnittestPluginImpl))
     }
 
     /// Native Flask dispatch-app plugin (port of
@@ -1002,7 +1210,7 @@ impl NativePlugin {
     /// targets a decl in another).
     #[staticmethod]
     fn mock_patch() -> Self {
-        Self::project_wide(Arc::new(MockPatchPluginImpl))
+        Self::dual_mode(Arc::new(MockPatchPluginImpl))
     }
 
     /// Native `DiscordPyPlugin` (port of `dead_cst.contrib.discordpy`). Wire
@@ -1020,7 +1228,7 @@ impl NativePlugin {
     /// (the subclass / fixture walk spans files).
     #[staticmethod]
     fn pytest() -> Self {
-        Self::project_wide(Arc::new(PytestPluginImpl))
+        Self::dual_mode(Arc::new(PytestPluginImpl))
     }
 
     /// Native `ProjectScriptsPlugin` (port of
@@ -1094,6 +1302,29 @@ impl NativePlugin {
                 name: plugin.name().to_string(),
                 plugin,
                 per_file_id: None,
+                _lib: None,
+            },
+        }
+    }
+
+    /// Wrap a curated **dual-mode** built-in: it emits facts per-file
+    /// (salsa-cached via [`per_file_plugin_ops`], so a clean file's facts are
+    /// reused with zero re-run) and resolves them in its project-wide `run`.
+    /// Registers the plugin for per-file dispatch and keeps it `External`, so
+    /// the host runs *both* phases (every `ExternalPlugin` runs its `run`; a
+    /// `Some` `per_file()` adds the build-walk emit). The plugin must return
+    /// `Some` from `per_file()`.
+    fn dual_mode(plugin: Arc<dyn plugin_api::ExternalPlugin>) -> Self {
+        debug_assert!(
+            plugin.per_file().is_some(),
+            "dual_mode plugin must implement per_file()"
+        );
+        let per_file_id = Some(register_external_per_file(Arc::clone(&plugin)));
+        Self {
+            kind: NativePluginKind::External {
+                name: plugin.name().to_string(),
+                plugin,
+                per_file_id,
                 _lib: None,
             },
         }
@@ -1353,14 +1584,17 @@ pub mod plugin_api {
     /// [`run`](ExternalPlugin::run) once per materialize against the frozen
     /// graph, then folds the emitted ops in as a single batch.
     ///
-    /// A plugin can optionally opt into **per-file** dispatch by also
+    /// A plugin can additionally opt into **per-file** dispatch by also
     /// implementing [`PerFilePlugin`] and returning `Some(self)` from
-    /// [`per_file`](ExternalPlugin::per_file). When it does, the host ignores
-    /// [`run`](ExternalPlugin::run) and instead invokes
+    /// [`per_file`](ExternalPlugin::per_file): the host then invokes
     /// [`PerFilePlugin::run_on_file`] once per project file through a
     /// salsa-cached query — so an unchanged file's ops are reused across a
-    /// `re_materialize` with zero re-run. (Same fast-path the in-tree
-    /// `MainBlockPlugin` rides.)
+    /// `re_materialize` with zero re-run (same fast-path the in-tree
+    /// `MainBlockPlugin` rides) — **and still calls [`run`](ExternalPlugin::run)**
+    /// for the project-wide pass. The two compose: the per-file pass typically
+    /// emits facts ([`FileOps::emit_fact`]) and `run` resolves them
+    /// ([`PluginCtx::facts_for_topic`]). A plugin with no project-wide work
+    /// simply leaves `run` as the no-op default, which costs nothing.
     pub trait ExternalPlugin: Send + Sync {
         /// Human-readable name (surfaced in progress logs).
         fn name(&self) -> &str;
@@ -1369,15 +1603,16 @@ pub mod plugin_api {
         /// frozen-graph contract as every built-in. Return
         /// `Err(`[`PluginError`]`)` to fail the whole materialize with that
         /// message; the host raises the mapped Python exception. Default no-op
-        /// (`Ok(())`) so a pure per-file plugin needn't implement it — the host
-        /// skips it entirely when [`per_file`](ExternalPlugin::per_file) is
-        /// `Some`.
+        /// (`Ok(())`), so a pure per-file plugin needn't implement it — the host
+        /// still calls it, but the default does nothing.
         fn run(&self, _ctx: &PluginCtx<'_>, _ops: &mut PluginOps) -> Result<(), PluginError> {
             Ok(())
         }
 
         /// Opt into per-file (salsa-cached) dispatch by returning
-        /// `Some(self)`. The default `None` keeps the plugin project-wide.
+        /// `Some(self)`, *in addition to* the project-wide [`run`](Self::run)
+        /// the host always calls. The default `None` keeps the plugin
+        /// project-wide only.
         ///
         /// Whether a plugin is per-file is read **once, at load** — it must
         /// not depend on runtime state.
@@ -2279,6 +2514,71 @@ pub mod plugin_api {
         pub fn calls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
             self.inner.calls(modules, names)
         }
+
+        // --- dual-mode (fact-emission) helpers, in-tree only ----------------
+        //
+        // `pub(crate)` so the surface external dylib authors compile against
+        // stays unchanged; the in-tree dual-mode built-ins use these to emit
+        // facts pinned to file-local decls, matching their old project-wide
+        // walk while riding the per-file salsa cache.
+
+        /// This file's source path (every node in it shares it).
+        pub(crate) fn path_string(&self) -> String {
+            self.inner.path()
+        }
+
+        /// File-local decls decorated by one of `names` from one of `modules`,
+        /// paired with the decorator's captured kwargs. See
+        /// [`FileContext::decorated_decls_with_args`].
+        pub(crate) fn decorated_decls_with_args(
+            &self,
+            modules: &[&str],
+            names: &[&str],
+        ) -> Vec<(u32, CallArgs)> {
+            self.inner.decorated_decls_with_args(modules, names)
+        }
+
+        /// `file-local idx → function parameter names`.
+        pub(crate) fn function_params_by_local(
+            &self,
+        ) -> rustc_hash::FxHashMap<u32, Vec<compact_str::CompactString>> {
+            self.inner.function_params_by_local()
+        }
+
+        /// `file-local idx → class method parameter names`.
+        pub(crate) fn class_method_params_by_local(
+            &self,
+        ) -> rustc_hash::FxHashMap<u32, Vec<compact_str::CompactString>> {
+            self.inner.class_method_params_by_local()
+        }
+
+        /// File-local indices of classes defining a method named `method_name`.
+        pub(crate) fn classes_defining_method(&self, method_name: &str) -> Vec<u32> {
+            self.inner.classes_defining_method(method_name)
+        }
+
+        /// `(local owner, literal)` for calls to `name` imported from one of
+        /// `modules`, taking the `arg_index` positional string literal.
+        pub(crate) fn calls_to_imported_local(
+            &self,
+            modules: &[&str],
+            name: &str,
+            arg_index: usize,
+        ) -> Vec<(u32, String)> {
+            self.inner.calls_to_imported_local(modules, name, arg_index)
+        }
+
+        /// `(local owner, literal)` for `<owner>.<attr>(...)` calls.
+        pub(crate) fn calls_on_var_local(
+            &self,
+            owner_name: &str,
+            attr: &str,
+            arg_index: usize,
+            required_positional: Option<usize>,
+        ) -> Vec<(u32, String)> {
+            self.inner
+                .calls_on_var_local(owner_name, attr, arg_index, required_positional)
+        }
     }
 
     /// File-local op sink for a [`PerFilePlugin`]. Emits in this file's
@@ -2525,11 +2825,39 @@ const UNITTEST_BASE_FQNAMES: [&str; 2] = ["unittest.TestCase", "unittest.Isolate
 /// Port of `dead_cst.plugins.init_subclass.InitSubclassPlugin`: for each
 /// class defining `__init_subclass__`, emit a marker node reachable from the
 /// parent that keeps every transitive subclass alive.
+/// Topic pinning each class that defines `__init_subclass__` (file-local
+/// detection); the project-wide resolve walks its subclasses.
+const INIT_SUBCLASS_TOPIC_PARENT: &str = "init_subclass/parent";
+
+/// Init-subclass, decomposed: the per-file pass detects `__init_subclass__`
+/// definers (a pure file-local read of `class_method_defs`); the project-wide
+/// resolve does the cross-file subclass walk those parents need.
 pub(crate) struct InitSubclassPluginImpl;
+
+impl plugin_api::PerFilePlugin for InitSubclassPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        for local in file.classes_defining_method("__init_subclass__") {
+            ops.emit_fact(INIT_SUBCLASS_TOPIC_PARENT, Some(local), "");
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
     fn name(&self) -> &str {
         "InitSubclassPlugin"
+    }
+
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: INIT_SUBCLASS_TOPIC_PARENT.to_string(),
+            description: "A class defining __init_subclass__, pinned to the class decl; \
+                          its transitive subclasses are kept reachable from it."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
     }
 
     fn run(
@@ -2537,10 +2865,15 @@ impl plugin_api::ExternalPlugin for InitSubclassPluginImpl {
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
-        let parents = ctx.classes_defining_method("__init_subclass__");
-        for parent_idx in &parents {
-            for subclass_idx in ctx.find_subclasses_of(*parent_idx) {
-                ops.add_edge(*parent_idx, subclass_idx, plugin_api::FLAG_INIT_SUBCLASS);
+        let Some(handle) = ctx.topic(INIT_SUBCLASS_TOPIC_PARENT) else {
+            return Ok(());
+        };
+        for fact in ctx.facts_for_topic(handle) {
+            let Some(parent_idx) = fact.decl_idx else {
+                continue;
+            };
+            for subclass_idx in ctx.find_subclasses_of(parent_idx) {
+                ops.add_edge(parent_idx, subclass_idx, plugin_api::FLAG_INIT_SUBCLASS);
             }
         }
         Ok(())
@@ -2614,7 +2947,46 @@ fn server_config_run_on_file(
 /// (`setUpModule` / `tearDownModule` / `load_tests`) in any file that
 /// imports `unittest`. Cross-file (the subclass walk spans files), so it
 /// can't be per-file.
+/// File-scoped fact (no pinned decl) signalling that this file imports
+/// `unittest` — the project-wide resolve runs the TestCase subclass walk iff
+/// any file published it (preserving the old `has_imports_of` short-circuit).
+const UNITTEST_TOPIC_IMPORTS: &str = "unittest/imports";
+
+/// Unittest, decomposed. The module-hook wiring is purely file-local — a
+/// `module -> setUpModule/tearDownModule/load_tests` edge within one file — so
+/// it moves wholesale into the per-file pass (salsa-cached; the old version
+/// rescanned every project node each build). The TestCase subclass flagging is
+/// genuinely cross-file (a base resolved through ty, transitive descendants in
+/// other files), so it stays in the project-wide resolve, gated on the
+/// per-file `unittest/imports` signal.
 pub(crate) struct UnittestPluginImpl;
+
+impl plugin_api::PerFilePlugin for UnittestPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        if !file.imports_any_module(&["unittest"]) {
+            return;
+        }
+        // Signal the project-wide subclass walk that unittest is in play.
+        ops.emit_fact(UNITTEST_TOPIC_IMPORTS, None, "");
+        // Module lifecycle hooks ride a `module -> hook` edge (alive iff the
+        // module is reached) — both endpoints are in this file, so it's a
+        // file-local edge, no project query needed.
+        let module_idx = file.module_local_idx();
+        for node in file.nodes().iter().skip(1) {
+            if node.kind != "function" {
+                continue;
+            }
+            let simple = node
+                .fqname
+                .rsplit_once('.')
+                .map(|(_, n)| n)
+                .unwrap_or(node.fqname.as_str());
+            if UNITTEST_MODULE_HOOKS.contains(&simple) {
+                ops.add_edge(module_idx, node.local_idx, 0);
+            }
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for UnittestPluginImpl {
     fn name(&self) -> &str {
@@ -2625,22 +2997,36 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
         vec![testcase_flag_spec()]
     }
 
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: UNITTEST_TOPIC_IMPORTS.to_string(),
+            description: "Published (file-scoped) by each file importing unittest; gates \
+                          the project-wide TestCase subclass walk."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
+    }
+
     fn run(
         &self,
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
-        // O(1) presence probe — short-circuit before the subclass walk.
-        if !ctx.has_imports_of("unittest") {
+        // Short-circuit before the subclass walk when nothing imports unittest
+        // (the per-file pass would have published at least one fact).
+        let imports = ctx
+            .topic(UNITTEST_TOPIC_IMPORTS)
+            .map(|h| ctx.facts_for_topic(h));
+        if imports.is_none_or(|f| f.is_empty()) {
             return Ok(());
         }
         // The bit the host allocated for our declared `test/testcase` flag.
         let testcase_flag = ctx
             .node_flag("test/testcase")
             .expect("test/testcase is declared in declare_node_flags");
-        let import_idxs = ctx.imports_of("unittest");
-        let importer_paths: std::collections::HashSet<String> =
-            ctx.node_paths(&import_idxs).into_iter().collect();
 
         // TestCase subclasses are unconditional roots — a test class stays
         // alive even if nothing imports its module — so stamp the
@@ -2652,28 +3038,6 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
             for idx in ctx.find_subclasses_of_fqn(base, true) {
                 if flagged.insert(idx) {
                     ops.flag_decl(idx, testcase_flag);
-                }
-            }
-        }
-
-        // Module lifecycle hooks (`setUpModule` / `tearDownModule` /
-        // `load_tests`) only fire while their module's tests run, so they
-        // ride a `module -> hook` edge: alive iff the module is reached (its
-        // own live TestCases keep it so), dead with it — the same shape as
-        // the engine's module-dunder edges. Restricted to files importing
-        // unittest so an unrelated `setUpModule` is never pinned.
-        for node in ctx.nodes() {
-            if node.kind != "function" || !importer_paths.contains(node.path) {
-                continue;
-            }
-            let simple = node
-                .fqname
-                .rsplit_once('.')
-                .map(|(_, n)| n)
-                .unwrap_or(node.fqname);
-            if UNITTEST_MODULE_HOOKS.contains(&simple) {
-                if let Some(module_idx) = ctx.module_for(node.path) {
-                    ops.add_edge(module_idx, node.idx, 0);
                 }
             }
         }
@@ -3226,11 +3590,61 @@ impl plugin_api::ExternalPlugin for ClickPluginImpl {
 // test file targets a decl in another), hence project-wide.
 // ---------------------------------------------------------------------------
 
+/// Topic carrying one patch site: pinned to the enclosing decl (the `owner`),
+/// value = the patch target's fqname string. The project-wide resolve groups
+/// by fqname, resolves it cross-file, and wires the keep-alive edges.
+const MOCKPATCH_TOPIC_SITE: &str = "mockpatch/site";
+
+/// Mock-patch, decomposed. Detecting the four patch-call shapes — `patch("X")`
+/// (from unittest.mock / mock), `mocker.patch("X")`,
+/// `monkeypatch.setattr("X", v)` / `.delattr("X")` — is a pure read of this
+/// file's salsa-cached call sites, emitted as `mockpatch/site` facts. The
+/// project-wide run does only the cross-file part: resolving each target
+/// fqname to its decls / module and wiring `owner -> target` keep-alive edges.
 pub(crate) struct MockPatchPluginImpl;
+
+impl plugin_api::PerFilePlugin for MockPatchPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        let mut emit = |owner: u32, target: String| {
+            ops.emit_fact(MOCKPATCH_TOPIC_SITE, Some(owner), target);
+        };
+        // `patch("X.Y")` imported from unittest.mock / mock.
+        for (owner, target) in file.calls_to_imported_local(&["unittest.mock", "mock"], "patch", 0)
+        {
+            emit(owner, target);
+        }
+        // `mocker.patch("X.Y")` (pytest-mock fixture).
+        for (owner, target) in file.calls_on_var_local("mocker", "patch", 0, None) {
+            emit(owner, target);
+        }
+        // `monkeypatch.setattr("X.Y", v)` (2 positional) /
+        // `monkeypatch.delattr("X.Y")` (1 positional). The required-positional
+        // count distinguishes the fqname form from the object form
+        // (`setattr(obj, "name", v)`).
+        for (attr, required) in [("setattr", 2usize), ("delattr", 1usize)] {
+            for (owner, target) in file.calls_on_var_local("monkeypatch", attr, 0, Some(required)) {
+                emit(owner, target);
+            }
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
     fn name(&self) -> &str {
         "MockPatchPlugin"
+    }
+
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: MOCKPATCH_TOPIC_SITE.to_string(),
+            description: "A patch/monkeypatch call site: pinned to the enclosing decl, \
+                          value = the target fqname string to keep alive."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
     }
 
     fn run(
@@ -3238,41 +3652,24 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
-        // Phase 1: gather (enclosing decl idx, target fqname) rows from the
-        // four patch-call shapes.
-        let mut rows: Vec<(usize, String)> = Vec::new();
-        // `patch("X.Y")` imported from unittest.mock / mock.
-        for (owner_idx, target) in ctx.calls_with_string_arg(&["unittest.mock", "mock"], "patch", 0)
-        {
-            rows.push((owner_idx, target));
-        }
-        // `mocker.patch("X.Y")` (pytest-mock fixture).
-        for (owner_idx, target) in ctx.calls_on_var("mocker", "patch", 0, None) {
-            rows.push((owner_idx, target));
-        }
-        // `monkeypatch.setattr("X.Y", v)` (2 positional) /
-        // `monkeypatch.delattr("X.Y")` (1 positional). The
-        // required-positional count distinguishes the fqname form from the
-        // object form (`setattr(obj, "name", v)`).
-        for (attr, required) in [("setattr", 2usize), ("delattr", 1usize)] {
-            for (owner_idx, target) in ctx.calls_on_var("monkeypatch", attr, 0, Some(required)) {
-                rows.push((owner_idx, target));
-            }
-        }
-
-        if rows.is_empty() {
+        let Some(handle) = ctx.topic(MOCKPATCH_TOPIC_SITE) else {
             return Ok(());
-        }
-
-        // Bucket owners by target fqname, first-seen order preserved (matches
-        // the Python dict insertion order).
+        };
+        // Bucket owners by target fqname (first-seen order preserved for
+        // determinism; facts arrive in file order).
         let mut order: Vec<String> = Vec::new();
         let mut owners_by_fqname: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-        for (owner_idx, fqname) in rows {
-            if !owners_by_fqname.contains_key(&fqname) {
-                order.push(fqname.clone());
+        for fact in ctx.facts_for_topic(handle) {
+            let Some(owner_idx) = fact.decl_idx else {
+                continue;
+            };
+            if !owners_by_fqname.contains_key(&fact.value) {
+                order.push(fact.value.clone());
             }
-            owners_by_fqname.entry(fqname).or_default().push(owner_idx);
+            owners_by_fqname
+                .entry(fact.value)
+                .or_default()
+                .push(owner_idx);
         }
 
         // Resolve targets per fqname (decls + the module node if the fqname is
@@ -3969,7 +4366,107 @@ fn fixture_flag_spec() -> plugin_api::FlagSpec {
     }
 }
 
+/// Topics pytest publishes per-file and resolves project-wide. Names are
+/// stable (the per-file salsa cache emits by name); descriptions must stay
+/// fixed (a conflicting re-registration fails the materialize).
+const PYTEST_TOPIC_TESTCASE: &str = "pytest/testcase";
+const PYTEST_TOPIC_FIXTURE_FLAG: &str = "pytest/fixture_flag";
+const PYTEST_TOPIC_FIXTURE_NAME: &str = "pytest/fixture_name";
+const PYTEST_TOPIC_TESTPARAM: &str = "pytest/testparam";
+
+fn pytest_topic_specs() -> Vec<crate::topic_registry::TopicSpec> {
+    use crate::topic_registry::TopicSpec;
+    vec![
+        TopicSpec {
+            name: PYTEST_TOPIC_TESTCASE.to_string(),
+            description: "A pytest test decl (test_* function / Test* class in a test \
+                          file); resolved to a test/testcase flag."
+                .to_string(),
+        },
+        TopicSpec {
+            name: PYTEST_TOPIC_FIXTURE_FLAG.to_string(),
+            description: "A decl kept alive as a fixture (a @pytest.fixture or any \
+                          conftest.py top-level decl); resolved to a test/fixture flag."
+                .to_string(),
+        },
+        TopicSpec {
+            name: PYTEST_TOPIC_FIXTURE_NAME.to_string(),
+            description: "A @pytest.fixture's binding name (its `name=` kwarg or simple \
+                          name); the value is the binding, pinned to the fixture decl."
+                .to_string(),
+        },
+        TopicSpec {
+            name: PYTEST_TOPIC_TESTPARAM.to_string(),
+            description: "One parameter name of a test function / test class, pinned to \
+                          the test decl; resolved to a test→fixture edge when it names a \
+                          fixture binding."
+                .to_string(),
+        },
+    ]
+}
+
+/// Pytest, decomposed into a per-file salsa-cached fact emitter
+/// ([`plugin_api::PerFilePlugin`]) and a project-wide resolve
+/// ([`plugin_api::ExternalPlugin::run`]). The per-file pass observes only this
+/// file's decls/decorators/params (all from the salsa-cached
+/// [`crate::file_extraction::file_extraction`]) and publishes facts; the
+/// project-wide pass aggregates them — building the cross-file fixture-name
+/// map and matching test parameters to fixtures — with no project walk. On an
+/// incremental edit, a clean file's facts are reused verbatim.
 pub(crate) struct PytestPluginImpl;
+
+impl plugin_api::PerFilePlugin for PytestPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        let path = file.path_string();
+        let filename = path_basename(&path);
+        let nodes = file.nodes();
+
+        if filename == "conftest.py" {
+            // Every top-level function / class / variable decl is kept alive as
+            // a fixture (conftest auto-loading isn't modeled as edges).
+            for node in nodes.iter().skip(1) {
+                if matches!(node.kind.as_str(), "function" | "class" | "variable") {
+                    ops.emit_fact(PYTEST_TOPIC_FIXTURE_FLAG, Some(node.local_idx), "");
+                }
+            }
+        } else if is_test_filename(filename) {
+            // Genuine test decls → testcase; their parameter names → testparam
+            // facts for the project-wide fixture match.
+            let fn_params = file.function_params_by_local();
+            let cls_params = file.class_method_params_by_local();
+            for node in nodes.iter().skip(1) {
+                if !is_test_decl(&node.kind, &node.fqname) {
+                    continue;
+                }
+                ops.emit_fact(PYTEST_TOPIC_TESTCASE, Some(node.local_idx), "");
+                let params = match node.kind.as_str() {
+                    "function" => fn_params.get(&node.local_idx),
+                    "class" => cls_params.get(&node.local_idx),
+                    _ => None,
+                };
+                if let Some(names) = params {
+                    for name in names {
+                        ops.emit_fact(PYTEST_TOPIC_TESTPARAM, Some(node.local_idx), name.as_str());
+                    }
+                }
+            }
+        }
+
+        // `@pytest.fixture`-decorated decls (in any file): flagged a fixture,
+        // and their binding name published for the cross-file param match.
+        for (local, args) in file.decorated_decls_with_args(&["pytest"], &["fixture"]) {
+            ops.emit_fact(PYTEST_TOPIC_FIXTURE_FLAG, Some(local), "");
+            let binding: compact_str::CompactString = match args.kwargs.get("name") {
+                Some(ArgValue::Str(alias)) => alias.clone(),
+                _ => nodes
+                    .get(local as usize)
+                    .map(|n| simple_name(&n.fqname).into())
+                    .unwrap_or_default(),
+            };
+            ops.emit_fact(PYTEST_TOPIC_FIXTURE_NAME, Some(local), binding.as_str());
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for PytestPluginImpl {
     fn name(&self) -> &str {
@@ -3978,6 +4475,14 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
 
     fn declare_node_flags(&self) -> Vec<plugin_api::FlagSpec> {
         vec![testcase_flag_spec(), fixture_flag_spec()]
+    }
+
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        pytest_topic_specs()
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
     }
 
     fn run(
@@ -3992,109 +4497,48 @@ impl plugin_api::ExternalPlugin for PytestPluginImpl {
         let fixture_flag = ctx
             .node_flag("test/fixture")
             .expect("test/fixture is declared in declare_node_flags");
-        // Every top-level function / class / variable decl + its path.
-        let idxs = ctx.nodes_matching(&plugin_api::NodeFilter {
-            kinds: &["function", "class", "variable"],
-            simple_names: &[],
-            paths: &[],
-            fqname_prefix: None,
-            flags_all: None,
-            flags_any: None,
-        });
-        if idxs.is_empty() {
-            return Ok(());
-        }
-        let paths = ctx.node_paths(&idxs);
 
-        // Flag every conftest.py decl `test/fixture`; collect test-file
-        // candidates for the `test/testcase` pass below. `fixture_flagged`
-        // dedups against the `@pytest.fixture` pass so a fixture defined in a
-        // conftest is flagged exactly once.
-        let mut fixture_flagged: FxHashSet<usize> = FxHashSet::default();
-        let mut cand_idxs: Vec<usize> = Vec::new();
-        for (idx, path) in idxs.iter().zip(paths.iter()) {
-            let filename = path_basename(path);
-            if filename == "conftest.py" {
-                if fixture_flagged.insert(*idx) {
-                    ops.flag_decl(*idx, fixture_flag);
-                }
-            } else if is_test_filename(filename) {
-                cand_idxs.push(*idx);
+        // Resolve our topic handles once. A `None` means the topic collected
+        // no facts this build (nothing to do for it).
+        let facts = |name: &str| {
+            ctx.topic(name)
+                .map(|h| ctx.facts_for_topic(h))
+                .unwrap_or_default()
+        };
+
+        // Flag passes — idempotent OR, so the conftest / @pytest.fixture
+        // overlap that the old pass dedup-tracked is harmless here.
+        for fact in facts(PYTEST_TOPIC_FIXTURE_FLAG) {
+            if let Some(idx) = fact.decl_idx {
+                ops.flag_decl(idx, fixture_flag);
+            }
+        }
+        for fact in facts(PYTEST_TOPIC_TESTCASE) {
+            if let Some(idx) = fact.decl_idx {
+                ops.flag_decl(idx, testcase_flag);
             }
         }
 
-        // Flag genuine test decls `test/testcase`; track function/class kinds
-        // for the fixture-parameter edges below.
-        let mut test_function_idxs: Vec<usize> = Vec::new();
-        let mut test_class_idxs: Vec<usize> = Vec::new();
-        if !cand_idxs.is_empty() {
-            let attrs = ctx.nodes_at(&cand_idxs);
-            for (idx, attr) in cand_idxs.iter().zip(attrs.iter()) {
-                if !is_test_decl(&attr.kind, &attr.fqname) {
-                    continue;
-                }
-                ops.flag_decl(*idx, testcase_flag);
-                if attr.kind == "function" {
-                    test_function_idxs.push(*idx);
-                } else if attr.kind == "class" {
-                    test_class_idxs.push(*idx);
-                }
+        // binding name -> [fixture idx], from the per-file fixture-name facts.
+        let mut fixtures_by_name: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for fact in facts(PYTEST_TOPIC_FIXTURE_NAME) {
+            if let Some(idx) = fact.decl_idx {
+                fixtures_by_name.entry(fact.value).or_default().push(idx);
             }
         }
-
-        // `@pytest.fixture`-decorated decls (args extracted for the `name=`
-        // alias). Each is conservatively flagged `test/fixture` — the rule
-        // that catches autouse / usefixtures / indirect without modeling them.
-        let fixture_refs: Vec<(usize, CallArgs)> =
-            ctx.decorated_decls_with_args(&["pytest"], &["fixture"]);
-        if fixture_refs.is_empty() {
+        if fixtures_by_name.is_empty() {
             return Ok(());
         }
-        for (idx, _) in &fixture_refs {
-            if fixture_flagged.insert(*idx) {
-                ops.flag_decl(*idx, fixture_flag);
-            }
-        }
-        let fixture_idxs_all: Vec<usize> = fixture_refs.iter().map(|(idx, _)| *idx).collect();
 
-        // Parameter-name edges. Skip when no test signature to inspect.
-        if test_function_idxs.is_empty() && test_class_idxs.is_empty() {
-            return Ok(());
-        }
-        // binding name -> [fixture idx]. Binding is the `name=` kwarg literal
-        // when present, else the function's simple name.
-        let fixture_attrs = ctx.nodes_at(&fixture_idxs_all);
-        let mut fixtures_by_name: FxHashMap<compact_str::CompactString, Vec<usize>> =
-            FxHashMap::default();
-        for ((idx, args), attr) in fixture_refs.iter().zip(fixture_attrs.iter()) {
-            let binding = match args.kwargs.get("name") {
-                Some(ArgValue::Str(alias)) => alias.clone(),
-                _ => simple_name(&attr.fqname).into(),
+        // Parameter-name edges: each test-parameter fact whose value names a
+        // fixture binding wires the test decl to that fixture.
+        for fact in facts(PYTEST_TOPIC_TESTPARAM) {
+            let Some(test_idx) = fact.decl_idx else {
+                continue;
             };
-            fixtures_by_name.entry(binding).or_default().push(*idx);
-        }
-
-        if !test_function_idxs.is_empty() {
-            let params = ctx.function_parameters(&test_function_idxs);
-            for (test_idx, names) in test_function_idxs.iter().zip(params) {
-                for name in names {
-                    if let Some(fixture_idxs) = fixtures_by_name.get(name.as_str()) {
-                        for &fixture_idx in fixture_idxs {
-                            ops.add_edge(*test_idx, fixture_idx, 0);
-                        }
-                    }
-                }
-            }
-        }
-        if !test_class_idxs.is_empty() {
-            let params = ctx.class_method_parameters(&test_class_idxs);
-            for (cls_idx, names) in test_class_idxs.iter().zip(params) {
-                for name in names {
-                    if let Some(fixture_idxs) = fixtures_by_name.get(name.as_str()) {
-                        for &fixture_idx in fixture_idxs {
-                            ops.add_edge(*cls_idx, fixture_idx, 0);
-                        }
-                    }
+            if let Some(fixture_idxs) = fixtures_by_name.get(&fact.value) {
+                for &fixture_idx in fixture_idxs {
+                    ops.add_edge(test_idx, fixture_idx, 0);
                 }
             }
         }
