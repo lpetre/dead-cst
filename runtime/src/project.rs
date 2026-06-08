@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
+use ruff_db::source::line_index;
 use ruff_db::system::{OsSystem, SystemPathBuf};
 use ruff_text_size::TextRange;
 use ty_project::metadata::options::{EnvironmentOptions, Options};
@@ -572,6 +573,14 @@ pub(crate) fn build_project_graph(
             // at its true sorted `file_idx`, so offsets stay deterministic.
             let lanes = num_workers.max(1);
             let cols = files_ref.len().div_ceil(lanes);
+            // Fan each file's per-file plugins out as their own tasks only when
+            // there are fewer files than workers — i.e. the file axis alone
+            // can't fill the cores, which is the incremental case (a small
+            // dirty set on a big box). Cold builds and large dirty sets keep
+            // the serial-within-file loop: the file fan-out already saturates
+            // the cores there, so splitting each file into N more tasks would
+            // just add scheduling + snapshot-channel traffic for no parallelism.
+            let fan_out_plugins = !per_file_ids_ref.is_empty() && files_ref.len() <= num_workers;
             rayon::scope(|s| {
                 for col in 0..cols {
                     for lane in 0..lanes {
@@ -583,7 +592,18 @@ pub(crate) fn build_project_graph(
                         let db_tx = db_tx.clone();
                         let db_rx = db_rx.clone();
                         let counters_inner = Arc::clone(&counters_ref);
-                        s.spawn(move |_| {
+                        // Deps task: warm this file's shared salsa inputs. When
+                        // fanning out, the per-file plugins then run as their own
+                        // tasks (below) — concurrently with each other and with
+                        // other files' `file_to_nodes` — instead of serially in
+                        // this worker, so a small dirty set with many plugins
+                        // still saturates the cores. Warming the shared inputs
+                        // *before* releasing the plugin tasks is what makes that
+                        // sound: each plugin reads a memoized `file_to_nodes` /
+                        // `file_extraction` / index / line index, so the
+                        // concurrent tasks never collide computing the same salsa
+                        // query (which would just park workers).
+                        s.spawn(move |s| {
                             let local_db = db_rx.recv().expect("snapshot available");
                             local_db.attach(|local_db| {
                                 let _ = file_to_nodes(local_db, file);
@@ -593,44 +613,75 @@ pub(crate) fn build_project_graph(
                                 // Warmed here so the assemble pass's
                                 // dirty-set derivation is memo reads.
                                 let _ = resolution_surface_fp(local_db, file);
-                                // Owned per-file facts for the project-wide
-                                // plugin queries. Warmed here, while the AST
-                                // is live, so the queries below run as cache
-                                // reads.
+                                // Owned per-file facts for the plugin queries,
+                                // warmed while the AST is live so the plugin
+                                // queries run as cache reads.
                                 let _ = file_extraction(local_db, file);
-                                // Per-file native plugins: warm the salsa-cached
-                                // `per_file_plugin_ops(file, id)` query on this
-                                // worker so the serial assembly fold below is a
-                                // pure cache read. `run_on_file` is GIL-free and
-                                // touches only this file, so it composes with the
-                                // GIL-released fan-out.
-                                for &id in per_file_ids_ref {
-                                    let _ = crate::native_plugins::per_file_plugin_ops(
-                                        local_db, file, id,
-                                    );
+                                // The per-file plugin helpers map name ranges to
+                                // source lines; warm the line index too so the
+                                // (possibly concurrent) plugin tasks don't race
+                                // to build it.
+                                let _ = line_index(local_db, file);
+                                // Serial path (cold / large dirty set, or no
+                                // plugins): run the plugins in this worker and
+                                // drop the AST + index now — the file axis already
+                                // saturates the cores, so this avoids the extra
+                                // task + snapshot-channel traffic of fanning out.
+                                if !fan_out_plugins {
+                                    for &id in per_file_ids_ref {
+                                        let _ = crate::native_plugins::per_file_plugin_ops(
+                                            local_db, file, id,
+                                        );
+                                    }
+                                    ty_python_core::semantic_index(local_db, file).clear();
+                                    parsed_module(local_db, file).clear();
                                 }
-                                // Every per-file AST consumer for this file has
-                                // now run and memoized its result, so drop the
-                                // parsed AST *and* the semantic index's per-scope
-                                // analysis data (place tables, use-def maps, AST
-                                // ids) rather than let them sit resident through
-                                // assembly and the project-wide plugin pass —
-                                // that's the memory win, and the index data is
-                                // the larger share of it. Assembly, fqname, and
-                                // the class hierarchy read only the cached
-                                // payloads (`class_bases`, `external_base_children`,
-                                // `children_by_node`), never the AST or index, so
-                                // the all-files-resident peak never forms. Subclass
-                                // resolution can still pull an individual file's
-                                // AST/index back on demand to relocate a class
-                                // seed — `SemanticIndex::load` lazily rebuilds in
-                                // ingredient-reuse mode — and that rare reload is
-                                // re-cleared right after the plugin pass.
-                                ty_python_core::semantic_index(local_db, file).clear();
-                                parsed_module(local_db, file).clear();
                             });
                             db_tx.send(local_db).expect("channel open");
                             counters_inner.populate_inc();
+                            if !fan_out_plugins {
+                                return;
+                            }
+                            // Fan-out path: one task per plugin.
+                            // `per_file_plugin_ops` is keyed `(file, id)`, so the
+                            // tasks are independent salsa queries; the warming
+                            // above means each is a pure read of this file's
+                            // memoized inputs.
+                            //
+                            // The parsed AST + semantic index stay resident until
+                            // the *last* plugin finishes, tracked by a per-file
+                            // countdown: whoever decrements it to zero clears them
+                            // (the memory win — so they don't sit resident through
+                            // assembly and the project-wide plugin pass). The
+                            // counter is observed only after each task's
+                            // `per_file_plugin_ops` returns, so the clearer runs
+                            // strictly after every reader is done. Subclass
+                            // resolution can pull them back on demand later; that
+                            // rare reload is re-cleared after the plugin pass.
+                            let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(
+                                per_file_ids_ref.len(),
+                            ));
+                            for &id in per_file_ids_ref {
+                                let db_tx = db_tx.clone();
+                                let db_rx = db_rx.clone();
+                                let remaining = Arc::clone(&remaining);
+                                s.spawn(move |_| {
+                                    let local_db = db_rx.recv().expect("snapshot available");
+                                    local_db.attach(|local_db| {
+                                        let _ = crate::native_plugins::per_file_plugin_ops(
+                                            local_db, file, id,
+                                        );
+                                        if remaining
+                                            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                                            == 1
+                                        {
+                                            ty_python_core::semantic_index(local_db, file).clear();
+                                            parsed_module(local_db, file).clear();
+                                        }
+                                    });
+                                    db_tx.send(local_db).expect("channel open");
+                                });
+                            }
                         });
                     }
                 }
