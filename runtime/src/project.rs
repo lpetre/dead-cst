@@ -3479,6 +3479,8 @@ impl ProjectContext {
             };
         let n_plugins = jobs.len();
         let plugin_bar = ProgressBars::plugin_bar(show_progress, n_plugins as u64);
+        let timing_names = plugin_names.clone();
+        let t_plugin_pass = std::time::Instant::now();
         counters.init_plugin_slots(plugin_names);
         counters.start_phase(PHASE_PLUGINS, Some(n_plugins));
         let num_workers = std::thread::available_parallelism()
@@ -3500,12 +3502,15 @@ impl ProjectContext {
         // registration order is restored by sorting on ``idx`` after.
         let results: std::sync::Mutex<Vec<(usize, PyResult<Vec<PreparedOp>>)>> =
             std::sync::Mutex::new(Vec::with_capacity(n_plugins));
+        let plugin_walls: std::sync::Mutex<Vec<(usize, std::time::Duration)>> =
+            std::sync::Mutex::new(Vec::with_capacity(n_plugins));
         {
             let counters_ref = &*counters;
             let bar_ref = &plugin_bar;
             let root_ref: &str = &root;
             let jobs_ref = &jobs;
             let results_ref = &results;
+            let plugin_walls_ref = &plugin_walls;
             // Lend the frozen registries into each worker's `FrozenView`.
             // `&FlagRegistry` is `Send` (the registry is `Sync`), so the refs
             // ride the `allow_threads` boundary the way `root_ref` does; the
@@ -3543,7 +3548,12 @@ impl ProjectContext {
                                     topic_reg_ref,
                                 );
                                 let mut sink: Vec<PreparedOp> = Vec::new();
+                                let t_job = std::time::Instant::now();
                                 let res = job.run(&view, &mut sink).map(|()| sink);
+                                plugin_walls_ref
+                                    .lock()
+                                    .unwrap()
+                                    .push((idx, t_job.elapsed()));
                                 results_ref.lock().unwrap().push((idx, res));
                                 counters_ref.plugin_finished(idx);
                                 counters_ref.plugins_inc();
@@ -3576,6 +3586,7 @@ impl ProjectContext {
         // whole batch" semantics (earlier plugins' ops are dropped on error).
         let mut collected = results.into_inner().expect("plugin results mutex poisoned");
         collected.sort_by_key(|(idx, _)| *idx);
+        let t_apply = std::time::Instant::now();
         let plugin_result = (|| -> PyResult<()> {
             let mut prepared: Vec<PreparedOp> = Vec::new();
             for (_, res) in collected {
@@ -3583,6 +3594,22 @@ impl ProjectContext {
             }
             apply_prepared_batch(&slf, py, prepared)
         })();
+        if std::env::var_os("DEAD_CST_TIMING").is_some() && n_plugins > 0 {
+            let mut walls = plugin_walls
+                .into_inner()
+                .expect("plugin walls mutex poisoned");
+            walls.sort_by_key(|(idx, _)| *idx);
+            let per: Vec<String> = walls
+                .iter()
+                .map(|(idx, d)| format!("{}={:?}", timing_names[*idx], d))
+                .collect();
+            eprintln!(
+                "[dead-cst-timing] plugins={:?} (apply={:?}) [{}]",
+                t_plugin_pass.elapsed(),
+                t_apply.elapsed(),
+                per.join(" ")
+            );
+        }
         counters.finish_phase(PHASE_PLUGINS);
         counters.mark_finished();
         plugin_result?;
