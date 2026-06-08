@@ -37,7 +37,7 @@ use crate::file_payload::{
 };
 use crate::file_ref_edges::{file_to_refspecs, FileRefSpecs};
 use crate::flag_registry::FlagRegistry;
-use crate::graph::{intern_kind, DeclIndex, NativeGraph, SymbolNode};
+use crate::graph::{intern_kind, NativeGraph, SymbolNode};
 use crate::helpers::{
     file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_member_def,
     CallArgs, ReloadLog, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT, NODE_FLAG_UNRESOLVED,
@@ -123,7 +123,12 @@ impl Project {
 pub(crate) struct BuildOutputs {
     pub(crate) builder: GraphBuilder,
     pub(crate) project_files: Vec<File>,
-    pub(crate) global_index: DeclIndex,
+    /// `File → position in the sorted `project_files` list` — the
+    /// O(1) hop from a `File`-keyed identity to its node block
+    /// (`builder.file_blocks[ordinal]`). With it, per-`DeclKey` /
+    /// per-`NodeRef` global maps are unnecessary: every lookup goes
+    /// `ordinal → block base + payload-local index`.
+    pub(crate) ordinal_of: FxHashMap<File, usize>,
     /// `file_path_string(file) -> File` so seed lookups don't have to
     /// linear-scan `project_files`. Populated alongside ingest.
     pub(crate) path_to_file: FxHashMap<String, File>,
@@ -696,7 +701,7 @@ pub(crate) fn build_project_graph(
     counters.finish_phase(PHASE_ASSEMBLE);
 
     let mut builder = assembled.builder;
-    let global_index = assembled.global_index;
+    let ordinal_of = assembled.ordinal_of;
     let module_nodes_by_file = assembled.module_nodes_by_file;
     let class_by_selection = assembled.class_by_selection;
     let decl_by_name_range = assembled.decl_by_name_range;
@@ -768,7 +773,7 @@ pub(crate) fn build_project_graph(
     Ok(BuildOutputs {
         builder,
         project_files,
-        global_index,
+        ordinal_of,
         path_to_file,
         class_by_selection,
         class_selection_by_idx,
@@ -810,7 +815,7 @@ fn current_rss_mb() -> usize {
 /// `path_to_file`, and the fqname indices.
 struct AssembledGraph {
     builder: GraphBuilder,
-    global_index: DeclIndex,
+    ordinal_of: FxHashMap<File, usize>,
     module_nodes_by_file: FxHashMap<File, usize>,
     class_by_selection: FxHashMap<(File, (u32, u32)), usize>,
     decl_by_name_range: FxHashMap<(File, (u32, u32)), usize>,
@@ -1021,8 +1026,6 @@ fn assemble_graph<'db>(
     // which is fine for capacity reservation).
     let total_decls = total_nodes.saturating_sub(n_files);
 
-    let mut global_index: DeclIndex =
-        FxHashMap::with_capacity_and_hasher(total_decls, Default::default());
     let mut module_nodes_by_file: FxHashMap<File, usize> =
         FxHashMap::with_capacity_and_hasher(n_files, Default::default());
     // class_by_selection only sees class decls — typically a small
@@ -1497,7 +1500,6 @@ fn assemble_graph<'db>(
     // refs every pass.
     let mints_ref = &mints;
     let counters_ref: &ProgressCounters = counters;
-    let global_index_mut = &mut global_index;
     let module_nodes_mut = &mut module_nodes_by_file;
     let class_by_selection_mut = &mut class_by_selection;
     let decl_by_name_range_mut = &mut decl_by_name_range;
@@ -1558,64 +1560,43 @@ fn assemble_graph<'db>(
                             })
                     },
                     move || {
-                        // Two serial insert loops over `Copy` keys on
-                        // sibling rayon tasks — each cheap enough to
-                        // hide behind the node fill / resolve arm.
-                        // (There is no project-wide NodeRef → idx map
-                        // any more: symbolic targets carry their
-                        // `File`, so translation goes
+                        // One serial insert loop over `Copy` keys —
+                        // cheap enough to hide behind the node fill /
+                        // resolve arm. (There is no project-wide
+                        // NodeRef → idx map, and no per-DeclKey
+                        // `global_index` either: symbolic identities
+                        // carry their `File`, so every lookup goes
                         // `ordinal_of[file] → block base +
-                        // payload.ref_to_local[ref]`. The
-                        // position-distinct invariant — `CLAUDE.md`
-                        // principle 3 — is enforced per file by the
-                        // payload's own `ref_to_local`, and the
-                        // `File` inside every key rules out
-                        // cross-file collisions by construction.)
-                        rayon::join(
-                            move || {
-                                for mint in mints_ref {
-                                    for (local_idx, &node_ref) in
-                                        mint.payload.refs.iter().enumerate()
-                                    {
-                                        if let NodeRef::Def(d) = node_ref {
-                                            // `d` is already the `(file,
-                                            // place_id, name_range)` triple
-                                            // `global_index` keys on.
-                                            global_index_mut.insert(d, mint.base + local_idx);
+                        // payload-local index`. The position-distinct
+                        // invariant — `CLAUDE.md` principle 3 — is
+                        // enforced per file by the payload's own
+                        // `ref_to_local`, and the `File` inside every
+                        // key rules out cross-file collisions by
+                        // construction.)
+                        for mint in mints_ref {
+                            for (local_idx, &node_ref) in mint.payload.refs.iter().enumerate() {
+                                let global_idx = mint.base + local_idx;
+                                match node_ref {
+                                    NodeRef::Module(_) => {
+                                        module_nodes_mut.insert(mint.file, global_idx);
+                                    }
+                                    NodeRef::Def(_) => {
+                                        let node_data = &mint.payload.nodes[local_idx];
+                                        let rk = node_data.name_range;
+                                        if matches!(node_data.kind, NodeKind::Class) {
+                                            class_by_selection_mut
+                                                .insert((mint.file, rk), global_idx);
                                         }
+                                        decl_by_name_range_mut.insert((mint.file, rk), global_idx);
+                                    }
+                                    NodeRef::StarStmt(_, _) => {
+                                        // Star-statement node: not a decl,
+                                        // contributes nothing to the decl
+                                        // indices.
                                     }
                                 }
-                            },
-                            move || {
-                                for mint in mints_ref {
-                                    for (local_idx, &node_ref) in
-                                        mint.payload.refs.iter().enumerate()
-                                    {
-                                        let global_idx = mint.base + local_idx;
-                                        match node_ref {
-                                            NodeRef::Module(_) => {
-                                                module_nodes_mut.insert(mint.file, global_idx);
-                                            }
-                                            NodeRef::Def(_) => {
-                                                let node_data = &mint.payload.nodes[local_idx];
-                                                let rk = node_data.name_range;
-                                                if matches!(node_data.kind, NodeKind::Class) {
-                                                    class_by_selection_mut
-                                                        .insert((mint.file, rk), global_idx);
-                                                }
-                                                decl_by_name_range_mut
-                                                    .insert((mint.file, rk), global_idx);
-                                            }
-                                            NodeRef::StarStmt(_, _) => {
-                                                // Star-statement node: not a
-                                                // decl, contributes nothing to
-                                                // the decl indices.
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                        );
+                            }
+                        }
                     },
                 )
             },
@@ -1728,36 +1709,44 @@ fn assemble_graph<'db>(
     // re-resolved this build (read-set consumers), or a cached triple
     // targeting a block tombstoned this build (`Module`-target edges
     // whose resolution read nothing — e.g. plain `import a` — and the
-    // structural submodule → parent edges land here).
-    let retranslate: Vec<bool> = match &dirty_files {
-        None => vec![true; n_files],
-        Some(dirty) => {
-            let mut r = dirty.clone();
-            for pos in 0..n_files {
-                if r[pos] {
-                    continue;
-                }
-                let ids = &spec_ids[pos];
-                let hit = spec_payloads[pos]
-                    .specs
-                    .iter()
-                    .zip(ids.iter())
-                    .any(|(spec, &id)| match &spec.target {
-                        Target::Local(_) => false,
-                        Target::Member(_) => member_redo[id as usize],
-                        Target::Dynamic(_) => dynamic_redo[id as usize],
-                    })
-                    || (!newly_tombstoned.is_empty()
-                        && builder.part_edges[pos]
-                            .iter_all()
-                            .any(|&(_, d, _)| newly_tombstoned.contains(&d)));
-                if hit {
-                    r[pos] = true;
-                }
+    // structural submodule → parent edges land here). The scan reads
+    // every clean file's rows + cached triples, so it fans out on
+    // rayon (read-only, GIL released).
+    let retranslate: Vec<bool> =
+        match &dirty_files {
+            None => vec![true; n_files],
+            Some(dirty) => {
+                let spec_payloads_ref = &spec_payloads;
+                let spec_ids_ref = &spec_ids;
+                let member_redo_ref = &member_redo;
+                let dynamic_redo_ref = &dynamic_redo;
+                let newly_tombstoned_ref = &newly_tombstoned;
+                let part_edges_ref = &builder.part_edges;
+                py.allow_threads(move || {
+                    use rayon::prelude::*;
+                    (0..n_files)
+                        .into_par_iter()
+                        .with_min_len(64)
+                        .map(|pos| {
+                            if dirty[pos] {
+                                return true;
+                            }
+                            let ids = &spec_ids_ref[pos];
+                            spec_payloads_ref[pos].specs.iter().zip(ids.iter()).any(
+                                |(spec, &id)| match &spec.target {
+                                    Target::Local(_) => false,
+                                    Target::Member(_) => member_redo_ref[id as usize],
+                                    Target::Dynamic(_) => dynamic_redo_ref[id as usize],
+                                },
+                            ) || (!newly_tombstoned_ref.is_empty()
+                                && part_edges_ref[pos]
+                                    .iter_all()
+                                    .any(|&(_, d, _)| newly_tombstoned_ref.contains(&d)))
+                        })
+                        .collect()
+                })
             }
-            r
-        }
-    };
+        };
 
     let t_detect = t_detect.elapsed();
     let t_slots = std::time::Instant::now();
@@ -2115,19 +2104,28 @@ fn assemble_graph<'db>(
     //    op order (the old pass 4; `add_edge` supplies the dedup).
     {
         builder.reset_derived_edges();
+        // Every spec-section triple's src lies inside the owning
+        // file's node block (spec rows, decl → module anchors,
+        // overload anchors, the submodule → parent edge — all
+        // src-anchored), and each section is sorted + deduplicated.
+        // Concatenating sections in block-base order therefore yields
+        // the globally-sorted, duplicate-free triple list directly —
+        // the 5M-row parallel sort and dedup the refold used to pay
+        // are gone (`init_edges_bulk` debug-asserts sortedness, so
+        // the dev/test builds verify the invariant on every run).
+        let mut order: Vec<usize> = (0..n_files).collect();
+        order.sort_unstable_by_key(|&pos| builder.file_blocks[pos].0);
         let total: usize = builder.part_edges.iter().map(|p| p.spec.len()).sum();
         let mut triples: Vec<(usize, usize, u8)> = Vec::with_capacity(total);
-        for part in &builder.part_edges {
+        for &pos in &order {
             triples.extend(
-                part.spec
+                builder.part_edges[pos]
+                    .spec
                     .iter()
                     .map(|&(s, d, f)| (s as usize, d as usize, f)),
             );
         }
         py.allow_threads(|| {
-            use rayon::prelude::*;
-            triples.par_sort_unstable();
-            triples.dedup();
             builder.init_edges_bulk(triples);
         });
 
@@ -2189,7 +2187,7 @@ fn assemble_graph<'db>(
 
     Ok(AssembledGraph {
         builder,
-        global_index,
+        ordinal_of,
         module_nodes_by_file,
         class_by_selection,
         decl_by_name_range,
@@ -2557,6 +2555,7 @@ pub(crate) fn build_fqname_indices(
         }
     }
 
+    counters.fqname_add(builder.nodes.len());
     // Map-reduce over the node table. The fold builds per-range maps
     // (where the String clones + hashing happen, on rayon workers);
     // the reduce merges adjacent ranges left-to-right. rayon's reduce
@@ -2571,7 +2570,6 @@ pub(crate) fn build_fqname_indices(
         .enumerate()
         .with_min_len(1024)
         .fold(FqnameAcc::default, |mut acc, (idx, node)| {
-            counters.fqname_inc();
             // `@typing.overload`-decorated stubs of an in-file overload group
             // are excluded from the fqname trie so cross-module `from mod
             // import f` resolves to the impl only. Reachability still anchors
@@ -4403,24 +4401,22 @@ fn find_main_blocks_indices_in(
         return Vec::new();
     }
 
-    let matched_files: FxHashSet<File> = hits.iter().map(|(f, _, _)| *f).collect();
-    let mut decls_by_file: FxHashMap<File, Vec<(u32, u32, usize)>> = FxHashMap::default();
-    for ((entry_file, _place_id, (start, end)), idx) in &outputs.global_index {
-        if matched_files.contains(entry_file) {
-            decls_by_file
-                .entry(*entry_file)
-                .or_default()
-                .push((*start, *end, *idx));
-        }
-    }
-
     let mut out: Vec<(usize, Vec<usize>)> = Vec::with_capacity(hits.len());
     for (file, module_idx, (block_start, block_end)) in hits {
+        // Per-file decl walk through the payload: the `(file, local)`
+        // identity is the block offset, so no global decl map is
+        // needed — and the result is in deterministic local order
+        // (the old `global_index` scan iterated a hashmap).
         let mut decl_idxs: Vec<usize> = Vec::new();
-        if let Some(file_decls) = decls_by_file.get(&file) {
-            for &(start, end, idx) in file_decls {
-                if start >= block_start && end <= block_end {
-                    decl_idxs.push(idx);
+        if let Some(&pos) = outputs.ordinal_of.get(&file) {
+            let base = outputs.builder.file_blocks[pos].0 as usize;
+            let payload = file_to_nodes(db, file);
+            for (local, node_ref) in payload.refs.iter().enumerate() {
+                if matches!(node_ref, NodeRef::Def(_)) {
+                    let (start, end) = payload.nodes[local].name_range;
+                    if start >= block_start && end <= block_end {
+                        decl_idxs.push(base + local);
+                    }
                 }
             }
         }

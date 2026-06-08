@@ -442,16 +442,89 @@ impl GraphBuilder {
                     (src, (dst, flags))
                 })
             },
-            || {
-                use rayon::prelude::*;
-                let mut by_dst = triples_ref.clone();
-                by_dst.par_sort_unstable_by_key(|&(src, dst, flags)| (dst, src, flags));
-                scatter_adjacency(reverse, &by_dst, |&(src, dst, flags)| (dst, (src, flags)));
-            },
+            || reverse_scatter(reverse, triples_ref),
         );
         self.bulk_len = triples.len();
         self.edges = triples;
     }
+}
+
+/// Build the reverse adjacency from `(src, dst, flags)`-sorted triples
+/// with a **counting scatter** instead of a clone + re-sort by dst:
+///
+/// 1. histogram the dst population (one parallel fold),
+/// 2. cut `[0, n)` into balanced dst ranges by cumulative count,
+/// 3. each worker owns a disjoint `reverse[lo..hi]` window and scans
+///    the full triple list, appending the triples whose dst falls in
+///    its range.
+///
+/// The scan preserves the input's `(src, dst, flags)` order, so each
+/// dst's list lands in `(src, flags)` order — byte-identical to the
+/// old sort-by-`(dst, src, flags)` path, without the 24-bytes-per-edge
+/// clone and parallel sort. The redundant per-worker scans are
+/// sequential reads (bandwidth-friendly) and run fully parallel.
+fn reverse_scatter(reverse: &mut [Vec<(usize, u8)>], rows: &[(usize, usize, u8)]) {
+    use rayon::prelude::*;
+    if rows.is_empty() {
+        return;
+    }
+    let n = reverse.len();
+    // 1. Parallel dst histogram: per-chunk counts, reduced by sum.
+    let counts: Vec<u32> = rows
+        .par_chunks(
+            rows.len()
+                .div_ceil(rayon::current_num_threads().max(1))
+                .max(1),
+        )
+        .map(|chunk| {
+            let mut c = vec![0u32; n];
+            for &(_, d, _) in chunk {
+                c[d] += 1;
+            }
+            c
+        })
+        .reduce(
+            || vec![0u32; n],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x += y;
+                }
+                a
+            },
+        );
+    // 2. Balanced dst ranges (~4 per worker for load balance).
+    let n_chunks = (rayon::current_num_threads() * 4).max(1);
+    let per_chunk = (rows.len() / n_chunks).max(1);
+    type Window<'a> = (usize, &'a mut [Vec<(usize, u8)>]);
+    let mut windows: Vec<Window<'_>> = Vec::new();
+    {
+        let mut rest = reverse;
+        let mut start = 0usize;
+        while start < n {
+            let mut acc = 0usize;
+            let mut end = start;
+            while end < n && (acc < per_chunk || end == start) {
+                acc += counts[end] as usize;
+                end += 1;
+            }
+            let (head, tail) = rest.split_at_mut(end - start);
+            windows.push((start, head));
+            rest = tail;
+            start = end;
+        }
+    }
+    // 3. Disjoint-window scatter.
+    windows.into_par_iter().for_each(|(lo, window)| {
+        let hi = lo + window.len();
+        for (d, slot) in window.iter_mut().enumerate() {
+            slot.reserve_exact(counts[lo + d] as usize);
+        }
+        for &(s, d, f) in rows {
+            if d >= lo && d < hi {
+                window[d - lo].push((s, f));
+            }
+        }
+    });
 }
 
 /// Scatter `rows` — sorted by the key half of `key_entry`'s return —

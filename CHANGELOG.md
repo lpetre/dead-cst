@@ -75,8 +75,17 @@ two versions.
   the benchmark scale); (4) `ProjectContext.materialize()` returns `None`
   instead of a `NativeGraph` snapshot — the snapshot allocated one
   `Py<SymbolNode>` per node per rebuild and its only caller discarded it
-  (query the live graph through the context). On the 50k-file benchmark
-  corpus the incremental edit loop's median dropped 4.63s → 1.81s.
+  (query the live graph through the context). Round two: (5) the global
+  edge refold no longer sorts — part spec-sections are per-block sorted
+  and blocks are disjoint, so concatenating parts in block-base order
+  *is* the globally-sorted list; (6) the reverse adjacency builds by a
+  counting scatter over the already-sorted triples instead of a clone +
+  re-sort; (7) `global_index` (the per-`DeclKey` map) is gone — its one
+  consumer walks the matched files' payloads through the retained
+  `ordinal_of` indirection; (8) the re-translate detect scan fans out on
+  rayon and the fqname fold accounts progress in one batch. On the
+  50k-file benchmark corpus the incremental edit loop went
+  4.63s → ~1.4–1.7s per edit.
 
 - **Topic/fact channel for native plugins.** A per-file native plugin can
   now hand structured facts up to its project-wide reader. A plugin declares

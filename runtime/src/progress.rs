@@ -328,8 +328,12 @@ impl ProgressCounters {
     }
 
     /// Bump the fqname-nodes-done counter.
-    pub(crate) fn fqname_inc(&self) {
-        self.fqname_done.fetch_add(1, Ordering::Relaxed);
+    /// Bump the fqname-done counter by a batch. The fqname fold
+    /// processes ~1M nodes; one relaxed atomic add per node was
+    /// measurable cross-core contention, so the fold accounts in
+    /// chunks instead.
+    pub(crate) fn fqname_add(&self, n: usize) {
+        self.fqname_done.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Bump the plugins-done counter.
