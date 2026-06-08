@@ -1289,19 +1289,68 @@ fn assemble_graph<'db>(
                 // per unique (ref, dir). Brand-new unique refs append
                 // a placeholder slot and go straight onto the work
                 // list.
+                // Parallel liveness sweep over the clean files'
+                // cached rows (read-only — the serial loop below only
+                // moves the arrays): per-chunk bitmaps OR-reduced,
+                // then folded into the live vecs.
+                {
+                    use rayon::prelude::*;
+                    let m_words = prev_member_len.div_ceil(64);
+                    let d_words = prev_dynamic_len.div_ceil(64);
+                    let cached_ref = &cached_spec_ids;
+                    let (m_bits, d_bits) = (0..spec_payloads_ref.len())
+                        .into_par_iter()
+                        .with_min_len(64)
+                        .fold(
+                            || (vec![0u64; m_words], vec![0u64; d_words]),
+                            |mut acc, pos| {
+                                if !dirty[pos] {
+                                    let ids = &cached_ref[pos];
+                                    for (spec, &id) in
+                                        spec_payloads_ref[pos].specs.iter().zip(ids.iter())
+                                    {
+                                        match &spec.target {
+                                            Target::Local(_) => {}
+                                            Target::Member(_) => {
+                                                acc.0[(id as usize) / 64] |= 1u64 << (id % 64);
+                                            }
+                                            Target::Dynamic(_) => {
+                                                acc.1[(id as usize) / 64] |= 1u64 << (id % 64);
+                                            }
+                                        }
+                                    }
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(
+                            || (vec![0u64; m_words], vec![0u64; d_words]),
+                            |mut a, b| {
+                                for (x, y) in a.0.iter_mut().zip(&b.0) {
+                                    *x |= y;
+                                }
+                                for (x, y) in a.1.iter_mut().zip(&b.1) {
+                                    *x |= y;
+                                }
+                                a
+                            },
+                        );
+                    for (id, live) in member_live.iter_mut().enumerate() {
+                        if m_bits[id / 64] & (1u64 << (id % 64)) != 0 {
+                            *live = true;
+                        }
+                    }
+                    for (id, live) in dynamic_live.iter_mut().enumerate() {
+                        if d_bits[id / 64] & (1u64 << (id % 64)) != 0 {
+                            *live = true;
+                        }
+                    }
+                }
                 let mut seen_member: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
                 let mut seen_dynamic: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
                 for (pos, payload) in spec_payloads_ref.iter().enumerate() {
                     if !dirty[pos] {
-                        let ids = std::mem::take(&mut cached_spec_ids[pos]);
-                        for (spec, &id) in payload.specs.iter().zip(ids.iter()) {
-                            match &spec.target {
-                                Target::Local(_) => {}
-                                Target::Member(_) => member_live[id as usize] = true,
-                                Target::Dynamic(_) => dynamic_live[id as usize] = true,
-                            }
-                        }
-                        spec_ids.push(ids);
+                        spec_ids.push(std::mem::take(&mut cached_spec_ids[pos]));
                         continue;
                     }
                     let dir = dir_ids_ref[pos];
