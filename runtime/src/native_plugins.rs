@@ -658,6 +658,105 @@ impl<'db> FileContext<'db> {
             .filter_map(|(rk, _)| by_range.get(rk).copied())
             .collect()
     }
+
+    /// Visit every call site in this file (decl-owned and module-scope),
+    /// yielding the *file-local* owner index (module-scope → 0). The per-file
+    /// twin of [`for_each_call_site`](crate::project) keyed on local indices.
+    fn for_each_call_site_local(
+        &self,
+        mut f: impl FnMut(u32, &crate::file_extraction::CallSiteFact),
+    ) {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let by_range = self.name_range_to_local();
+        for (rk, sites) in &facts.call_sites_by_decl {
+            // A call site whose enclosing decl isn't a node falls back to the
+            // module node (idx 0) — same `.or(module_idx)` the global walk uses.
+            let owner = by_range.get(rk).copied().unwrap_or(0);
+            for site in sites {
+                f(owner, site);
+            }
+        }
+        for site in &facts.module_call_sites {
+            f(0, site);
+        }
+    }
+
+    /// Per-file twin of `find_calls_to_imported`: `(local owner, literal)` for
+    /// calls to `name` imported from one of `modules`, taking the `arg_index`
+    /// positional string literal.
+    fn calls_to_imported_local(
+        &self,
+        modules: &[&str],
+        name: &str,
+        arg_index: usize,
+    ) -> Vec<(u32, String)> {
+        let facts = crate::file_extraction::file_extraction(self.db, self.file);
+        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
+        let allowed: rustc_hash::FxHashSet<&str> = [name].into_iter().collect();
+        let imports = crate::file_extraction::imports_local_from_facts(
+            &facts.import_facts,
+            &modules_owned,
+            &allowed,
+        );
+        if imports.is_empty() {
+            return Vec::new();
+        }
+        let mut out: Vec<(u32, String)> = Vec::new();
+        self.for_each_call_site_local(|owner, site| {
+            let Some(chain) = &site.callee else {
+                return;
+            };
+            if crate::file_extraction::match_callee_chain(
+                &chain.root_name,
+                &chain.attrs,
+                &imports,
+                &modules_owned,
+                &allowed,
+            )
+            .is_none()
+            {
+                return;
+            }
+            if let Some(arg) = site.nth_positional_string(arg_index) {
+                out.push((owner, arg.to_string()));
+            }
+        });
+        out
+    }
+
+    /// Per-file twin of `find_calls_on_var`: `(local owner, literal)` for
+    /// `<owner>.<attr>(...)` calls (bare-name receiver), taking the
+    /// `arg_index` positional string literal, optionally gated on an exact
+    /// positional-argument count.
+    fn calls_on_var_local(
+        &self,
+        owner_name: &str,
+        attr: &str,
+        arg_index: usize,
+        required_positional: Option<usize>,
+    ) -> Vec<(u32, String)> {
+        let mut out: Vec<(u32, String)> = Vec::new();
+        self.for_each_call_site_local(|owner, site| {
+            let Some(chain) = &site.callee else {
+                return;
+            };
+            let [only] = chain.attrs.as_slice() else {
+                return;
+            };
+            if chain.root_name.as_str() != owner_name || only.as_str() != attr {
+                return;
+            }
+            if let Some(expected) = required_positional {
+                if site.positional_len != expected {
+                    return;
+                }
+            }
+            if let Some(arg) = site.nth_positional_string(arg_index) {
+                out.push((owner, arg.to_string()));
+            }
+        });
+        out
+    }
 }
 
 /// Salsa cache-key discriminant for a *configless* per-file plugin. A cheap
@@ -1123,7 +1222,7 @@ impl NativePlugin {
     /// targets a decl in another).
     #[staticmethod]
     fn mock_patch() -> Self {
-        Self::project_wide(Arc::new(MockPatchPluginImpl))
+        Self::dual_mode(Arc::new(MockPatchPluginImpl))
     }
 
     /// Native `DiscordPyPlugin` (port of `dead_cst.contrib.discordpy`). Wire
@@ -2480,6 +2579,29 @@ pub mod plugin_api {
         pub(crate) fn classes_defining_method(&self, method_name: &str) -> Vec<u32> {
             self.inner.classes_defining_method(method_name)
         }
+
+        /// `(local owner, literal)` for calls to `name` imported from one of
+        /// `modules`, taking the `arg_index` positional string literal.
+        pub(crate) fn calls_to_imported_local(
+            &self,
+            modules: &[&str],
+            name: &str,
+            arg_index: usize,
+        ) -> Vec<(u32, String)> {
+            self.inner.calls_to_imported_local(modules, name, arg_index)
+        }
+
+        /// `(local owner, literal)` for `<owner>.<attr>(...)` calls.
+        pub(crate) fn calls_on_var_local(
+            &self,
+            owner_name: &str,
+            attr: &str,
+            arg_index: usize,
+            required_positional: Option<usize>,
+        ) -> Vec<(u32, String)> {
+            self.inner
+                .calls_on_var_local(owner_name, attr, arg_index, required_positional)
+        }
     }
 
     /// File-local op sink for a [`PerFilePlugin`]. Emits in this file's
@@ -3499,11 +3621,65 @@ impl plugin_api::ExternalPlugin for ClickPluginImpl {
 // test file targets a decl in another), hence project-wide.
 // ---------------------------------------------------------------------------
 
+/// Topic carrying one patch site: pinned to the enclosing decl (the `owner`),
+/// value = the patch target's fqname string. The project-wide resolve groups
+/// by fqname, resolves it cross-file, and wires the keep-alive edges.
+const MOCKPATCH_TOPIC_SITE: &str = "mockpatch/site";
+
+/// Mock-patch, decomposed. Detecting the four patch-call shapes — `patch("X")`
+/// (from unittest.mock / mock), `mocker.patch("X")`,
+/// `monkeypatch.setattr("X", v)` / `.delattr("X")` — is a pure read of this
+/// file's salsa-cached call sites, emitted as `mockpatch/site` facts. The
+/// project-wide run does only the cross-file part: resolving each target
+/// fqname to its decls / module and wiring `owner -> target` keep-alive edges.
 pub(crate) struct MockPatchPluginImpl;
+
+impl plugin_api::PerFilePlugin for MockPatchPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        let mut emit = |owner: u32, target: String| {
+            ops.emit_fact(MOCKPATCH_TOPIC_SITE, Some(owner), target);
+        };
+        // `patch("X.Y")` imported from unittest.mock / mock.
+        for (owner, target) in file.calls_to_imported_local(&["unittest.mock", "mock"], "patch", 0)
+        {
+            emit(owner, target);
+        }
+        // `mocker.patch("X.Y")` (pytest-mock fixture).
+        for (owner, target) in file.calls_on_var_local("mocker", "patch", 0, None) {
+            emit(owner, target);
+        }
+        // `monkeypatch.setattr("X.Y", v)` (2 positional) /
+        // `monkeypatch.delattr("X.Y")` (1 positional). The required-positional
+        // count distinguishes the fqname form from the object form
+        // (`setattr(obj, "name", v)`).
+        for (attr, required) in [("setattr", 2usize), ("delattr", 1usize)] {
+            for (owner, target) in file.calls_on_var_local("monkeypatch", attr, 0, Some(required)) {
+                emit(owner, target);
+            }
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
     fn name(&self) -> &str {
         "MockPatchPlugin"
+    }
+
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: MOCKPATCH_TOPIC_SITE.to_string(),
+            description: "A patch/monkeypatch call site: pinned to the enclosing decl, \
+                          value = the target fqname string to keep alive."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
+    }
+
+    fn resolves_facts(&self) -> bool {
+        true
     }
 
     fn run(
@@ -3511,41 +3687,24 @@ impl plugin_api::ExternalPlugin for MockPatchPluginImpl {
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
-        // Phase 1: gather (enclosing decl idx, target fqname) rows from the
-        // four patch-call shapes.
-        let mut rows: Vec<(usize, String)> = Vec::new();
-        // `patch("X.Y")` imported from unittest.mock / mock.
-        for (owner_idx, target) in ctx.calls_with_string_arg(&["unittest.mock", "mock"], "patch", 0)
-        {
-            rows.push((owner_idx, target));
-        }
-        // `mocker.patch("X.Y")` (pytest-mock fixture).
-        for (owner_idx, target) in ctx.calls_on_var("mocker", "patch", 0, None) {
-            rows.push((owner_idx, target));
-        }
-        // `monkeypatch.setattr("X.Y", v)` (2 positional) /
-        // `monkeypatch.delattr("X.Y")` (1 positional). The
-        // required-positional count distinguishes the fqname form from the
-        // object form (`setattr(obj, "name", v)`).
-        for (attr, required) in [("setattr", 2usize), ("delattr", 1usize)] {
-            for (owner_idx, target) in ctx.calls_on_var("monkeypatch", attr, 0, Some(required)) {
-                rows.push((owner_idx, target));
-            }
-        }
-
-        if rows.is_empty() {
+        let Some(handle) = ctx.topic(MOCKPATCH_TOPIC_SITE) else {
             return Ok(());
-        }
-
-        // Bucket owners by target fqname, first-seen order preserved (matches
-        // the Python dict insertion order).
+        };
+        // Bucket owners by target fqname (first-seen order preserved for
+        // determinism; facts arrive in file order).
         let mut order: Vec<String> = Vec::new();
         let mut owners_by_fqname: FxHashMap<String, Vec<usize>> = FxHashMap::default();
-        for (owner_idx, fqname) in rows {
-            if !owners_by_fqname.contains_key(&fqname) {
-                order.push(fqname.clone());
+        for fact in ctx.facts_for_topic(handle) {
+            let Some(owner_idx) = fact.decl_idx else {
+                continue;
+            };
+            if !owners_by_fqname.contains_key(&fact.value) {
+                order.push(fact.value.clone());
             }
-            owners_by_fqname.entry(fqname).or_default().push(owner_idx);
+            owners_by_fqname
+                .entry(fact.value)
+                .or_default()
+                .push(owner_idx);
         }
 
         // Resolve targets per fqname (decls + the module node if the fqname is
