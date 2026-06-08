@@ -1013,7 +1013,7 @@ impl NativePlugin {
     /// lifecycle hooks alive. Project-wide (the subclass walk spans files).
     #[staticmethod]
     fn unittest() -> Self {
-        Self::project_wide(Arc::new(UnittestPluginImpl))
+        Self::dual_mode(Arc::new(UnittestPluginImpl))
     }
 
     /// Native Flask dispatch-app plugin (port of
@@ -2852,7 +2852,46 @@ fn server_config_run_on_file(
 /// (`setUpModule` / `tearDownModule` / `load_tests`) in any file that
 /// imports `unittest`. Cross-file (the subclass walk spans files), so it
 /// can't be per-file.
+/// File-scoped fact (no pinned decl) signalling that this file imports
+/// `unittest` — the project-wide resolve runs the TestCase subclass walk iff
+/// any file published it (preserving the old `has_imports_of` short-circuit).
+const UNITTEST_TOPIC_IMPORTS: &str = "unittest/imports";
+
+/// Unittest, decomposed. The module-hook wiring is purely file-local — a
+/// `module -> setUpModule/tearDownModule/load_tests` edge within one file — so
+/// it moves wholesale into the per-file pass (salsa-cached; the old version
+/// rescanned every project node each build). The TestCase subclass flagging is
+/// genuinely cross-file (a base resolved through ty, transitive descendants in
+/// other files), so it stays in the project-wide resolve, gated on the
+/// per-file `unittest/imports` signal.
 pub(crate) struct UnittestPluginImpl;
+
+impl plugin_api::PerFilePlugin for UnittestPluginImpl {
+    fn run_on_file(&self, file: &plugin_api::PluginFileCtx<'_>, ops: &mut plugin_api::FileOps) {
+        if !file.imports_any_module(&["unittest"]) {
+            return;
+        }
+        // Signal the project-wide subclass walk that unittest is in play.
+        ops.emit_fact(UNITTEST_TOPIC_IMPORTS, None, "");
+        // Module lifecycle hooks ride a `module -> hook` edge (alive iff the
+        // module is reached) — both endpoints are in this file, so it's a
+        // file-local edge, no project query needed.
+        let module_idx = file.module_local_idx();
+        for node in file.nodes().iter().skip(1) {
+            if node.kind != "function" {
+                continue;
+            }
+            let simple = node
+                .fqname
+                .rsplit_once('.')
+                .map(|(_, n)| n)
+                .unwrap_or(node.fqname.as_str());
+            if UNITTEST_MODULE_HOOKS.contains(&simple) {
+                ops.add_edge(module_idx, node.local_idx, 0);
+            }
+        }
+    }
+}
 
 impl plugin_api::ExternalPlugin for UnittestPluginImpl {
     fn name(&self) -> &str {
@@ -2863,22 +2902,40 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
         vec![testcase_flag_spec()]
     }
 
+    fn declare_topics(&self) -> Vec<crate::topic_registry::TopicSpec> {
+        vec![crate::topic_registry::TopicSpec {
+            name: UNITTEST_TOPIC_IMPORTS.to_string(),
+            description: "Published (file-scoped) by each file importing unittest; gates \
+                          the project-wide TestCase subclass walk."
+                .to_string(),
+        }]
+    }
+
+    fn per_file(&self) -> Option<&dyn plugin_api::PerFilePlugin> {
+        Some(self)
+    }
+
+    fn resolves_facts(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         ctx: &plugin_api::PluginCtx<'_>,
         ops: &mut plugin_api::PluginOps,
     ) -> Result<(), plugin_api::PluginError> {
-        // O(1) presence probe — short-circuit before the subclass walk.
-        if !ctx.has_imports_of("unittest") {
+        // Short-circuit before the subclass walk when nothing imports unittest
+        // (the per-file pass would have published at least one fact).
+        let imports = ctx
+            .topic(UNITTEST_TOPIC_IMPORTS)
+            .map(|h| ctx.facts_for_topic(h));
+        if imports.is_none_or(|f| f.is_empty()) {
             return Ok(());
         }
         // The bit the host allocated for our declared `test/testcase` flag.
         let testcase_flag = ctx
             .node_flag("test/testcase")
             .expect("test/testcase is declared in declare_node_flags");
-        let import_idxs = ctx.imports_of("unittest");
-        let importer_paths: std::collections::HashSet<String> =
-            ctx.node_paths(&import_idxs).into_iter().collect();
 
         // TestCase subclasses are unconditional roots — a test class stays
         // alive even if nothing imports its module — so stamp the
@@ -2890,28 +2947,6 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
             for idx in ctx.find_subclasses_of_fqn(base, true) {
                 if flagged.insert(idx) {
                     ops.flag_decl(idx, testcase_flag);
-                }
-            }
-        }
-
-        // Module lifecycle hooks (`setUpModule` / `tearDownModule` /
-        // `load_tests`) only fire while their module's tests run, so they
-        // ride a `module -> hook` edge: alive iff the module is reached (its
-        // own live TestCases keep it so), dead with it — the same shape as
-        // the engine's module-dunder edges. Restricted to files importing
-        // unittest so an unrelated `setUpModule` is never pinned.
-        for node in ctx.nodes() {
-            if node.kind != "function" || !importer_paths.contains(node.path) {
-                continue;
-            }
-            let simple = node
-                .fqname
-                .rsplit_once('.')
-                .map(|(_, n)| n)
-                .unwrap_or(node.fqname);
-            if UNITTEST_MODULE_HOOKS.contains(&simple) {
-                if let Some(module_idx) = ctx.module_for(node.path) {
-                    ops.add_edge(module_idx, node.idx, 0);
                 }
             }
         }
