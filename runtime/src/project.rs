@@ -1223,46 +1223,189 @@ fn assemble_graph<'db>(
         match dirty_ref {
             None => {
                 // Full resolve: drop any retained state and run the
-                // borrowed-key gather (zero clones per row; one owned
-                // clone per *unique* key at the end).
+                // sharded concurrent gather. Workers intern each
+                // row's (ref, dir) key against a per-worker cache
+                // first — hot refs (the same import used across the
+                // project) hit it after their first touch — falling
+                // back to one of 256 mutexed shards (picked by key
+                // hash) that assign a provisional (shard, local) id
+                // and keep the borrowed unique keys in encounter
+                // order. A serial prefix-sum over shard sizes makes
+                // the ids dense, the owned work/key rows are cloned
+                // per shard in parallel, and a parallel remap
+                // rewrites the per-file rows to final ids. Ids are
+                // therefore scheduling-dependent: nothing downstream
+                // reads id *order* (results/redo/live are id-indexed
+                // scatter targets; edges derive from slot content,
+                // not slot index), and the parity suite pins the
+                // emitted graph against a fresh build.
                 member_keys.clear();
                 member_results.clear();
                 dynamic_keys.clear();
                 dynamic_results.clear();
                 class_base_memo.clear();
                 class_touched.clear();
-                let mut bmember: FxHashMap<(&MemberRef, u32), u32> = FxHashMap::default();
-                let mut bdynamic: FxHashMap<(&DynamicRef, u32), u32> = FxHashMap::default();
-                for (pos, payload) in spec_payloads_ref.iter().enumerate() {
-                    let dir = dir_ids_ref[pos];
-                    let anchor = dir_anchors_ref[dir as usize];
-                    let mut ids: Vec<u32> = Vec::with_capacity(payload.specs.len());
-                    for spec in payload.specs.iter() {
-                        let id = match &spec.target {
-                            Target::Local(_) => LOCAL_SPEC,
-                            Target::Member(m) => *bmember.entry((m, dir)).or_insert_with(|| {
-                                let id = member_work.len() as u32;
-                                member_work.push((id, m.clone(), anchor));
-                                id
-                            }),
-                            Target::Dynamic(d) => *bdynamic.entry((d, dir)).or_insert_with(|| {
-                                let id = dynamic_work.len() as u32;
-                                dynamic_work.push((id, d.clone(), anchor));
-                                id
-                            }),
-                        };
-                        ids.push(id);
+                const SHARDS: usize = 256;
+                struct Shard<'a, K> {
+                    map: FxHashMap<(&'a K, u32), u32>,
+                    items: Vec<(&'a K, u32)>,
+                }
+                /// Provisional id: shard index in the low 8 bits,
+                /// shard-local ordinal above (capped at 2^24 entries
+                /// per shard, so it can never alias `LOCAL_SPEC` —
+                /// and `Local` rows are never remapped anyway).
+                fn intern<'a, K: std::hash::Hash + Eq>(
+                    shards: &[Mutex<Shard<'a, K>>],
+                    cache: &mut FxHashMap<(&'a K, u32), u32>,
+                    key: (&'a K, u32),
+                ) -> u32 {
+                    if let Some(&enc) = cache.get(&key) {
+                        return enc;
                     }
-                    spec_ids.push(ids.into_boxed_slice());
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = rustc_hash::FxHasher::default();
+                    key.hash(&mut hasher);
+                    let sh = (hasher.finish() as usize) & (shards.len() - 1);
+                    let mut guard = shards[sh].lock();
+                    let st = &mut *guard;
+                    let local = match st.map.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(o) => *o.get(),
+                        std::collections::hash_map::Entry::Vacant(v) => {
+                            let l = st.items.len() as u32;
+                            st.items.push(key);
+                            *v.insert(l)
+                        }
+                    };
+                    drop(guard);
+                    assert!(local < (1 << 24), "resolve gather shard overflow");
+                    let enc = (local << 8) | sh as u32;
+                    // Bound the per-worker cache: most refs are
+                    // file-local one-offs that never repay caching,
+                    // and unbounded growth costs ~tens of MB *per
+                    // worker* on many-core machines. The hot refs a
+                    // clear evicts re-warm on their next touch.
+                    if cache.len() >= 1 << 16 {
+                        cache.clear();
+                    }
+                    cache.insert(key, enc);
+                    enc
                 }
-                member_keys.reserve(bmember.len());
-                for ((m, dir), id) in bmember {
-                    member_keys.insert((m.clone(), dir), id);
+                fn new_shards<'a, K>() -> Vec<Mutex<Shard<'a, K>>> {
+                    (0..SHARDS)
+                        .map(|_| {
+                            Mutex::new(Shard {
+                                map: FxHashMap::default(),
+                                items: Vec::new(),
+                            })
+                        })
+                        .collect()
                 }
-                dynamic_keys.reserve(bdynamic.len());
-                for ((d, dir), id) in bdynamic {
-                    dynamic_keys.insert((d.clone(), dir), id);
+                let mshards: Vec<Mutex<Shard<'_, MemberRef>>> = new_shards();
+                let dshards: Vec<Mutex<Shard<'_, DynamicRef>>> = new_shards();
+                use rayon::prelude::*;
+                let mut rows: Vec<Vec<u32>> = spec_payloads_ref
+                    .par_iter()
+                    .enumerate()
+                    .map_init(
+                        || (FxHashMap::default(), FxHashMap::default()),
+                        |(mcache, dcache), (pos, payload)| {
+                            let dir = dir_ids_ref[pos];
+                            payload
+                                .specs
+                                .iter()
+                                .map(|spec| match &spec.target {
+                                    Target::Local(_) => LOCAL_SPEC,
+                                    Target::Member(m) => intern(&mshards, mcache, (m, dir)),
+                                    Target::Dynamic(d) => intern(&dshards, dcache, (d, dir)),
+                                })
+                                .collect()
+                        },
+                    )
+                    .collect();
+                // Dense bases per shard, then clone the owned work /
+                // key rows per shard in parallel (the clones are the
+                // bulk of the serial cost otherwise); the map inserts
+                // stay serial.
+                let mshards: Vec<Shard<'_, MemberRef>> =
+                    mshards.into_iter().map(|m| m.into_inner()).collect();
+                let dshards: Vec<Shard<'_, DynamicRef>> =
+                    dshards.into_iter().map(|d| d.into_inner()).collect();
+                let mut mbase = [0u32; SHARDS];
+                let mut total = 0u32;
+                for (sh, st) in mshards.iter().enumerate() {
+                    mbase[sh] = total;
+                    total += st.items.len() as u32;
                 }
+                let mut dbase = [0u32; SHARDS];
+                let mut dtotal = 0u32;
+                for (sh, st) in dshards.iter().enumerate() {
+                    dbase[sh] = dtotal;
+                    dtotal += st.items.len() as u32;
+                }
+                type Parts<K> = Vec<(Vec<(u32, K, File)>, Vec<((K, u32), u32)>)>;
+                let mparts: Parts<MemberRef> =
+                    mshards
+                        .par_iter()
+                        .enumerate()
+                        .map(|(sh, st)| {
+                            let mut work = Vec::with_capacity(st.items.len());
+                            let mut keys = Vec::with_capacity(st.items.len());
+                            for (local, &(m, dir)) in st.items.iter().enumerate() {
+                                let id = mbase[sh] + local as u32;
+                                work.push((id, m.clone(), dir_anchors_ref[dir as usize]));
+                                keys.push(((m.clone(), dir), id));
+                            }
+                            (work, keys)
+                        })
+                        .collect();
+                let dparts: Parts<DynamicRef> =
+                    dshards
+                        .par_iter()
+                        .enumerate()
+                        .map(|(sh, st)| {
+                            let mut work = Vec::with_capacity(st.items.len());
+                            let mut keys = Vec::with_capacity(st.items.len());
+                            for (local, &(d, dir)) in st.items.iter().enumerate() {
+                                let id = dbase[sh] + local as u32;
+                                work.push((id, d.clone(), dir_anchors_ref[dir as usize]));
+                                keys.push(((d.clone(), dir), id));
+                            }
+                            (work, keys)
+                        })
+                        .collect();
+                member_work.reserve(total as usize);
+                member_keys.reserve(total as usize);
+                for (work, keys) in mparts {
+                    member_work.extend(work);
+                    for (k, id) in keys {
+                        member_keys.insert(k, id);
+                    }
+                }
+                dynamic_work.reserve(dtotal as usize);
+                dynamic_keys.reserve(dtotal as usize);
+                for (work, keys) in dparts {
+                    dynamic_work.extend(work);
+                    for (k, id) in keys {
+                        dynamic_keys.insert(k, id);
+                    }
+                }
+                // Remap the per-file rows from provisional to dense
+                // ids (the row's variant picks the base table).
+                rows.par_iter_mut().enumerate().for_each(|(pos, ids)| {
+                    let payload = spec_payloads_ref[pos];
+                    for (slot, spec) in ids.iter_mut().zip(payload.specs.iter()) {
+                        match &spec.target {
+                            Target::Local(_) => {}
+                            Target::Member(_) => {
+                                *slot = mbase[(*slot & 0xFF) as usize] + (*slot >> 8);
+                            }
+                            Target::Dynamic(_) => {
+                                *slot = dbase[(*slot & 0xFF) as usize] + (*slot >> 8);
+                            }
+                        }
+                    }
+                });
+                spec_ids.extend(rows.into_iter().map(|v| v.into_boxed_slice()));
                 member_results.resize_with(member_work.len(), Default::default);
                 dynamic_results.resize_with(dynamic_work.len(), Default::default);
                 member_redo = vec![true; member_work.len()];
