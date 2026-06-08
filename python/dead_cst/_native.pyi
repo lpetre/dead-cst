@@ -624,18 +624,32 @@ class ProjectContext:
         """
         ...
 
-    def materialize(self) -> NativeGraph:
-        """Build the project-wide graph, run every registered plugin,
-        then snapshot the final state.
+    def tombstoned_indices(self) -> list[int]:
+        """Sorted dense node indices tombstoned by incremental
+        re-mints — slots whose file block was replaced by a later
+        ``re_materialize``. The slots stay in place (live indices never
+        remap) but are dead: blanked node data, zero flags, no edges,
+        excluded from every query. Empty after a full build, which
+        compacts the id space (and runs automatically once tombstones
+        outnumber live nodes)."""
+        ...
 
-        The build pass runs first; project-wide plugins then fan out
-        across a GIL-free ``rayon`` scope (one task per plugin, each
-        with its own salsa-db snapshot), while per-file plugins are
-        folded inline during the build's own parallel file walk. Every
-        plugin observes the same frozen base-graph state — its own
-        emissions are invisible to its own queries and to other
-        plugins' — and the collected ops fold into the graph in
-        registration order in one end-of-pass apply.
+    def _last_resolve_counts(self) -> tuple[int, int]:
+        """``(resolved, reused)`` cross-file resolution counts from the
+        most recent build — the observability hook for the resolve
+        cache's incremental reuse (a full build reports ``reused == 0``;
+        a ``re_materialize`` after a small content-only edit should
+        report ``resolved`` close to the edit's blast radius).
+        Diagnostic only — not part of the supported surface.
+        """
+        ...
+
+    def materialize(self) -> None:
+        """Build the project-wide graph, run every registered plugin,
+        and leave the live graph on this context (query it via
+        ``nodes()`` / ``edges()`` / the index-returning queries — no
+        ``NativeGraph`` snapshot is materialized; that cost one
+        ``Py<SymbolNode>`` per node on every rebuild).
         """
         ...
 

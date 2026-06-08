@@ -111,6 +111,48 @@ pub(crate) fn project_dist_lookup(db: &dyn ProjectDb) -> ProjectDistLookup {
     }
 }
 
+/// Order-independent fingerprint of the slice of a file's payload that
+/// cross-file resolution can observe: every `exports_by_name` entry
+/// (the name plus the [`NodeRef`]s — including positions — it maps to)
+/// and every `star_reexports` entry. Two payloads with equal
+/// fingerprints give byte-identical answers to every resolution that
+/// reads them (`resolve_member` / `resolve_dynamic` /
+/// `walk_exports_chain` only ever look at these two maps).
+///
+/// Salsa-tracked, so its **invalidation is the dependency analysis**:
+/// the query depends on [`file_to_nodes`], which depends on ty's
+/// semantic index, which for `from X import *` reads X's exported
+/// names — so editing X recomputes the fingerprint of every transitive
+/// star importer automatically, with no hand-built dependency walk.
+/// [`crate::project::ResolveCache`] compares each file's fingerprint
+/// against the previous build's to find the *effectively changed* file
+/// set that drives read-set eviction.
+#[salsa::tracked(heap_size = ruff_memory_usage::heap_size)]
+pub(crate) fn resolution_surface_fp(db: &dyn ProjectDb, file: File) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let payload = file_to_nodes(db, file);
+    // XOR-fold per-entry hashes so the FxHashMap iteration order
+    // (which is not stable run-to-run) can't leak into the value.
+    let mut acc: u64 = 0;
+    for (name, locals) in &payload.exports_by_name {
+        let mut h = rustc_hash::FxHasher::default();
+        0u8.hash(&mut h);
+        name.hash(&mut h);
+        for &local in locals {
+            payload.refs[local as usize].hash(&mut h);
+        }
+        acc ^= h.finish();
+    }
+    for (name, upstream) in &payload.star_reexports {
+        let mut h = rustc_hash::FxHasher::default();
+        1u8.hash(&mut h);
+        name.hash(&mut h);
+        upstream.hash(&mut h);
+        acc ^= h.finish();
+    }
+    acc
+}
+
 /// Compute the canonical synthetic-node fqname for a non-first-party
 /// target: `[external dist] {dist_name}` if dist_lookup knows the
 /// file (PEP 503 canonical name), else `[external file] {top_level}`
@@ -752,6 +794,7 @@ pub(crate) fn walk_exports_chain(
     db: &dyn ProjectDb,
     target_file: File,
     symbol_name: &str,
+    touched: &mut crate::refspec::Touched,
 ) -> Vec<NodeRef> {
     let mut seen: std::collections::HashSet<(File, String)> = std::collections::HashSet::new();
     let mut out: Vec<NodeRef> = Vec::new();
@@ -760,6 +803,10 @@ pub(crate) fn walk_exports_chain(
         if !seen.insert(key.clone()) {
             continue;
         }
+        // Every chain hop is a content read — record it so the resolve
+        // cache's read sets cover intermediary star-reexport files, not
+        // just the final targets.
+        touched.record(key.0);
         let target_nodes = file_to_nodes(db, key.0);
         // If `key` is a `from <upstream> import *` reexport, step
         // into the upstream file's same-name lookup. The star alias

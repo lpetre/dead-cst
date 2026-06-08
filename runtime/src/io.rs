@@ -193,10 +193,36 @@ pub(crate) fn write_graph(
     edge_flag_registry: Vec<FlagTuple>,
     py: Python<'_>,
 ) -> PyResult<()> {
+    // Incremental tombstones (blanked slots left in place by
+    // `re_materialize` so live indices never remap) are compacted away
+    // at serialization time: blank nodes are skipped and edge
+    // endpoints remapped to the packed record indices. A fresh build
+    // has no blanks, in which case the remap is the identity.
+    let keep: Vec<bool> = nodes
+        .iter()
+        .map(|node| !node.borrow(py).kind.is_empty())
+        .collect();
+    let mut remap: Vec<u32> = Vec::with_capacity(nodes.len());
+    let mut next: u32 = 0;
+    for &k in &keep {
+        remap.push(next);
+        if k {
+            next += 1;
+        }
+    }
+    let edges: Vec<(u32, u32, u8)> = edges
+        .into_iter()
+        .filter(|&(s, d, _)| keep[s as usize] && keep[d as usize])
+        .map(|(s, d, f)| (remap[s as usize], remap[d as usize], f))
+        .collect();
+
     let mut node_records: Vec<NodeRecord> = Vec::with_capacity(nodes.len());
     let mut paths: Vec<String> = Vec::new();
     let mut path_to_idx: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    for node in &nodes {
+    for (node, &k) in nodes.iter().zip(&keep) {
+        if !k {
+            continue;
+        }
         let n = node.borrow(py);
         let imports = if let Some(imp) = &n.imports {
             let imp = imp.borrow(py);

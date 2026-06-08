@@ -11,7 +11,6 @@ use std::sync::OnceLock;
 use pyo3::prelude::*;
 use pyo3::types::PyAnyMethods;
 use ruff_db::files::File;
-use rustc_hash::FxHashMap;
 use ty_python_core::place::ScopedPlaceId;
 
 /// Raw record of one cross-file import reference, attached to a
@@ -251,8 +250,6 @@ impl NativeGraph {
 /// while still distinguishing two `def f` redefinitions by their
 /// distinct target ranges.
 pub(crate) type DeclKey = (File, ScopedPlaceId, (u32, u32));
-
-pub(crate) type DeclIndex = FxHashMap<DeclKey, usize>;
 
 /// Bit values stamped into [`SymbolNode::flags`]. Mirrors
 /// `dead_cst.graph.NodeFlags` exactly so plugin code can mix

@@ -163,7 +163,19 @@ pub(crate) fn locate_class_seed(
     // by construction, not via a query-time string scan.
     let anchor = *outputs.project_files.first()?;
     let (seed_module, seed_name) = fqn.rsplit_once('.')?;
-    resolve_member_def(db, seed_module, seed_name, anchor, 0, &outputs.reload_log)
+    // Query-time seed location: the read-set record is irrelevant here
+    // (the plugin pass re-runs in full on every materialize), so a
+    // scratch recorder is discarded.
+    let mut scratch = crate::refspec::Touched::default();
+    resolve_member_def(
+        db,
+        seed_module,
+        seed_name,
+        anchor,
+        0,
+        &outputs.reload_log,
+        &mut scratch,
+    )
 }
 
 /// Maximum hops [`resolve_member_def`] / [`classify_base`] follow through
@@ -348,13 +360,14 @@ pub(crate) fn resolve_base_spec(
     anchor: File,
     depth: u32,
     reloads: &ReloadLog,
+    touched: &mut crate::refspec::Touched,
 ) -> Option<(File, TextRange)> {
     match spec {
         ClassBaseSpec::LocalClass((start, end)) => {
             Some((local_file, TextRange::new((*start).into(), (*end).into())))
         }
         ClassBaseSpec::ModuleMember { module, name } => {
-            resolve_member_def(db, module, name, anchor, depth, reloads)
+            resolve_member_def(db, module, name, anchor, depth, reloads, touched)
         }
     }
 }
@@ -370,13 +383,14 @@ pub(crate) fn resolve_member_def(
     anchor: File,
     depth: u32,
     reloads: &ReloadLog,
+    touched: &mut crate::refspec::Touched,
 ) -> Option<(File, TextRange)> {
     if depth > MEMBER_RESOLVE_DEPTH_CAP {
         return None;
     }
     let module_name = ModuleName::new(module)?;
     let module_file = resolve_module(db, anchor, &module_name)?.file(db)?;
-    resolve_member_in_file(db, module_file, name, anchor, depth, reloads)
+    resolve_member_in_file(db, module_file, name, anchor, depth, reloads, touched)
 }
 
 /// Resolve `name` in `file`'s global scope to a canonical
@@ -394,18 +408,23 @@ fn resolve_member_in_file(
     anchor: File,
     depth: u32,
     reloads: &ReloadLog,
+    touched: &mut crate::refspec::Touched,
 ) -> Option<(File, TextRange)> {
     // This load (and `local_member_defs`'s semantic-index load below)
     // repopulates salsa slots the populate-phase eviction emptied —
     // record the file so the post-plugin-pass sweep can re-clear
-    // exactly the touched set.
+    // exactly the touched set. The `touched` record is the resolve
+    // cache's eviction twin: every file whose *content* this
+    // resolution reads, so a class-base memo entry re-resolves iff one
+    // of these files changed.
     reloads.record(file);
+    touched.record(file);
     let parsed = parsed_module(db, file).load(db);
     local_member_defs(db, file, name)
         .into_iter()
         .find_map(|def| {
             let spec = classify_name_def(db, file, &parsed, def, name, depth)?;
-            resolve_base_spec(db, &spec, file, anchor, depth + 1, reloads)
+            resolve_base_spec(db, &spec, file, anchor, depth + 1, reloads, touched)
         })
 }
 

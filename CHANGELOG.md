@@ -11,6 +11,82 @@ two versions.
 
 ### Added
 
+- **Incremental cross-file resolution on `re_materialize`.** The assemble
+  pass now retains a per-`File` resolution memo across builds
+  (`ResolveCache`): every memoized member / dynamic / class-base resolution
+  records the set of files whose *content* it read, and a rebuild driven by
+  content-only `ChangeEvent.changed` batches re-resolves only the entries
+  whose read set touches an effectively-changed file — everything else is
+  reused. "Effectively changed" combines the event scope with a new
+  salsa-tracked per-file resolution-surface fingerprint, so `from X import *`
+  importers (whose payloads derive from X's exports) propagate dirtiness
+  through salsa itself, with no hand-built dependency walk. Everything global
+  — the node table, edge translation, fqname / class-hierarchy indices, the
+  plugin pass — is still refolded from the per-file parts on every build, so
+  the incremental output is bit-identical to a fresh build by construction.
+  `Created` / `Deleted` / `Rescan` events (or paths the project doesn't know)
+  invalidate the cache and resolve everything, exactly as before. The
+  diagnostic `ProjectContext._last_resolve_counts()` reports `(resolved,
+  reused)` for the most recent build; `DEAD_CST_TIMING=1` prints the same
+  counts.
+- **Per-file builder parts with stable dense ids.** The builder output is now
+  stored per file and persists across builds: each file owns a contiguous
+  node block in the dense id space (reached through the O(1)
+  `node_file` / `file_blocks` indirection) and a translated out-edge list
+  (`GraphBuilder::part_edges`). On an incremental `re_materialize`, clean
+  files keep their node block and part verbatim — no node re-mint, no edge
+  re-translation, no row re-hashing; dirty files tombstone their old block
+  and append a fresh one at the tail (so live indices never remap — cached
+  positional indices into unchanged files stay valid across rebuilds,
+  exposed via `ProjectContext.tombstoned_indices()`); files whose
+  cross-file answers changed (a re-resolved memo entry, or a cached triple
+  targeting a tombstoned block) re-translate their edges only. Every global
+  structure — the edge vec + adjacency, decl/fqname indices, node flags
+  (restored from a per-build base snapshot, so plugin effects never leak
+  into reused parts), topic facts, the class hierarchy, the plugin pass —
+  is still refolded from the parts each build. Full builds compact the id
+  space, and run automatically once tombstones outnumber live nodes;
+  `write_graph` packs tombstones away at serialization time. Memo entries
+  whose last referencing row vanished go *stale*: they're excluded from
+  re-resolution, the external pre-mint, and slot translation (so a removed
+  `import X` drops its `[external dist] X` anchor exactly like a fresh
+  build — the anchor is tombstoned, and a later re-import resurrects the
+  same dense id with a fresh resolution). A full build's output is
+  **byte-identical** to the historical pipeline — the per-part edge
+  sections replay the old assemble's exact phase order (verified A/B
+  against the pre-change binary, plugins included). The populate phase's
+  warm-and-evict sweep runs over the touched set only on incremental
+  builds (event scope ∪ fingerprint-moved files) instead of every project
+  file.
+
+### Changed
+
+- **Assemble hill-climb (every build, biggest on incremental).** Four
+  structural cuts, output byte-identical throughout: (1) memo-slot
+  translation is demand-driven — only the ids the re-translate set's rows
+  reference are translated (a one-file edit translates dozens of entries,
+  not the whole memo) — and runs as a GIL-free parallel fan-out; (2) the
+  project-wide `ref_to_global` map is gone — symbolic targets carry their
+  `File`, so translation goes `ordinal → block base +
+  payload.ref_to_local[ref]` (peer-stub edges are pure arithmetic:
+  `twin base + local`); (3) the all-edges `edge_set` is gone — post-bulk
+  dedup binary-searches the sorted bulk prefix plus a small overflow set,
+  deleting a hash insert per edge from every build (and ~8% of peak RSS at
+  the benchmark scale); (4) `ProjectContext.materialize()` returns `None`
+  instead of a `NativeGraph` snapshot — the snapshot allocated one
+  `Py<SymbolNode>` per node per rebuild and its only caller discarded it
+  (query the live graph through the context). Round two: (5) the global
+  edge refold no longer sorts — part spec-sections are per-block sorted
+  and blocks are disjoint, so concatenating parts in block-base order
+  *is* the globally-sorted list; (6) the reverse adjacency builds by a
+  counting scatter over the already-sorted triples instead of a clone +
+  re-sort; (7) `global_index` (the per-`DeclKey` map) is gone — its one
+  consumer walks the matched files' payloads through the retained
+  `ordinal_of` indirection; (8) the re-translate detect scan fans out on
+  rayon and the fqname fold accounts progress in one batch. On the
+  50k-file benchmark corpus the incremental edit loop went
+  4.63s → ~1.4–1.7s per edit.
+
 - **Topic/fact channel for native plugins.** A per-file native plugin can
   now hand structured facts up to its project-wide reader. A plugin declares
   topics with `ExternalPlugin::declare_topics() -> Vec<TopicSpec>` (same
