@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-09
+
 ### Added
 
 - **Incremental cross-file resolution on `re_materialize`.** The assemble
@@ -61,6 +63,30 @@ two versions.
 
 ### Changed
 
+- **Per-file plugins run in one salsa query per file.** The per-file plugin
+  pass was keyed `(file, plugin)` — one salsa query, and one memo entry, per
+  plugin per file — so its bookkeeping grew `O(files × plugins)`. It's now
+  keyed `(file, set_id)`, where `set_id` interns the registered per-file
+  plugin set: a single query per file runs the whole set (the per-plugin loop
+  is plain Rust, free of salsa), so per-build memo work is `O(files)`
+  regardless of plugin count. Identical plugin sets share a `set_id` and so
+  their cache entries; different sets key separately. Output unchanged.
+- **`click`, and the dispatch-app / discord.py handler detection, moved to the
+  per-file pass.** `click` became a pure per-file plugin (its group→handler
+  wiring is entirely file-local). The dispatch-app family (flask / fastapi /
+  typer / cyclopts / slack_bolt / fastmcp / celery) and discord.py now emit
+  their `@<owner>.<verb>` handlers as per-file facts and resolve them
+  project-wide, so the handler walk rides the salsa cache instead of
+  rescanning every file each build; the cross-file construction / subclass /
+  factory work stays in the project-wide pass. Output unchanged.
+- **Sorted flag fold in the plugin apply.** The project-wide plugin-op fold
+  applied flag ORs in registration order, scattering writes across the node
+  array — cache-miss-bound when a plugin like `pytest` flags millions of
+  testcases / fixtures, where the random scatter (not the OR) dominates. Flag
+  ORs are now gathered, sorted by node index, and applied in one monotonic,
+  prefetch-friendly sweep; they're commutative + idempotent, so the result is
+  byte-identical, and edges still fold in registration order through
+  `add_edge`.
 - **Project-wide plugins moved onto per-file facts + a project-wide resolve.**
   The `pytest`, `init_subclass`, `unittest`, and `mock_patch` built-ins are
   now *dual-mode*: their file-local observations (test/fixture/conftest
@@ -346,8 +372,6 @@ two versions.
   `edge_flag_registry()`, `default_seed_mask()`, `node_flag(name)`, and
   `edge_flag(name)`, and `GraphMetadata` carries both tables. (`PLUGIN_API_EPOCH`
   bumped 1→2; `FORMAT_VERSION` bumped 1→2 — old graph files are rejected.)
-
-### Changed
 
 - **`re_materialize` early-returns on zero change.** `apply_changes` now
   reports whether any salsa revision advanced; when explicit
