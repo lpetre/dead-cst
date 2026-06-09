@@ -717,49 +717,55 @@ pub(crate) fn apply_prepared_batch(
     // ``PyRef`` is not.
     let outputs_lock = ctx.borrow(py).outputs.clone();
     py.allow_threads(move || -> PyResult<()> {
+        use rayon::prelude::*;
         let mut outputs = outputs_lock.write();
         let outputs = outputs
             .as_mut()
             .ok_or_else(|| not_materialized("apply_prepared_batch"))?;
+        let len = outputs.builder.nodes.len();
+        // Split the batch: edges apply in registration order through
+        // `add_edge` (which dedups); flag ORs are gathered for a separate
+        // sorted pass. A plugin like pytest flags every testcase / fixture —
+        // millions of decls — and `nodes[idx].flags |= bits` at a random `idx`
+        // into the multi-GB node array is cache-miss-bound, so that scatter,
+        // not the OR, is the cost. Flag ORs are commutative and idempotent, so
+        // applying them sorted by index — a monotonic, prefetch-friendly
+        // sweep — is byte-identical to the in-order scatter.
+        let mut flag_ops: Vec<(usize, u32)> = Vec::new();
         for op in prepared {
-            apply_prepared(outputs, op)?;
+            match op {
+                PreparedOp::Edge {
+                    src_idx,
+                    dst_idx,
+                    flags,
+                } => {
+                    check_idx_in_range(len, src_idx, "PreparedOp::Edge", "src_idx")?;
+                    check_idx_in_range(len, dst_idx, "PreparedOp::Edge", "dst_idx")?;
+                    outputs.builder.add_edge(src_idx, dst_idx, flags);
+                }
+                PreparedOp::Entrypoint { decl_idx } => {
+                    check_idx_in_range(len, decl_idx, "PreparedOp::Entrypoint", "decl_idx")?;
+                    // Flag the decl itself an entrypoint seed — no synthetic
+                    // marker node, since reachability seeds off the flag, not
+                    // an edge from a marker.
+                    flag_ops.push((decl_idx, NODE_FLAG_ENTRYPOINT));
+                }
+                PreparedOp::FlagDecl { decl_idx, flags } => {
+                    check_idx_in_range(len, decl_idx, "PreparedOp::FlagDecl", "decl_idx")?;
+                    flag_ops.push((decl_idx, flags));
+                }
+            }
+        }
+        // Parallel sort, then a sequential OR sweep that walks the node array
+        // in index order (so consecutive flagged decls hit warm cache lines).
+        // The result is order-independent, so this stays byte-identical.
+        flag_ops.par_sort_unstable_by_key(|&(idx, _)| idx);
+        let nodes = &mut outputs.builder.nodes;
+        for (idx, bits) in flag_ops {
+            nodes[idx].flags |= bits;
         }
         Ok(())
     })
-}
-
-fn apply_prepared(
-    outputs: &mut crate::project::BuildOutputs,
-    prepared: PreparedOp,
-) -> PyResult<()> {
-    match prepared {
-        PreparedOp::Edge {
-            src_idx,
-            dst_idx,
-            flags,
-        } => {
-            let len = outputs.builder.nodes.len();
-            check_idx_in_range(len, src_idx, "PreparedOp::Edge", "src_idx")?;
-            check_idx_in_range(len, dst_idx, "PreparedOp::Edge", "dst_idx")?;
-            outputs.builder.add_edge(src_idx, dst_idx, flags);
-            Ok(())
-        }
-        PreparedOp::Entrypoint { decl_idx } => {
-            let len = outputs.builder.nodes.len();
-            check_idx_in_range(len, decl_idx, "PreparedOp::Entrypoint", "decl_idx")?;
-            // Flag the decl itself an entrypoint seed — no synthetic
-            // marker node, since reachability seeds off the flag, not
-            // an edge from a marker.
-            outputs.builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
-            Ok(())
-        }
-        PreparedOp::FlagDecl { decl_idx, flags } => {
-            let len = outputs.builder.nodes.len();
-            check_idx_in_range(len, decl_idx, "PreparedOp::FlagDecl", "decl_idx")?;
-            outputs.builder.nodes[decl_idx].flags |= flags;
-            Ok(())
-        }
-    }
 }
 
 /// Bounds-check a single index against the builder's current node
