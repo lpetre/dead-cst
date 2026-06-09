@@ -132,6 +132,116 @@ def _module_source(
     return "\n".join(lines) + "\n"
 
 
+# Framework flavors woven into the corpus so the per-file plugins have real
+# work to do — decorators to extract, fixtures / handlers / constructions to
+# find, subclass bases to walk — instead of every plugin hitting its
+# import/decorator early-out on a barren generic tree. Each framework file is
+# *additive* (written alongside the generic modules, importing its generic
+# sibling so it still resolves and mints an edge), so the generic import graph
+# that carries the node/edge scale is untouched. Third-party frameworks
+# (fastapi / flask / pytest / click) needn't be installed — the plugins match
+# the import + decorator syntactically — while `unittest` / `__init_subclass__`
+# resolve first-party, so their subclass walks fire too.
+FRAMEWORK_FLAVORS = (
+    "pytest",
+    "fastapi",
+    "flask",
+    "unittest",
+    "init_subclass",
+    "mock_patch",
+    "click",
+)
+
+# Flavors that need a `test_*.py` filename (pytest collection) — also the ones
+# whose package gets a `conftest.py`.
+_TEST_FLAVORS = frozenset({"pytest", "mock_patch"})
+
+
+def _framework_file(flavor: str, p: int, m: int) -> tuple[str, str]:
+    """``(filename, source)`` for one additive framework file for module
+    ``(p, m)``. Deterministic in ``(flavor, p, m)``; imports the generic
+    sibling so the body's call resolves to a real cross-file edge."""
+    uid = f"{p:04d}_{m:04d}"
+    head = [f"from pkg_{p:04d} import mod_{m:04d} as _i0", ""]
+    call = ["    _i0.fn_0()"]
+    meth = ["        _i0.fn_0()"]
+    body: list[str] = []
+    if flavor == "pytest":
+        name = f"test_x{uid}.py"
+        body += ["import pytest", ""]
+        body += ["@pytest.fixture", f"def fix_{uid}():", f"    return {m}", ""]
+        body += [
+            f'@pytest.fixture(name="alias_{uid}")',
+            f"def make_{uid}():",
+            "    return object()",
+            "",
+        ]
+        body += [f"def test_uses_{uid}(fix_{uid}, alias_{uid}):", *call, ""]
+        body += [f"class TestGroup_{uid}:", f"    def test_method(self, fix_{uid}):", *meth, ""]
+    elif flavor == "fastapi":
+        name = f"app_{uid}.py"
+        body += ["from fastapi import FastAPI", "", "app = FastAPI()", ""]
+        for h, verb in enumerate(("get", "post", "put")):
+            body += [f'@app.{verb}("/r_{uid}_{h}")', f"def handler_{uid}_{h}():", *call, ""]
+    elif flavor == "flask":
+        name = f"app_{uid}.py"
+        body += ["from flask import Flask", "", "app = Flask(__name__)", ""]
+        for h in range(2):
+            body += [f'@app.route("/r_{uid}_{h}")', f"def view_{uid}_{h}():", *call, ""]
+        body += ["def create_app():", "    return Flask(__name__)", "", "made = create_app()", ""]
+        body += [f'@made.route("/m_{uid}")', f"def made_view_{uid}():", *call, ""]
+    elif flavor == "unittest":
+        name = f"tests_{uid}.py"
+        body += ["import unittest", "", f"class Test_{uid}(unittest.TestCase):"]
+        body += ["    def test_a(self):", *meth]
+        body += ["    def test_b(self):", *meth, ""]
+        body += ["def setUpModule():", "    pass", "", "def tearDownModule():", "    pass", ""]
+    elif flavor == "init_subclass":
+        name = f"models_{uid}.py"
+        body += [
+            f"class Base_{uid}:",
+            "    registry = []",
+            "    def __init_subclass__(cls, **kwargs):",
+            "        super().__init_subclass__(**kwargs)",
+            f"        Base_{uid}.registry.append(cls)",
+            "",
+        ]
+        for s in range(2):
+            body += [f"class Sub_{uid}_{s}(Base_{uid}):", "    def run(self):", *meth, ""]
+    elif flavor == "mock_patch":
+        name = f"test_p{uid}.py"
+        body += [
+            f"def test_patches_{uid}(monkeypatch):",
+            f'    monkeypatch.setattr("pkg_{p:04d}.mod_{m:04d}.fn_0", None)',
+            *call,
+            "",
+        ]
+    elif flavor == "click":
+        name = f"cli_{uid}.py"
+        body += ["import click", "", "cli = click.Group()", ""]
+        body += ["@cli.command()", f"def cmd_{uid}_0():", *call, ""]
+        body += ["@cli.group()", f"def sub_{uid}():", "    pass", ""]
+        body += [f"@sub_{uid}.command()", f"def cmd_{uid}_1():", *call, ""]
+    else:  # pragma: no cover - guarded by FRAMEWORK_FLAVORS
+        raise ValueError(flavor)
+    return name, "\n".join(head + body) + "\n"
+
+
+# conftest.py for a package containing pytest/mock_patch files: a couple of
+# shared fixtures, so `@pytest.fixture` resolution + the conftest-decl rule fire.
+_CONFTEST_SRC = (
+    "import pytest\n\n"
+    "@pytest.fixture\n"
+    "def shared_fix():\n"
+    "    return 1\n\n"
+    '@pytest.fixture(name="shared_alias")\n'
+    "def make_shared():\n"
+    "    return object()\n\n"
+    "def conftest_helper():\n"
+    "    return 2\n"
+)
+
+
 def generate(
     out: Path,
     *,
@@ -140,18 +250,27 @@ def generate(
     decls_per_module: int,
     imports_per_module: int,
     calls_per_decl: int,
+    framework_fraction: float,
     clean: bool,
 ) -> dict[str, object]:
     if clean and out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Stride that selects ~`framework_fraction` of modules to also get an
+    # additive framework file; flavors round-robin across the selected set so
+    # every plugin gets a proportional share. Deterministic in the indices.
+    stride = round(1 / framework_fraction) if framework_fraction > 0 else 0
     files = 0
+    framework_files = 0
+    flavor_counts: dict[str, int] = {f: 0 for f in FRAMEWORK_FLAVORS}
+    selected = 0
     for p in range(packages):
         pkg = out / f"pkg_{p:04d}"
         pkg.mkdir(exist_ok=True)
         (pkg / "__init__.py").write_text("")
         files += 1
+        pkg_needs_conftest = False
         for m in range(modules_per_package):
             src = _module_source(
                 p,
@@ -164,6 +283,20 @@ def generate(
             )
             (pkg / f"mod_{m:04d}.py").write_text(src)
             files += 1
+            gi = p * modules_per_package + m
+            if stride and gi % stride == 0:
+                flavor = FRAMEWORK_FLAVORS[selected % len(FRAMEWORK_FLAVORS)]
+                selected += 1
+                name, fsrc = _framework_file(flavor, p, m)
+                (pkg / name).write_text(fsrc)
+                files += 1
+                framework_files += 1
+                flavor_counts[flavor] += 1
+                if flavor in _TEST_FLAVORS:
+                    pkg_needs_conftest = True
+        if pkg_needs_conftest:
+            (pkg / "conftest.py").write_text(_CONFTEST_SRC)
+            files += 1
 
     manifest = {
         "packages": packages,
@@ -171,6 +304,9 @@ def generate(
         "decls_per_module": decls_per_module,
         "imports_per_module": imports_per_module,
         "calls_per_decl": calls_per_decl,
+        "framework_fraction": framework_fraction,
+        "framework_files": framework_files,
+        "framework_flavors": flavor_counts,
         "files": files,
     }
     (out / "_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -201,6 +337,17 @@ def main() -> None:
         "The default (2) yields ~103 edges/file (~5.2 edges/node).",
     )
     parser.add_argument(
+        "--framework-fraction",
+        type=float,
+        default=0.0,
+        help="Fraction (0..1) of modules that also get an additive framework "
+        "file — a pytest fixture/test module, fastapi/flask app, unittest "
+        "TestCase, __init_subclass__ base, monkeypatch test, or click group "
+        "(round-robin) — plus a conftest.py per package with pytest files. "
+        "These give the per-file plugins real work; the generic import graph "
+        "(node/edge scale) is untouched. Default 0 reproduces the plain tree.",
+    )
+    parser.add_argument(
         "--no-clean",
         dest="clean",
         action="store_false",
@@ -216,6 +363,7 @@ def main() -> None:
         decls_per_module=args.decls_per_module,
         imports_per_module=args.imports_per_module,
         calls_per_decl=args.calls_per_decl,
+        framework_fraction=args.framework_fraction,
         clean=args.clean,
     )
     elapsed = time.perf_counter() - start
