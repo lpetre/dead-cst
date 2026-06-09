@@ -565,18 +565,6 @@ def _dylib_name(stem: str) -> str:
 _PLUGIN_EXTERN_CRATES = ("serde_json", "regex")
 
 
-def _crate_key(filename: str) -> str:
-    """Crate name from a cargo ``deps/`` artifact filename, dropping the SVH
-    suffix: ``libserde_json-1a2b3c4d.rlib`` (or ``.dylib`` / ``.so`` for a
-    proc-macro) -> ``serde_json``. Cargo names every dep artifact
-    ``lib<crate>-<hash>.<ext>``, so strip the ``lib`` prefix, the extension, and
-    the trailing ``-<hash>``."""
-    stem = filename.rsplit(".", 1)[0]
-    if stem.startswith("lib"):
-        stem = stem[3:]
-    return stem.rsplit("-", 1)[0]
-
-
 def _prefer_dynamic_link_args(std_lib: Path) -> list[str]:
     """The ``-Wl,...`` linker args (without the ``-C link-arg=`` prefix) that
     make a ``prefer-dynamic`` artifact defer host symbols and find libstd + its
@@ -632,9 +620,61 @@ def _materialize_dep_closure(dep_dir: Path) -> Path:
     return staging
 
 
-def _build_runtime_from_source(root: Path, *, release: bool, std_lib: Path) -> Path:
+def _cargo_artifact_files(cargo_json_stdout: str) -> list[Path]:
+    """Every output file cargo reported via ``compiler-artifact`` messages in a
+    ``cargo build --message-format=json`` stream. This is the exact set of
+    compiled units in the build's crate graph — every distinct SVH artifact,
+    deduped by the graph itself rather than guessed by mtime — so the shipped
+    closure binds the same SVHs the runtime dylib does. Fresh (cached) units
+    still report their ``filenames``, so this is correct over a reused (not
+    cleaned) target dir."""
+    files: list[Path] = []
+    for line in cargo_json_stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue  # non-JSON line on stdout (shouldn't occur) — be lenient
+        if msg.get("reason") == "compiler-artifact":
+            files.extend(Path(f) for f in (msg.get("filenames") or []))
+    return files
+
+
+def _closure_units(
+    artifacts: Iterable[Path], *, dylib_suffix: str, excluded: set[str]
+) -> list[Path]:
+    """The plugin-compile closure drawn from a set of cargo artifacts: every
+    dependency ``.rlib`` plus proc-macro dylib, with **every distinct SVH unit
+    kept**. No ``(crate, kind)`` dedup — that could drop the exact SVH the
+    runtime dylib bound (mtime is not a faithful proxy for "what binds"), and it
+    collapses crates the graph legitimately compiles at more than one SVH, so
+    `rustc`'s ``-L`` search for the runtime's transitive deps would fail to find
+    a match. The runtime dylib, the dynamic ``_native``, and libstd are excluded
+    (they ship in the base ``dead_cst`` wheel); ``.rmeta`` / ``.d`` and other
+    non-link outputs fall out by suffix. Distinct SVHs have distinct filenames,
+    so they're all retained; identical paths are deduped."""
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for entry in artifacts:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        is_proc_macro = (
+            entry.suffix == dylib_suffix
+            and entry.name not in excluded
+            and not entry.name.startswith("libstd-")
+        )
+        if entry.suffix == ".rlib" or is_proc_macro:
+            out.append(entry)
+    return out
+
+
+def _build_runtime_from_source(
+    root: Path, *, release: bool, std_lib: Path
+) -> tuple[Path, list[Path]]:
     """Build the runtime dylib + dep metadata (+ the dynamic ``_native``) from a
-    source checkout into ``target/plugin-host``; return the deps dir."""
+    source checkout into ``target/plugin-host``; return ``(deps_dir, artifacts)``
+    where ``artifacts`` is every file cargo's crate graph compiled (see
+    [`_cargo_artifact_files`])."""
     if shutil.which("cargo") is None:
         raise typer.BadParameter(
             "cargo not found on PATH; needed to build the runtime from source."
@@ -660,14 +700,20 @@ def _build_runtime_from_source(root: Path, *, release: bool, std_lib: Path) -> P
         "CARGO_TARGET_DIR": str(target_dir),
         "RUSTFLAGS": " ".join(["-C prefer-dynamic", *(f"-C link-arg={arg}" for arg in link_args)]),
     }
-    cmd = ["cargo", "build", "-p", "dead-cst-native"] + (["--release"] if release else [])
+    # `--message-format=json`: capture cargo's `compiler-artifact` stream so the
+    # closure is derived from the actual crate graph (every SVH unit), not by
+    # globbing the reused deps dir and guessing with mtime. Progress + warnings
+    # still flow to stderr; the JSON rides stdout.
+    cmd = ["cargo", "build", "-p", "dead-cst-native", "--message-format=json"] + (
+        ["--release"] if release else []
+    )
     typer.echo(f"$ {' '.join(cmd)}  (prefer-dynamic, dylib-only runtime)", err=True)
     try:
         manifest.write_text(dylib_only)
-        subprocess.run(cmd, cwd=root, env=env, check=True)
+        proc = subprocess.run(cmd, cwd=root, env=env, check=True, stdout=subprocess.PIPE, text=True)
     finally:
         manifest.write_text(original)
-    return deps_dir
+    return deps_dir, _cargo_artifact_files(proc.stdout)
 
 
 @app.command(name="build-plugin")
@@ -878,7 +924,7 @@ def bundle_plugin_host(
 
     std_lib = _host_std_lib()
     suffix = _dylib_suffix()
-    deps_dir = _build_runtime_from_source(root, release=release, std_lib=std_lib)
+    deps_dir, artifacts = _build_runtime_from_source(root, release=release, std_lib=std_lib)
 
     if output is not None:
         bundle = output.resolve()
@@ -898,29 +944,16 @@ def bundle_plugin_host(
     # `dead_cst` wheel. (.rmeta are skipped: redundant with the .rlib, which
     # embed metadata, and would nearly double the payload.)
     #
-    # Dedup by (crate, kind): cargo's deps/ accumulates multiple SVH-suffixed
-    # artifacts per crate across incremental rebuilds (this target dir is reused,
-    # not cleaned, to keep rebuilds fast). Ship exactly one per (crate, kind) —
-    # the newest, which is the set this build's runtime dylib actually binds
-    # against (mtime is a faithful proxy right after a successful build).
-    # Without this, stale copies (e.g. a second `regex` rlib) leak in and bloat
-    # the wheel — and a `--extern <crate>` glob in `build-plugin` could pick the
-    # wrong SVH.
+    # The set is derived from cargo's `compiler-artifact` stream (every unit the
+    # crate graph compiled), NOT by globbing the reused deps dir. That ships
+    # *every distinct SVH unit per crate* and nothing stale: the previous
+    # `(crate, kind)` + newest-mtime dedup could ship a different SVH than the
+    # runtime dylib bound (so a plugin built against the closure failed `rustc`'s
+    # `-L` crate resolution), and it collapsed crates the graph compiles at more
+    # than one SVH. The graph also has no stale copies, so the bloat the old
+    # dedup guarded against doesn't arise.
     excluded = {_dylib_name("dead_cst_runtime"), _dylib_name("dead_cst_native")}
-    newest: dict[tuple[str, str], Path] = {}
-    for entry in deps_dir.iterdir():
-        if not entry.is_file():
-            continue
-        is_proc_macro = (
-            entry.suffix == suffix
-            and entry.name not in excluded
-            and not entry.name.startswith("libstd-")
-        )
-        if entry.suffix == ".rlib" or is_proc_macro:
-            key = (_crate_key(entry.name), entry.suffix)
-            cur = newest.get(key)
-            if cur is None or entry.stat().st_mtime > cur.stat().st_mtime:
-                newest[key] = entry
+    units = _closure_units(artifacts, dylib_suffix=suffix, excluded=excluded)
     # Store each artifact xz-compressed (`<name>.xz`). A wheel is a zip, and the
     # raw `.rlib` closure deflates to ~107 MB — over PyPI's 100 MB/file cap. The
     # bulk is `lib.rmeta` crate metadata embedded in each rlib, which can't be
@@ -930,7 +963,7 @@ def bundle_plugin_host(
     n_files = 0
     raw_bytes = 0
     xz_bytes = 0
-    for entry in newest.values():
+    for entry in units:
         dest = bundle / f"{entry.name}.xz"
         with (
             open(entry, "rb") as fsrc,

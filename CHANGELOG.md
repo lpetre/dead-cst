@@ -9,6 +9,21 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`bundle-plugin-host` ships every distinct SVH unit the runtime binds.** The
+  plugin-compile closure was gathered by globbing the (reused, never-cleaned)
+  cargo deps dir and deduping by `(crate, kind)` keeping the newest by mtime —
+  but mtime is not a faithful proxy for "the SVH the runtime dylib bound", so
+  the closure could omit the exact unit a plugin needs (the plugin then failed
+  `rustc`'s `-L` crate resolution against the shipped runtime), and it collapsed
+  crates the graph compiles at more than one SVH. The closure is now derived
+  from cargo's `compiler-artifact` stream (`--message-format=json`) — the exact
+  set of units the crate graph compiled, every distinct SVH retained, with no
+  stale copies (so the old dedup's bloat concern doesn't arise). The runtime
+  dylib, the dynamic `_native`, and libstd are still excluded (they ship in the
+  base `dead_cst` wheel).
+
 ## [0.14.0] - 2026-06-09
 
 ### Added
