@@ -584,53 +584,91 @@ pub(crate) fn build_project_graph(
                         let db_rx = db_rx.clone();
                         let counters_inner = Arc::clone(&counters_ref);
                         s.spawn(move |_| {
-                            let local_db = db_rx.recv().expect("snapshot available");
-                            local_db.attach(|local_db| {
-                                let _ = file_to_nodes(local_db, file);
-                                let _ = file_to_refspecs(local_db, file);
-                                // Resolution-surface fingerprint: the
-                                // resolve cache's per-file change gate.
-                                // Warmed here so the assemble pass's
-                                // dirty-set derivation is memo reads.
-                                let _ = resolution_surface_fp(local_db, file);
-                                // Owned per-file facts for the project-wide
-                                // plugin queries. Warmed here, while the AST
-                                // is live, so the queries below run as cache
-                                // reads.
-                                let _ = file_extraction(local_db, file);
-                                // Per-file native plugins: warm the salsa-cached
-                                // `per_file_plugin_ops(file, id)` query on this
-                                // worker so the serial assembly fold below is a
-                                // pure cache read. `run_on_file` is GIL-free and
-                                // touches only this file, so it composes with the
-                                // GIL-released fan-out.
-                                for &id in per_file_ids_ref {
-                                    let _ = crate::native_plugins::per_file_plugin_ops(
-                                        local_db, file, id,
-                                    );
-                                }
-                                // Every per-file AST consumer for this file has
-                                // now run and memoized its result, so drop the
-                                // parsed AST *and* the semantic index's per-scope
-                                // analysis data (place tables, use-def maps, AST
-                                // ids) rather than let them sit resident through
-                                // assembly and the project-wide plugin pass —
-                                // that's the memory win, and the index data is
-                                // the larger share of it. Assembly, fqname, and
-                                // the class hierarchy read only the cached
-                                // payloads (`class_bases`, `external_base_children`,
-                                // `children_by_node`), never the AST or index, so
-                                // the all-files-resident peak never forms. Subclass
-                                // resolution can still pull an individual file's
-                                // AST/index back on demand to relocate a class
-                                // seed — `SemanticIndex::load` lazily rebuilds in
-                                // ingredient-reuse mode — and that rare reload is
-                                // re-cleared right after the plugin pass.
-                                ty_python_core::semantic_index(local_db, file).clear();
-                                parsed_module(local_db, file).clear();
-                            });
-                            db_tx.send(local_db).expect("channel open");
+                            // Per-file DAG, scheduled with rayon's fork-join
+                            // primitives; salsa resolves the dependency edges
+                            // underneath and dedups any shared query.
+                            //
+                            // Roots, in parallel: `file_to_nodes` (the
+                            // semantic-index long pole) and `file_extraction`
+                            // (the cheap AST walk) are independent — neither
+                            // calls the other — so `join` runs them on two
+                            // workers. The caller executes the long-pole arm
+                            // itself, so it isn't left stealing/nesting while a
+                            // slow query runs elsewhere. Each arm takes its own
+                            // snapshot.
+                            {
+                                let tx_a = db_tx.clone();
+                                let rx_a = db_rx.clone();
+                                let tx_b = db_tx.clone();
+                                let rx_b = db_rx.clone();
+                                rayon::join(
+                                    move || {
+                                        let db = rx_a.recv().expect("snapshot available");
+                                        db.attach(|db| {
+                                            let _ = file_to_nodes(db, file);
+                                        });
+                                        tx_a.send(db).expect("channel open");
+                                    },
+                                    move || {
+                                        let db = rx_b.recv().expect("snapshot available");
+                                        db.attach(|db| {
+                                            let _ = file_extraction(db, file);
+                                        });
+                                        tx_b.send(db).expect("channel open");
+                                    },
+                                );
+                            }
+                            // Downstream per-file deps for the assemble pass /
+                            // dirty gate: `file_to_refspecs` reads both roots and
+                            // `resolution_surface_fp` reads `file_to_nodes`, so
+                            // they run after the join. Cheap — kept serial.
+                            {
+                                let db = db_rx.recv().expect("snapshot available");
+                                db.attach(|db| {
+                                    let _ = file_to_refspecs(db, file);
+                                    let _ = resolution_surface_fp(db, file);
+                                });
+                                db_tx.send(db).expect("channel open");
+                            }
                             counters_inner.populate_inc();
+                            // Per-file plugins, fanned out — one task per plugin.
+                            // Each reads only the now-warm roots, so it's a pure
+                            // cache read: no worker parks on an in-progress shared
+                            // query. The scope's implicit join is the barrier the
+                            // `clear()` below waits on, and this task holds no
+                            // snapshot while the scope drains — so a worker
+                            // blocked here work-steals other files' tasks freely
+                            // (the scope is not a global barrier). With enough
+                            // cores, different files' plugins overlap.
+                            rayon::scope(|s2| {
+                                for &id in per_file_ids_ref {
+                                    let tx = db_tx.clone();
+                                    let rx = db_rx.clone();
+                                    s2.spawn(move |_| {
+                                        let db = rx.recv().expect("snapshot available");
+                                        db.attach(|db| {
+                                            let _ = crate::native_plugins::per_file_plugin_ops(
+                                                db, file, id,
+                                            );
+                                        });
+                                        tx.send(db).expect("channel open");
+                                    });
+                                }
+                            });
+                            // Eviction (DAG sink): every AST/index consumer —
+                            // `file_to_nodes`, `file_extraction`, every plugin —
+                            // has run and memoized, so drop the parsed AST + the
+                            // semantic index's per-scope analysis rather than let
+                            // them sit resident through assembly and the
+                            // project-wide plugin pass (the memory win). A later
+                            // subclass-resolution reload is re-cleared right after
+                            // that pass.
+                            let db = db_rx.recv().expect("snapshot available");
+                            db.attach(|db| {
+                                ty_python_core::semantic_index(db, file).clear();
+                                parsed_module(db, file).clear();
+                            });
+                            db_tx.send(db).expect("channel open");
                         });
                     }
                 }
