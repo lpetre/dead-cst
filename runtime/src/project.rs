@@ -97,7 +97,7 @@ impl Project {
             false,
             None,
             &counters,
-            &[],
+            None,
             GraphBuilder::with_capacity(0),
             ResolveCache::default(),
             None,
@@ -376,7 +376,7 @@ pub(crate) fn build_project_graph(
     show_progress: bool,
     stack_size: Option<usize>,
     counters: &Arc<ProgressCounters>,
-    per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
+    per_file_set_id: Option<u32>,
     carry: GraphBuilder,
     cache: ResolveCache,
     scope: Option<Vec<File>>,
@@ -552,7 +552,6 @@ pub(crate) fn build_project_graph(
         // commit message for the hazard.
         let dist_db: ProjectDatabase = db.clone();
         let files_ref: &[File] = &populate_files;
-        let per_file_ids_ref: &[crate::native_plugins::PerFilePluginId] = per_file_plugin_ids;
         let counters_ref = Arc::clone(counters);
         let run_populate = move || {
             use salsa::Database as _;
@@ -599,14 +598,17 @@ pub(crate) fn build_project_graph(
                                 // reads.
                                 let _ = file_extraction(local_db, file);
                                 // Per-file native plugins: warm the salsa-cached
-                                // `per_file_plugin_ops(file, id)` query on this
-                                // worker so the serial assembly fold below is a
-                                // pure cache read. `run_on_file` is GIL-free and
-                                // touches only this file, so it composes with the
-                                // GIL-released fan-out.
-                                for &id in per_file_ids_ref {
+                                // `per_file_plugin_ops(file, set_id)` query on
+                                // this worker so the assembly fold below is a
+                                // pure cache read. One query runs the whole
+                                // plugin set (keyed on `set_id`), so this is O(1)
+                                // in plugin count, not one warm per plugin.
+                                // `run_on_file` is GIL-free and touches only this
+                                // file, so it composes with the GIL-released
+                                // fan-out.
+                                if let Some(set_id) = per_file_set_id {
                                     let _ = crate::native_plugins::per_file_plugin_ops(
-                                        local_db, file, id,
+                                        local_db, file, set_id,
                                     );
                                 }
                                 // Every per-file AST consumer for this file has
@@ -688,7 +690,7 @@ pub(crate) fn build_project_graph(
         db,
         &project_files,
         &peer_pyi_to_py,
-        per_file_plugin_ids,
+        per_file_set_id,
         counters,
         &reload_log,
         carry,
@@ -879,7 +881,7 @@ fn assemble_graph<'db>(
     db: &'db ProjectDatabase,
     project_files: &[File],
     peer_pyi_to_py: &FxHashMap<File, File>,
-    per_file_plugin_ids: &[crate::native_plugins::PerFilePluginId],
+    per_file_set_id: Option<u32>,
     counters: &Arc<ProgressCounters>,
     reload_log: &ReloadLog,
     carry: GraphBuilder,
@@ -1049,23 +1051,16 @@ fn assemble_graph<'db>(
     for &file in project_files {
         spec_payloads.push(file_to_refspecs(db, file));
     }
-    // Per-file plugin ops, flattened across the registered per-file
-    // plugins (in registration order). Prefetched here so the per-part
-    // edge translation below can run db-free on rayon workers.
-    let plugin_ops: Vec<Vec<&'db crate::native_plugins::FileLocalOp>> = if per_file_plugin_ids
-        .is_empty()
-    {
-        vec![Vec::new(); n_files]
-    } else {
-        project_files
+    // Per-file plugin ops: one salsa query per file runs the whole plugin
+    // set (keyed on `set_id`) and returns every plugin's ops concatenated in
+    // registration order. Prefetched here (a cache read — warmed in populate)
+    // so the per-part edge translation below can run db-free on rayon workers.
+    let plugin_ops: Vec<&'db [crate::native_plugins::FileLocalOp]> = match per_file_set_id {
+        Some(set_id) => project_files
             .iter()
-            .map(|&file| {
-                per_file_plugin_ids
-                    .iter()
-                    .flat_map(|&id| crate::native_plugins::per_file_plugin_ops(db, file, id).iter())
-                    .collect()
-            })
-            .collect()
+            .map(|&file| crate::native_plugins::per_file_plugin_ops(db, file, set_id).as_slice())
+            .collect(),
+        None => vec![&[][..]; n_files],
     };
 
     // Per-file anchor-directory ids. ty's `resolve_module` is anchor-
@@ -2112,7 +2107,7 @@ fn assemble_graph<'db>(
     // derived state, rebuilt from every file's ops each pass.
     let mut topic_facts: FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>> =
         FxHashMap::default();
-    if !per_file_plugin_ids.is_empty() {
+    if per_file_set_id.is_some() {
         use crate::native_plugins::FileLocalOp;
         for (pos, ops) in plugin_ops.iter().enumerate() {
             let mint = &mints[pos];
@@ -2120,7 +2115,7 @@ fn assemble_graph<'db>(
             let to_global =
                 |local: u32| ((local as usize) < len).then_some(mint.base + local as usize);
             let mut file_path: Option<String> = None;
-            for op in ops {
+            for op in ops.iter() {
                 match op {
                     FileLocalOp::Edge { .. } => {}
                     FileLocalOp::Entrypoint { decl_local_idx } => {
@@ -2275,7 +2270,7 @@ fn assemble_graph<'db>(
                 {
                     use crate::native_plugins::FileLocalOp;
                     let len = mint.payload.nodes.len();
-                    for op in &plugin_ops_ref[pos] {
+                    for op in plugin_ops_ref[pos] {
                         if let FileLocalOp::Edge {
                             src_local_idx,
                             dst_local_idx,
@@ -2573,26 +2568,38 @@ fn run_job<T: Sync, R: Send>(
 /// post-build plugin pass. Project-wide plugins (including project-wide
 /// external dylibs) and non-native Python plugins are skipped here —
 /// they still run in [`collect_prepared_plugin_ops`].
-fn extract_per_file_plugin_ids(
-    py: Python<'_>,
-    plugins: &[PyObject],
-) -> Vec<crate::native_plugins::PerFilePluginId> {
+/// Collect the registered per-file plugins (in registration order) and intern
+/// the ordered id list to a single process-stable `set_id`. `None` when no
+/// per-file plugins are registered (the build skips the per-file pass). The
+/// whole set then rides one salsa query per file keyed on this `set_id` — see
+/// [`crate::native_plugins::per_file_plugin_ops`].
+fn extract_per_file_plugin_set(py: Python<'_>, plugins: &[PyObject]) -> Option<u32> {
     use crate::native_plugins::{NativePlugin, NativePluginKind, PerFilePluginId};
-    let mut ids = Vec::new();
+    let mut ids: Vec<PerFilePluginId> = Vec::new();
+    let mut seen: FxHashSet<PerFilePluginId> = FxHashSet::default();
+    // Dedup by id, preserving first-occurrence (registration) order. Two
+    // plugins with the same id — e.g. identical `ServerConfig` configs that
+    // intern to one `Configured` id, or two `main_block()`s — collapse to one
+    // run, exactly as the old `(file, id)` salsa key deduped them.
+    let mut push = |id: PerFilePluginId, ids: &mut Vec<PerFilePluginId>| {
+        if seen.insert(id) {
+            ids.push(id);
+        }
+    };
     for p in plugins {
         let Ok(native) = p.bind(py).downcast::<NativePlugin>() else {
             continue;
         };
         match &native.borrow().kind {
-            NativePluginKind::PerFile(id) => ids.push(*id),
+            NativePluginKind::PerFile(id) => push(*id, &mut ids),
             NativePluginKind::External {
                 per_file_id: Some(eid),
                 ..
-            } => ids.push(PerFilePluginId::External(*eid)),
+            } => push(PerFilePluginId::External(*eid), &mut ids),
             _ => {}
         }
     }
-    ids
+    (!ids.is_empty()).then(|| crate::native_plugins::register_per_file_set(ids))
 }
 
 /// Owned `(module, name, anchor-dir)` → resolved class-base memo.
@@ -3398,7 +3405,7 @@ impl ProjectContext {
         let counters = Arc::clone(&slf.borrow(py).progress);
         let build_result = {
             let mut this = slf.borrow_mut(py);
-            let per_file_ids = extract_per_file_plugin_ids(py, &this.plugins);
+            let per_file_set_id = extract_per_file_plugin_set(py, &this.plugins);
             // Hand the previous build's resolve cache + the
             // accumulated change scope to the new build. The cache
             // moves out (the old outputs keep an invalid Default);
@@ -3422,7 +3429,7 @@ impl ProjectContext {
                 show_progress,
                 stack_size,
                 &counters,
-                &per_file_ids,
+                per_file_set_id,
                 carry,
                 cache,
                 scope,
