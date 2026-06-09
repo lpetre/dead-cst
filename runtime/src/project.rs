@@ -2105,65 +2105,96 @@ fn assemble_graph<'db>(
     // translation below; flags apply to freshly minted blocks only
     // (clean files carry theirs in the restored base flags); facts are
     // derived state, rebuilt from every file's ops each pass.
+    //
+    // The per-fact work — `file_path_string`, the topic/value `to_string`s,
+    // the `Fact` alloc — is fanned out across the snapshot pool, one job per
+    // file that emitted any op; the cheap, order-sensitive reduce (OR the
+    // flags onto disjoint blocks, push facts into `topic_facts`) stays serial
+    // in `pos` order so the output is byte-identical to the serial loop.
     let mut topic_facts: FxHashMap<String, Vec<crate::native_plugins::plugin_api::Fact>> =
         FxHashMap::default();
     if per_file_set_id.is_some() {
+        use crate::native_plugins::plugin_api::Fact;
         use crate::native_plugins::FileLocalOp;
-        for (pos, ops) in plugin_ops.iter().enumerate() {
-            let mint = &mints[pos];
-            let len = mint.payload.nodes.len();
-            let to_global =
-                |local: u32| ((local as usize) < len).then_some(mint.base + local as usize);
-            let mut file_path: Option<String> = None;
-            for op in ops.iter() {
-                match op {
-                    FileLocalOp::Edge { .. } => {}
-                    FileLocalOp::Entrypoint { decl_local_idx } => {
-                        if !mint.fill {
-                            continue;
+        type Applied = (Vec<(usize, u32)>, Vec<(String, Fact)>);
+        let op_positions: Vec<usize> = (0..n_files)
+            .filter(|&pos| !plugin_ops[pos].is_empty())
+            .collect();
+        // Fresh snapshot pool: the assemble-wide `pool` was moved into the
+        // resolve arm. Cheap (a handful of snapshot clones).
+        let plugin_pool = DbPool::new(db);
+        let mints_ref = &mints;
+        let plugin_ops_ref = &plugin_ops;
+        let applied: Vec<Applied> = py.allow_threads(|| {
+            run_job(&plugin_pool, &op_positions, |ldb, &pos| {
+                let ops = plugin_ops_ref[pos];
+                let mint = &mints_ref[pos];
+                let len = mint.payload.nodes.len();
+                let to_global =
+                    |local: u32| ((local as usize) < len).then_some(mint.base + local as usize);
+                let mut flag_writes: Vec<(usize, u32)> = Vec::new();
+                let mut facts: Vec<(String, Fact)> = Vec::new();
+                let mut file_path: Option<String> = None;
+                for op in ops {
+                    match op {
+                        FileLocalOp::Edge { .. } => {}
+                        FileLocalOp::Entrypoint { decl_local_idx } => {
+                            if mint.fill {
+                                if let Some(idx) = to_global(*decl_local_idx) {
+                                    flag_writes.push((idx, NODE_FLAG_ENTRYPOINT));
+                                }
+                            }
                         }
-                        if let Some(decl_idx) = to_global(*decl_local_idx) {
-                            builder.nodes[decl_idx].flags |= NODE_FLAG_ENTRYPOINT;
+                        FileLocalOp::FlagDecl {
+                            decl_local_idx,
+                            flags,
+                        } => {
+                            if mint.fill {
+                                if let Some(idx) = to_global(*decl_local_idx) {
+                                    flag_writes.push((idx, *flags));
+                                }
+                            }
                         }
-                    }
-                    FileLocalOp::FlagDecl {
-                        decl_local_idx,
-                        flags,
-                    } => {
-                        if !mint.fill {
-                            continue;
+                        FileLocalOp::Fact {
+                            topic,
+                            decl_local_idx,
+                            value,
+                        } => {
+                            // A fact that pinned a decl is dropped when that
+                            // decl doesn't resolve to a global node — same
+                            // lenient contract as edge/flag ops.
+                            let decl_idx = match decl_local_idx {
+                                Some(local) => match to_global(*local) {
+                                    Some(global) => Some(global),
+                                    None => continue,
+                                },
+                                None => None,
+                            };
+                            let path = file_path
+                                .get_or_insert_with(|| file_path_string(ldb, mint.file))
+                                .clone();
+                            facts.push((
+                                topic.to_string(),
+                                Fact {
+                                    path,
+                                    decl_idx,
+                                    value: value.to_string(),
+                                },
+                            ));
                         }
-                        if let Some(decl_idx) = to_global(*decl_local_idx) {
-                            builder.nodes[decl_idx].flags |= flags;
-                        }
-                    }
-                    FileLocalOp::Fact {
-                        topic,
-                        decl_local_idx,
-                        value,
-                    } => {
-                        // A fact that pinned a decl is dropped when that
-                        // decl doesn't resolve to a global node — same
-                        // lenient contract as edge/flag ops.
-                        let decl_idx = match decl_local_idx {
-                            Some(local) => match to_global(*local) {
-                                Some(global) => Some(global),
-                                None => continue,
-                            },
-                            None => None,
-                        };
-                        let path = file_path
-                            .get_or_insert_with(|| file_path_string(db, mint.file))
-                            .clone();
-                        topic_facts.entry(topic.to_string()).or_default().push(
-                            crate::native_plugins::plugin_api::Fact {
-                                path,
-                                decl_idx,
-                                value: value.to_string(),
-                            },
-                        );
                     }
                 }
+                (flag_writes, facts)
+            })
+        });
+        // Serial reduce in `pos` order (op_positions is ascending), so the
+        // fact order — and thus the build — matches the serial loop exactly.
+        for (flag_writes, facts) in applied {
+            for (idx, bits) in flag_writes {
+                builder.nodes[idx].flags |= bits;
+            }
+            for (topic, fact) in facts {
+                topic_facts.entry(topic).or_default().push(fact);
             }
         }
     }
