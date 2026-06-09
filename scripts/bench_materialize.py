@@ -130,13 +130,21 @@ def _incremental(
         return ctx.read_progress_snapshot()["fqname_total"] - len(ctx.tombstoned_indices())
 
     manifest = sorted((corpus).glob("pkg_*"))
+    # Prefer framework files (pytest / fastapi / unittest / … — see
+    # gen_bench_corpus.py) as edit targets: editing one re-runs the per-file
+    # plugins on a file that actually has fixtures/handlers/etc., so the
+    # incremental loop measures real plugin work, not a generic-module no-op.
+    # Falls back to generic `mod_*.py` on a corpus with no framework content.
+    _fw_prefixes = ("test_", "app_", "tests_", "models_", "cli_")
+    fw_files = sorted(f for f in corpus.glob("pkg_*/*.py") if f.name.startswith(_fw_prefixes))
+    generic = [sorted(pkg.glob("mod_*.py"))[0] for pkg in manifest[: max(edits, 1)]]
+    scatter_targets = fw_files or generic
     rows: list[tuple[str, float, tuple[int, int], int]] = []
     originals: dict[Path, str] = {}
     try:
-        # Scattered edits: one file per round, spread across packages.
+        # Scattered edits: one file per round, spread across the corpus.
         for i in range(edits):
-            pkg = manifest[(i * 97) % len(manifest)]
-            target = sorted(pkg.glob("mod_*.py"))[i % 3]
+            target = scatter_targets[(i * 97) % len(scatter_targets)]
             originals.setdefault(target, target.read_text())
             target.write_text(target.read_text() + f"\n\ndef _bench_s{i}():\n    pass\n")
             before = _nodes()
@@ -153,8 +161,8 @@ def _incremental(
                 )
             )
 
-        # Hot loop: repeated edits to one file.
-        target = (corpus / "pkg_0000" / "mod_0000.py").resolve()
+        # Hot loop: repeated edits to one file (a framework file if present).
+        target = (fw_files[0] if fw_files else corpus / "pkg_0000" / "mod_0000.py").resolve()
         originals.setdefault(target, target.read_text())
         for i in range(edits):
             target.write_text(target.read_text() + f"\n\ndef _bench_h{i}():\n    pass\n")
@@ -194,8 +202,10 @@ def main() -> None:
     parser.add_argument(
         "--plugins",
         choices=("none", "all"),
-        default="none",
-        help="Run with no plugins (pure build) or the full built-in set.",
+        default="all",
+        help="Run with the full built-in plugin set (default) or none (pure "
+        "build). Only meaningful against a corpus generated with "
+        "--framework-fraction > 0; otherwise every plugin early-outs.",
     )
     parser.add_argument(
         "--count",
