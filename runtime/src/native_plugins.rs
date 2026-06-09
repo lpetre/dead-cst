@@ -943,29 +943,72 @@ fn configured_per_file_plugin(id: u32) -> Option<Arc<ConfiguredPerFile>> {
         .map(Arc::clone)
 }
 
-/// Salsa-tracked per-file plugin invocation. Keyed on ``(file, id)``;
-/// re-runs only when the file's tracked inputs (``file_to_nodes`` /
-/// ``parsed_module`` / ``line_index``) change. Returns the file-local ops
-/// the harness translates to global indices at apply time.
-#[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
-pub(crate) fn per_file_plugin_ops(
-    db: &dyn ProjectDb,
-    file: File,
+/// Process-global registry interning an *ordered* per-file plugin id list to a
+/// stable `set_id`. This is what lets [`per_file_plugin_ops`] be keyed
+/// `(file, set_id)` — **one** salsa query per file that runs the whole set —
+/// rather than `(file, plugin)`, one per plugin. Salsa's per-build memo work
+/// is then O(files), not O(files × plugins): the per-plugin loop lives inside
+/// the query body, costing nothing in salsa. Interning by the ordered list
+/// keeps it sound across `Analysis`es with different plugin sets (a different
+/// list → a different `set_id` → separate memo entries), and an identical set
+/// reconstructed across a `re_materialize` reuses its `set_id` (and so its
+/// cache entries). Append-only and immutable for a given `set_id`, so the
+/// untracked lookup from inside the query is sound — same contract as
+/// [`CONFIGURED_PER_FILE_PLUGINS`] / [`EXTERNAL_PER_FILE_PLUGINS`].
+static PER_FILE_PLUGIN_SETS: std::sync::OnceLock<std::sync::RwLock<PluginSetRegistry>> =
+    std::sync::OnceLock::new();
+
+#[derive(Default)]
+struct PluginSetRegistry {
+    sets: Vec<Arc<[PerFilePluginId]>>,
+    by_hash: FxHashMap<u64, u32>,
+}
+
+/// Register (intern) an ordered per-file plugin id list, returning its
+/// process-stable `set_id`. An identical list returns the existing id.
+pub(crate) fn register_per_file_set(ids: Vec<PerFilePluginId>) -> u32 {
+    let reg =
+        PER_FILE_PLUGIN_SETS.get_or_init(|| std::sync::RwLock::new(PluginSetRegistry::default()));
+    let mut hasher = FxHasher::default();
+    ids.hash(&mut hasher);
+    let hash = hasher.finish();
+    let mut guard = reg.write().expect("per-file plugin set registry poisoned");
+    if let Some(&id) = guard.by_hash.get(&hash) {
+        return id;
+    }
+    let set_id = guard.sets.len() as u32;
+    guard.sets.push(ids.into());
+    guard.by_hash.insert(hash, set_id);
+    set_id
+}
+
+/// Look up an interned per-file plugin id list by `set_id`.
+fn per_file_set(set_id: u32) -> Option<Arc<[PerFilePluginId]>> {
+    PER_FILE_PLUGIN_SETS
+        .get()?
+        .read()
+        .expect("per-file plugin set registry poisoned")
+        .sets
+        .get(set_id as usize)
+        .map(Arc::clone)
+}
+
+/// Run one per-file plugin (configless builtin, configured builtin, or
+/// external dylib) into `ops` — the single curated [`plugin_api::PerFilePlugin`]
+/// dispatch, shared by the whole-set loop in [`per_file_plugin_ops`].
+fn run_one_per_file(
     id: PerFilePluginId,
-) -> Vec<FileLocalOp> {
-    let file_ctx = FileContext::new(db, file);
-    let pctx = plugin_api::PluginFileCtx::new(&file_ctx);
-    let mut ops = plugin_api::FileOps::new();
-    // Every per-file plugin — configless builtin, configured builtin, or
-    // external dylib — runs through the one curated `PerFilePlugin` surface.
+    pctx: &plugin_api::PluginFileCtx<'_>,
+    ops: &mut plugin_api::FileOps,
+) {
     match id {
-        PerFilePluginId::Builtin(kind) => kind.plugin().run_on_file(&pctx, &mut ops),
+        PerFilePluginId::Builtin(kind) => kind.plugin().run_on_file(pctx, ops),
         PerFilePluginId::Configured(plugin_id) => {
             // Resolve the configured plugin from the registry; a stale id
             // (shouldn't happen) yields no ops.
             if let Some(cfg) = configured_per_file_plugin(plugin_id) {
                 let per_file: &dyn plugin_api::PerFilePlugin = cfg.as_ref();
-                per_file.run_on_file(&pctx, &mut ops);
+                per_file.run_on_file(pctx, ops);
             }
         }
         PerFilePluginId::External(plugin_id) => {
@@ -973,9 +1016,30 @@ pub(crate) fn per_file_plugin_ops(
             // registry; a stale id (shouldn't happen) yields no ops.
             if let Some(plugin) = external_per_file_plugin(plugin_id) {
                 if let Some(per_file) = plugin.per_file() {
-                    per_file.run_on_file(&pctx, &mut ops);
+                    per_file.run_on_file(pctx, ops);
                 }
             }
+        }
+    }
+}
+
+/// Salsa-tracked per-file plugin invocation. Keyed on ``(file, set_id)`` — the
+/// whole registered per-file plugin *set* runs in one query, so re-runs are
+/// O(files) not O(files × plugins). Re-runs only when the file's tracked
+/// inputs (``file_to_nodes`` / ``parsed_module`` / ``line_index``) change.
+/// Returns every plugin's file-local ops concatenated in registration order
+/// (the order the harness translates + folds at apply time).
+#[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
+pub(crate) fn per_file_plugin_ops(db: &dyn ProjectDb, file: File, set_id: u32) -> Vec<FileLocalOp> {
+    let file_ctx = FileContext::new(db, file);
+    let pctx = plugin_api::PluginFileCtx::new(&file_ctx);
+    let mut ops = plugin_api::FileOps::new();
+    // Every per-file plugin in the set — configless builtin, configured
+    // builtin, or external dylib — runs through the one curated
+    // `PerFilePlugin` surface, in registration order.
+    if let Some(ids) = per_file_set(set_id) {
+        for &id in ids.iter() {
+            run_one_per_file(id, &pctx, &mut ops);
         }
     }
     ops.into_inner()
