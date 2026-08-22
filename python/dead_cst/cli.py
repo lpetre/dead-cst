@@ -834,7 +834,19 @@ def build_plugin(
 
     # The shipped closure is xz-compressed (PyPI per-file size cap); rustc needs
     # it decompressed. No-op for a raw local deps dir.
+    raw_dep_dir = dep_dir
     dep_dir = _materialize_dep_closure(dep_dir)
+
+    # The explicit-`--target` bundle build splits the graphs, so a raw
+    # `--runtime-dir` pointing at the tripled deps dir (…/<triple>/<profile>/deps)
+    # holds only target units — the proc-macro dylibs rustc also loads while
+    # resolving the runtime's crate graph live in the sibling host deps dir
+    # (…/<profile>/deps). Search it too when it exists; the shipped bundle is
+    # flat (host proc-macros + target rlibs together), so this is a no-op there.
+    # rustc matches -L candidates by exact (name, hash), so an extra dir can't
+    # introduce ambiguity.
+    host_deps = raw_dep_dir.parent.parent.parent / raw_dep_dir.parent.name / raw_dep_dir.name
+    extra_search_dirs = [host_deps] if host_deps != raw_dep_dir and host_deps.is_dir() else []
 
     # Resolve the plugin source (default: bundled example from a source checkout).
     if plugin_src is None:
@@ -895,6 +907,7 @@ def build_plugin(
         *exposed_externs,
         "-L",
         f"dependency={dep_dir}",
+        *(arg for d in extra_search_dirs for arg in ("-L", f"dependency={d}")),
         *(
             arg
             for link_arg in _prefer_dynamic_link_args(std_lib)

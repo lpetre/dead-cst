@@ -20,7 +20,9 @@ two versions.
   cargo splits the graphs and host-graph rlibs are dropped from the closure
   (proc-macro dylibs are still shipped): exactly one rlib per exposed crate
   remains — the unit the runtime dylib binds. `build-plugin` warns when a raw
-  `--runtime-dir` still holds an ambiguous set. The publish workflow smoke-tests
+  `--runtime-dir` still holds an ambiguous set, and searches the sibling host
+  deps dir (`…/<profile>/deps` next to a tripled `…/<triple>/<profile>/deps`)
+  so proc-macro dylibs still resolve when pointed at a split raw build. The publish workflow smoke-tests
   the freshly built wheels before upload: it installs the dynamic base wheel +
   plugin-host wheel into a clean venv, compiles a tiny plugin (exercising both
   curated externs), loads it, and runs a materialize with it applied.
