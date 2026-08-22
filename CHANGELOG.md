@@ -11,6 +11,20 @@ two versions.
 
 ### Fixed
 
+- **`build-plugin`'s `--extern serde_json` / `--extern regex` pick is
+  deterministic.** The compile closure shipped both graph copies of a crate
+  compiled for host *and* target (e.g. `regex`, also a private dep of the
+  `ruff_macros` proc-macro), and `build-plugin` chose between the same-named
+  rlibs by newest mtime — an arbitrary pick after the xz round-trip.
+  `bundle-plugin-host` now builds with an explicit `--target <host triple>`, so
+  cargo splits the graphs and host-graph rlibs are dropped from the closure
+  (proc-macro dylibs are still shipped): exactly one rlib per exposed crate
+  remains — the unit the runtime dylib binds. `build-plugin` warns when a raw
+  `--runtime-dir` still holds an ambiguous set. The publish workflow smoke-tests
+  the freshly built wheels before upload: it installs the dynamic base wheel +
+  plugin-host wheel into a clean venv, compiles a tiny plugin (exercising both
+  curated externs), loads it, and runs a materialize with it applied.
+
 - **`bundle-plugin-host` ships every distinct SVH unit the runtime binds.** The
   plugin-compile closure was gathered by globbing the (reused, never-cleaned)
   cargo deps dir and deduping by `(crate, kind)` keeping the newest by mtime —

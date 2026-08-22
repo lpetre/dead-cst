@@ -183,14 +183,36 @@ def test_cargo_artifact_files_collects_compiler_artifact_filenames():
 
 
 def test_closure_units_keeps_every_distinct_svh_per_crate():
-    # The fix: two SVH-distinct rlibs of one crate are BOTH shipped (the old
-    # (crate, kind) + mtime dedup dropped one — possibly the one that binds).
+    # The fix: two SVH-distinct target-graph rlibs of one crate are BOTH shipped
+    # (the old (crate, kind) + mtime dedup dropped one — possibly the one that
+    # binds).
     artifacts = [
         Path("/d/libregex-1111111111111111.rlib"),
         Path("/d/libregex-2222222222222222.rlib"),
     ]
-    kept = _closure_units(artifacts, dylib_suffix=".so", excluded=set())
+    kept = _closure_units(artifacts, dylib_suffix=".so", excluded=set(), target_deps_dir=Path("/d"))
     assert kept == artifacts
+
+
+def test_closure_units_drops_host_graph_rlibs():
+    # The `--target` build splits the graphs: target units in the tripled deps
+    # dir, host units (proc-macro private deps — e.g. regex compiled a second
+    # time for ruff_macros) in the un-tripled one. Host rlibs are dropped so the
+    # flat bundle holds exactly one regex — build-plugin's `--extern` pick is
+    # deterministic. Proc-macro dylibs live in the host dir and ARE kept.
+    target = Path("/t/x86_64-unknown-linux-gnu/release/deps")
+    host = Path("/t/release/deps")
+    artifacts = [
+        target / "libregex-1111111111111111.rlib",  # target unit -> keep
+        host / "libregex-2222222222222222.rlib",  # host unit -> dropped
+        host / "libruff_macros-cccc.so",  # proc-macro dylib -> keep
+    ]
+    assert _closure_units(
+        artifacts, dylib_suffix=".so", excluded=set(), target_deps_dir=target
+    ) == [
+        target / "libregex-1111111111111111.rlib",
+        host / "libruff_macros-cccc.so",
+    ]
 
 
 def test_closure_units_filters_kinds_and_excludes_wheel_shipped():
@@ -205,7 +227,9 @@ def test_closure_units_filters_kinds_and_excludes_wheel_shipped():
         Path("/d/libregex-aaaa.rmeta"),  # metadata-only -> dropped by suffix
         Path("/d/libregex-aaaa.rlib"),  # duplicate path -> deduped
     ]
-    assert _closure_units(artifacts, dylib_suffix=suffix, excluded=excluded) == [
+    assert _closure_units(
+        artifacts, dylib_suffix=suffix, excluded=excluded, target_deps_dir=Path("/d")
+    ) == [
         Path("/d/libregex-aaaa.rlib"),
         Path("/d/libserde_derive-bbbb.so"),
     ]
