@@ -512,10 +512,8 @@ def _rustc_print(*args: str) -> str:
     ).stdout.strip()
 
 
-def _host_std_lib() -> Path:
-    """The toolchain dir holding the shared ``libstd-<hash>`` dylib (everything
-    is built ``-C prefer-dynamic``, so artifacts rpath here)."""
-    sysroot = Path(_rustc_print("--print", "sysroot"))
+def _host_triple() -> str:
+    """The host target triple from ``rustc -vV`` (e.g. ``x86_64-unknown-linux-gnu``)."""
     host = next(
         (
             line.split("host: ", 1)[1]
@@ -526,7 +524,14 @@ def _host_std_lib() -> Path:
     )
     if host is None:
         raise typer.BadParameter("could not determine the host target triple from `rustc -vV`.")
-    return sysroot / "lib" / "rustlib" / host / "lib"
+    return host
+
+
+def _host_std_lib() -> Path:
+    """The toolchain dir holding the shared ``libstd-<hash>`` dylib (everything
+    is built ``-C prefer-dynamic``, so artifacts rpath here)."""
+    sysroot = Path(_rustc_print("--print", "sysroot"))
+    return sysroot / "lib" / "rustlib" / _host_triple() / "lib"
 
 
 # --- platform abstraction for the shared-runtime plugin build ----------------
@@ -563,18 +568,6 @@ def _dylib_name(stem: str) -> str:
 # runtime's transitive dep tree is intentionally NOT a stable surface — exposing
 # it would leak ruff/ty's private deps as a de-facto public API.
 _PLUGIN_EXTERN_CRATES = ("serde_json", "regex")
-
-
-def _crate_key(filename: str) -> str:
-    """Crate name from a cargo ``deps/`` artifact filename, dropping the SVH
-    suffix: ``libserde_json-1a2b3c4d.rlib`` (or ``.dylib`` / ``.so`` for a
-    proc-macro) -> ``serde_json``. Cargo names every dep artifact
-    ``lib<crate>-<hash>.<ext>``, so strip the ``lib`` prefix, the extension, and
-    the trailing ``-<hash>``."""
-    stem = filename.rsplit(".", 1)[0]
-    if stem.startswith("lib"):
-        stem = stem[3:]
-    return stem.rsplit("-", 1)[0]
 
 
 def _prefer_dynamic_link_args(std_lib: Path) -> list[str]:
@@ -632,9 +625,72 @@ def _materialize_dep_closure(dep_dir: Path) -> Path:
     return staging
 
 
-def _build_runtime_from_source(root: Path, *, release: bool, std_lib: Path) -> Path:
+def _cargo_artifact_files(cargo_json_stdout: str) -> list[Path]:
+    """Every output file cargo reported via ``compiler-artifact`` messages in a
+    ``cargo build --message-format=json`` stream. This is the exact set of
+    compiled units in the build's crate graph — every distinct SVH artifact,
+    deduped by the graph itself rather than guessed by mtime — so the shipped
+    closure binds the same SVHs the runtime dylib does. Fresh (cached) units
+    still report their ``filenames``, so this is correct over a reused (not
+    cleaned) target dir."""
+    files: list[Path] = []
+    for line in cargo_json_stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue  # non-JSON line on stdout (shouldn't occur) — be lenient
+        if msg.get("reason") == "compiler-artifact":
+            files.extend(Path(f) for f in (msg.get("filenames") or []))
+    return files
+
+
+def _closure_units(
+    artifacts: Iterable[Path], *, dylib_suffix: str, excluded: set[str], target_deps_dir: Path
+) -> list[Path]:
+    """The plugin-compile closure drawn from a set of cargo artifacts: every
+    *target-graph* dependency ``.rlib`` plus every proc-macro dylib, with
+    **every distinct SVH unit kept**. No ``(crate, kind)`` dedup — that could
+    drop the exact SVH the runtime dylib bound (mtime is not a faithful proxy
+    for "what binds"), and it collapses crates the graph legitimately compiles
+    at more than one SVH, so `rustc`'s ``-L`` search for the runtime's
+    transitive deps would fail to find a match.
+
+    The build runs with an explicit ``--target``, so cargo splits the graphs:
+    target units land in ``target_deps_dir`` (``…/<triple>/<profile>/deps``),
+    host units (proc-macros + their private deps, e.g. ``regex`` compiled a
+    second time for ``ruff_macros``) in the un-tripled deps dir. Host ``.rlib``
+    units are dropped — ``rustc`` never consults them when compiling a plugin
+    (proc-macro dylibs are self-contained) and shipping them into the flat bundle
+    would leave two same-crate rlibs for ``build-plugin``'s ``--extern`` pick to
+    guess between. Proc-macro *dylibs* are kept from either dir. The runtime
+    dylib, the dynamic ``_native``, and libstd are excluded (they ship in the
+    base ``dead_cst`` wheel); ``.rmeta`` / ``.d`` and other non-link outputs
+    fall out by suffix. Distinct SVHs have distinct filenames, so they're all
+    retained; identical paths are deduped."""
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for entry in artifacts:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        is_proc_macro = (
+            entry.suffix == dylib_suffix
+            and entry.name not in excluded
+            and not entry.name.startswith("libstd-")
+        )
+        is_target_rlib = entry.suffix == ".rlib" and entry.parent == target_deps_dir
+        if is_target_rlib or is_proc_macro:
+            out.append(entry)
+    return out
+
+
+def _build_runtime_from_source(
+    root: Path, *, release: bool, std_lib: Path
+) -> tuple[Path, list[Path]]:
     """Build the runtime dylib + dep metadata (+ the dynamic ``_native``) from a
-    source checkout into ``target/plugin-host``; return the deps dir."""
+    source checkout into ``target/plugin-host``; return ``(deps_dir, artifacts)``
+    where ``artifacts`` is every file cargo's crate graph compiled (see
+    [`_cargo_artifact_files`])."""
     if shutil.which("cargo") is None:
         raise typer.BadParameter(
             "cargo not found on PATH; needed to build the runtime from source."
@@ -652,22 +708,42 @@ def _build_runtime_from_source(root: Path, *, release: bool, std_lib: Path) -> P
             "could not switch runtime crate-type to dylib-only "
             '(expected \'crate-type = ["rlib", "dylib"]\' in runtime/Cargo.toml).'
         )
+    # An explicit `--target` (the host triple) makes cargo split the host and
+    # target graphs into separate deps dirs. Without it, host units — proc-macro
+    # private deps like the second `regex` compiled for `ruff_macros` — land in
+    # the SAME deps dir as the target units the runtime dylib binds, and the
+    # shipped closure ends up with two same-crate rlibs that `build-plugin`'s
+    # `--extern` pick can only guess between. (It also scopes RUSTFLAGS'
+    # prefer-dynamic to target units, where it belongs.)
+    triple = _host_triple()
     target_dir = root / "target" / "plugin-host"
-    deps_dir = target_dir / ("release" if release else "debug") / "deps"
+    deps_dir = target_dir / triple / ("release" if release else "debug") / "deps"
     link_args = _prefer_dynamic_link_args(std_lib)
     env = {
         **os.environ,
         "CARGO_TARGET_DIR": str(target_dir),
         "RUSTFLAGS": " ".join(["-C prefer-dynamic", *(f"-C link-arg={arg}" for arg in link_args)]),
     }
-    cmd = ["cargo", "build", "-p", "dead-cst-native"] + (["--release"] if release else [])
+    # `--message-format=json`: capture cargo's `compiler-artifact` stream so the
+    # closure is derived from the actual crate graph (every SVH unit), not by
+    # globbing the reused deps dir and guessing with mtime. Progress + warnings
+    # still flow to stderr; the JSON rides stdout.
+    cmd = [
+        "cargo",
+        "build",
+        "-p",
+        "dead-cst-native",
+        "--target",
+        triple,
+        "--message-format=json",
+    ] + (["--release"] if release else [])
     typer.echo(f"$ {' '.join(cmd)}  (prefer-dynamic, dylib-only runtime)", err=True)
     try:
         manifest.write_text(dylib_only)
-        subprocess.run(cmd, cwd=root, env=env, check=True)
+        proc = subprocess.run(cmd, cwd=root, env=env, check=True, stdout=subprocess.PIPE, text=True)
     finally:
         manifest.write_text(original)
-    return deps_dir
+    return deps_dir, _cargo_artifact_files(proc.stdout)
 
 
 @app.command(name="build-plugin")
@@ -758,7 +834,19 @@ def build_plugin(
 
     # The shipped closure is xz-compressed (PyPI per-file size cap); rustc needs
     # it decompressed. No-op for a raw local deps dir.
+    raw_dep_dir = dep_dir
     dep_dir = _materialize_dep_closure(dep_dir)
+
+    # The explicit-`--target` bundle build splits the graphs, so a raw
+    # `--runtime-dir` pointing at the tripled deps dir (…/<triple>/<profile>/deps)
+    # holds only target units — the proc-macro dylibs rustc also loads while
+    # resolving the runtime's crate graph live in the sibling host deps dir
+    # (…/<profile>/deps). Search it too when it exists; the shipped bundle is
+    # flat (host proc-macros + target rlibs together), so this is a no-op there.
+    # rustc matches -L candidates by exact (name, hash), so an extra dir can't
+    # introduce ambiguity.
+    host_deps = raw_dep_dir.parent.parent.parent / raw_dep_dir.parent.name / raw_dep_dir.name
+    extra_search_dirs = [host_deps] if host_deps != raw_dep_dir and host_deps.is_dir() else []
 
     # Resolve the plugin source (default: bundled example from a source checkout).
     if plugin_src is None:
@@ -777,11 +865,23 @@ def build_plugin(
 
     # Curated allowlist (`_PLUGIN_EXTERN_CRATES`): expose these direct runtime
     # deps to plugin authors via `--extern` (their rlibs are always in the
-    # closure). Newest wins if a deps dir holds stale SVH-suffixed copies; an
-    # absent crate (unexpected) is skipped rather than fatal.
+    # closure). The shipped bundle holds exactly one rlib per crate — the
+    # target-graph unit the runtime dylib binds (`bundle-plugin-host` builds
+    # with an explicit `--target` and drops host-graph units) — so the pick is
+    # deterministic. A raw `--runtime-dir` can still hold several (stale copies,
+    # or a pre-split host+target dir): warn and take the newest by mtime, the
+    # best guess available. An absent crate (unexpected) is skipped, not fatal.
     exposed_externs: list[str] = []
     for crate in _PLUGIN_EXTERN_CRATES:
         rlibs = sorted(dep_dir.glob(f"lib{crate}-*.rlib"), key=lambda p: p.stat().st_mtime)
+        if len(rlibs) > 1:
+            typer.echo(
+                f"warning: {len(rlibs)} {crate} rlibs in {dep_dir}; picking the newest "
+                f"({rlibs[-1].name}), which may not be the unit the runtime binds. "
+                "Rebuild the closure with `dead-cst bundle-plugin-host` for a "
+                "deterministic pick.",
+                err=True,
+            )
         if rlibs:
             exposed_externs += ["--extern", f"{crate}={rlibs[-1]}"]
         elif verbose:
@@ -807,6 +907,7 @@ def build_plugin(
         *exposed_externs,
         "-L",
         f"dependency={dep_dir}",
+        *(arg for d in extra_search_dirs for arg in ("-L", f"dependency={d}")),
         *(
             arg
             for link_arg in _prefer_dynamic_link_args(std_lib)
@@ -878,7 +979,7 @@ def bundle_plugin_host(
 
     std_lib = _host_std_lib()
     suffix = _dylib_suffix()
-    deps_dir = _build_runtime_from_source(root, release=release, std_lib=std_lib)
+    deps_dir, artifacts = _build_runtime_from_source(root, release=release, std_lib=std_lib)
 
     if output is not None:
         bundle = output.resolve()
@@ -898,29 +999,21 @@ def bundle_plugin_host(
     # `dead_cst` wheel. (.rmeta are skipped: redundant with the .rlib, which
     # embed metadata, and would nearly double the payload.)
     #
-    # Dedup by (crate, kind): cargo's deps/ accumulates multiple SVH-suffixed
-    # artifacts per crate across incremental rebuilds (this target dir is reused,
-    # not cleaned, to keep rebuilds fast). Ship exactly one per (crate, kind) —
-    # the newest, which is the set this build's runtime dylib actually binds
-    # against (mtime is a faithful proxy right after a successful build).
-    # Without this, stale copies (e.g. a second `regex` rlib) leak in and bloat
-    # the wheel — and a `--extern <crate>` glob in `build-plugin` could pick the
-    # wrong SVH.
+    # The set is derived from cargo's `compiler-artifact` stream (every unit the
+    # crate graph compiled), NOT by globbing the reused deps dir. That ships
+    # *every distinct SVH unit per crate* and nothing stale: the previous
+    # `(crate, kind)` + newest-mtime dedup could ship a different SVH than the
+    # runtime dylib bound (so a plugin built against the closure failed `rustc`'s
+    # `-L` crate resolution), and it collapsed crates the graph compiles at more
+    # than one SVH. The graph also has no stale copies, so the bloat the old
+    # dedup guarded against doesn't arise. Host-graph rlibs (proc-macro private
+    # deps) are dropped — the explicit `--target` build keeps them out of
+    # `deps_dir`, so e.g. exactly ONE `regex` rlib ships: the unit the runtime
+    # dylib binds, making `build-plugin`'s `--extern` wiring deterministic.
     excluded = {_dylib_name("dead_cst_runtime"), _dylib_name("dead_cst_native")}
-    newest: dict[tuple[str, str], Path] = {}
-    for entry in deps_dir.iterdir():
-        if not entry.is_file():
-            continue
-        is_proc_macro = (
-            entry.suffix == suffix
-            and entry.name not in excluded
-            and not entry.name.startswith("libstd-")
-        )
-        if entry.suffix == ".rlib" or is_proc_macro:
-            key = (_crate_key(entry.name), entry.suffix)
-            cur = newest.get(key)
-            if cur is None or entry.stat().st_mtime > cur.stat().st_mtime:
-                newest[key] = entry
+    units = _closure_units(
+        artifacts, dylib_suffix=suffix, excluded=excluded, target_deps_dir=deps_dir
+    )
     # Store each artifact xz-compressed (`<name>.xz`). A wheel is a zip, and the
     # raw `.rlib` closure deflates to ~107 MB — over PyPI's 100 MB/file cap. The
     # bulk is `lib.rmeta` crate metadata embedded in each rlib, which can't be
@@ -930,7 +1023,7 @@ def bundle_plugin_host(
     n_files = 0
     raw_bytes = 0
     xz_bytes = 0
-    for entry in newest.values():
+    for entry in units:
         dest = bundle / f"{entry.name}.xz"
         with (
             open(entry, "rb") as fsrc,

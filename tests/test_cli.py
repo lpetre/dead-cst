@@ -23,7 +23,8 @@ import typer
 from typer.testing import CliRunner
 
 from dead_cst.cli import (
-    _crate_key,
+    _cargo_artifact_files,
+    _closure_units,
     _materialize_dep_closure,
     _rel_path,
     app,
@@ -153,28 +154,85 @@ def test_rel_path_outside_root_returned_unchanged():
 
 
 # ---------------------------------------------------------------------------
-# _crate_key (plugin-host closure dedup)
+# plugin-host closure derivation (_cargo_artifact_files / _closure_units)
 # ---------------------------------------------------------------------------
 
 
-def test_crate_key_strips_lib_prefix_ext_and_svh():
-    # rlib, proc-macro dylib, and .so all reduce to the bare crate name.
-    assert _crate_key("libserde_json-1a2b3c4d5e6f7a8b.rlib") == "serde_json"
-    assert _crate_key("libserde_derive-9f8e7d6c.dylib") == "serde_derive"
-    assert _crate_key("libregex-abc123.so") == "regex"
-
-
-def test_crate_key_preserves_underscores_in_crate_name():
-    # Only the trailing `-<hash>` segment is dropped; internal `_` stays.
-    assert _crate_key("libregex_automata-deadbeefcafef00d.rlib") == "regex_automata"
-
-
-def test_crate_key_collapses_distinct_svh_of_same_crate():
-    # The dedup invariant: two SVH-distinct artifacts of one crate (the stale
-    # leftover scenario `bundle-plugin-host` must collapse) map to one key.
-    assert _crate_key("libregex-1111111111111111.rlib") == _crate_key(
-        "libregex-2222222222222222.rlib"
+def test_cargo_artifact_files_collects_compiler_artifact_filenames():
+    # The compiler-artifact stream — fresh and dirty units both report
+    # `filenames`; non-artifact reasons and non-JSON noise are ignored.
+    stream = "\n".join(
+        [
+            json.dumps({"reason": "compiler-artifact", "filenames": ["/d/libregex-aaaa.rlib"]}),
+            json.dumps(
+                {
+                    "reason": "compiler-artifact",
+                    "fresh": True,
+                    "filenames": ["/d/libserde-bbbb.rlib"],
+                }
+            ),
+            json.dumps({"reason": "compiler-message", "message": {"rendered": "warning"}}),
+            json.dumps({"reason": "build-finished", "success": True}),
+            "not json",
+        ]
     )
+    assert _cargo_artifact_files(stream) == [
+        Path("/d/libregex-aaaa.rlib"),
+        Path("/d/libserde-bbbb.rlib"),
+    ]
+
+
+def test_closure_units_keeps_every_distinct_svh_per_crate():
+    # The fix: two SVH-distinct target-graph rlibs of one crate are BOTH shipped
+    # (the old (crate, kind) + mtime dedup dropped one — possibly the one that
+    # binds).
+    artifacts = [
+        Path("/d/libregex-1111111111111111.rlib"),
+        Path("/d/libregex-2222222222222222.rlib"),
+    ]
+    kept = _closure_units(artifacts, dylib_suffix=".so", excluded=set(), target_deps_dir=Path("/d"))
+    assert kept == artifacts
+
+
+def test_closure_units_drops_host_graph_rlibs():
+    # The `--target` build splits the graphs: target units in the tripled deps
+    # dir, host units (proc-macro private deps — e.g. regex compiled a second
+    # time for ruff_macros) in the un-tripled one. Host rlibs are dropped so the
+    # flat bundle holds exactly one regex — build-plugin's `--extern` pick is
+    # deterministic. Proc-macro dylibs live in the host dir and ARE kept.
+    target = Path("/t/x86_64-unknown-linux-gnu/release/deps")
+    host = Path("/t/release/deps")
+    artifacts = [
+        target / "libregex-1111111111111111.rlib",  # target unit -> keep
+        host / "libregex-2222222222222222.rlib",  # host unit -> dropped
+        host / "libruff_macros-cccc.so",  # proc-macro dylib -> keep
+    ]
+    assert _closure_units(
+        artifacts, dylib_suffix=".so", excluded=set(), target_deps_dir=target
+    ) == [
+        target / "libregex-1111111111111111.rlib",
+        host / "libruff_macros-cccc.so",
+    ]
+
+
+def test_closure_units_filters_kinds_and_excludes_wheel_shipped():
+    suffix = ".so"
+    excluded = {"libdead_cst_runtime.so", "dead_cst_native.so"}
+    artifacts = [
+        Path("/d/libregex-aaaa.rlib"),  # dep rlib -> keep
+        Path("/d/libserde_derive-bbbb.so"),  # proc-macro dylib -> keep
+        Path("/d/libdead_cst_runtime.so"),  # runtime dylib -> excluded
+        Path("/d/dead_cst_native.so"),  # _native -> excluded
+        Path("/d/libstd-cccc.so"),  # libstd -> excluded by prefix
+        Path("/d/libregex-aaaa.rmeta"),  # metadata-only -> dropped by suffix
+        Path("/d/libregex-aaaa.rlib"),  # duplicate path -> deduped
+    ]
+    assert _closure_units(
+        artifacts, dylib_suffix=suffix, excluded=excluded, target_deps_dir=Path("/d")
+    ) == [
+        Path("/d/libregex-aaaa.rlib"),
+        Path("/d/libserde_derive-bbbb.so"),
+    ]
 
 
 # ---------------------------------------------------------------------------

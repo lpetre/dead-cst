@@ -116,9 +116,9 @@ jobs:
           uv run --no-project --with "maturin>=1.7,<2" maturin build --release \
             -i 3.11 ${compat:+--compatibility "$compat"} --out dist-static
       # One prefer-dynamic build: populates the plugin-host rlib closure and
-      # leaves the runtime dylib + shim in target/plugin-host/release/deps for
-      # the repack. Install the skeleton wheel to get the `dead-cst` CLI without
-      # a third recompile.
+      # leaves the runtime dylib + shim in the (explicit-`--target`, so tripled)
+      # target/plugin-host/<triple>/release/deps for the repack. Install the
+      # skeleton wheel to get the `dead-cst` CLI without a third recompile.
       - name: Build runtime closure (prefer-dynamic) + populate plugin-host
         shell: bash
         run: |
@@ -129,7 +129,8 @@ jobs:
         shell: bash
         run: |
           uv run --no-project --with wheel python scripts/repack_dynamic_wheel.py \
-            dist-static/*.whl --deps-dir target/plugin-host/release/deps -o dist
+            dist-static/*.whl \
+            --deps-dir "target/plugin-host/${{ matrix.platform.target }}/release/deps" -o dist
       - name: Build plugin-host wheel
         shell: bash
         run: |
@@ -138,6 +139,46 @@ jobs:
             python setup.py bdist_wheel \
             --plat-name "${{ matrix.platform.plat }}" \
             --dist-dir "$GITHUB_WORKSPACE/dist-host"
+      # Smoke-test the exact artifacts about to be uploaded, end-user flow:
+      # install the fresh base (dynamic) wheel + plugin-host wheel into a clean
+      # venv, `dead-cst build-plugin` a tiny plugin against them — the bundled
+      # example plus `use` lines pinning the curated `--extern` crates
+      # (serde_json, regex) — then load it through the ABI airlock and run a
+      # real materialize with it applied.
+      - name: Smoke test wheels (build + load a plugin)
+        shell: bash
+        run: |
+          uv venv .smoke-venv
+          uv pip install --python .smoke-venv dist/*.whl dist-host/*.whl
+          mkdir -p smoke
+          cat examples/main_block_plugin/src/lib.rs > smoke/smoke_plugin.rs
+          printf '\nuse regex as _;\nuse serde_json as _;\n' >> smoke/smoke_plugin.rs
+          plugin="$(cd smoke && "$GITHUB_WORKSPACE/.smoke-venv/bin/dead-cst" build-plugin smoke_plugin.rs)"
+          .smoke-venv/bin/python - "$plugin" <<'EOF'
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          from dead_cst import Analysis, _native as native
+
+          plugins = native.load_native_plugins(sys.argv[1])
+          assert [p.name for p in plugins] == ["ExternalMainBlockPlugin"], plugins
+
+          root = Path(tempfile.mkdtemp())
+          (root / "pkg").mkdir()
+          (root / "pkg" / "__init__.py").write_text("")
+          (root / "pkg" / "script.py").write_text(
+              "def main(): pass\n"
+              "def unused(): pass\n"
+              'if __name__ == "__main__":\n'
+              "    main()\n"
+          )
+          ctx = Analysis(root, plugins=plugins).materialize_all()
+          reached = {n.fqname for n in ctx.reachable(seed_flags=ctx.default_seed_mask())}
+          assert "pkg.script.main" in reached, sorted(reached)
+          assert "pkg.script.unused" not in reached, sorted(reached)
+          print(f"smoke OK: plugin built, loaded, and applied ({len(reached)} reachable nodes)")
+          EOF
       # Report-only: surface each wheel's size so the real per-platform numbers
       # are visible (esp. the plugin-host wheel vs PyPI's 100 MB/file cap).
       - name: Report wheel sizes

@@ -9,6 +9,39 @@ two versions.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-01
+
+### Fixed
+
+- **`build-plugin`'s `--extern serde_json` / `--extern regex` pick is
+  deterministic.** The compile closure shipped both graph copies of a crate
+  compiled for host *and* target (e.g. `regex`, also a private dep of the
+  `ruff_macros` proc-macro), and `build-plugin` chose between the same-named
+  rlibs by newest mtime — an arbitrary pick after the xz round-trip.
+  `bundle-plugin-host` now builds with an explicit `--target <host triple>`, so
+  cargo splits the graphs and host-graph rlibs are dropped from the closure
+  (proc-macro dylibs are still shipped): exactly one rlib per exposed crate
+  remains — the unit the runtime dylib binds. `build-plugin` warns when a raw
+  `--runtime-dir` still holds an ambiguous set, and searches the sibling host
+  deps dir (`…/<profile>/deps` next to a tripled `…/<triple>/<profile>/deps`)
+  so proc-macro dylibs still resolve when pointed at a split raw build. The publish workflow smoke-tests
+  the freshly built wheels before upload: it installs the dynamic base wheel +
+  plugin-host wheel into a clean venv, compiles a tiny plugin (exercising both
+  curated externs), loads it, and runs a materialize with it applied.
+
+- **`bundle-plugin-host` ships every distinct SVH unit the runtime binds.** The
+  plugin-compile closure was gathered by globbing the (reused, never-cleaned)
+  cargo deps dir and deduping by `(crate, kind)` keeping the newest by mtime —
+  but mtime is not a faithful proxy for "the SVH the runtime dylib bound", so
+  the closure could omit the exact unit a plugin needs (the plugin then failed
+  `rustc`'s `-L` crate resolution against the shipped runtime), and it collapsed
+  crates the graph compiles at more than one SVH. The closure is now derived
+  from cargo's `compiler-artifact` stream (`--message-format=json`) — the exact
+  set of units the crate graph compiled, every distinct SVH retained, with no
+  stale copies (so the old dedup's bloat concern doesn't arise). The runtime
+  dylib, the dynamic `_native`, and libstd are still excluded (they ship in the
+  base `dead_cst` wheel).
+
 ## [0.14.0] - 2026-06-09
 
 ### Added

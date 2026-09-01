@@ -13,7 +13,7 @@ exclude = ["vendor"]
 
 [package]
 name = "dead-cst-native"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2021"
 publish = false
 
