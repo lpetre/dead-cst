@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-09-01
+
 ### Fixed
 
 - **`build-plugin`'s `--extern serde_json` / `--extern regex` pick is
