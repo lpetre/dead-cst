@@ -917,6 +917,43 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             },
             id="subscript-assignment-target-emits-uses",
         ),
+        pytest.param(
+            # An attribute chain rooted at a *call* whose return value is
+            # a module must still resolve the attribute segments. ty infers
+            # ``get_config()`` as the ``pkg.config`` module object, so
+            # ``get_config().NAME`` is a use of ``pkg.config.NAME`` exactly
+            # like ``config.NAME`` would be -- the use emits the parallel
+            # reachability edges to the module and the decl (no alias edge:
+            # the use site never names the ``config`` alias). Only
+            # ``WHO -> get_config`` is emitted today; without the attribute
+            # edges ``pkg.config.NAME`` is reported dead.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": (
+                    "from pkg import config\n"
+                    "def get_config():\n"
+                    "    return config\n"
+                    "WHO = get_config().NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.get_config",
+                "pkg.use.config -> pkg.config",
+                "pkg.use.config -> pkg.use",
+                "pkg.use.get_config -> pkg.config",
+                "pkg.use.get_config -> pkg.use",
+                "pkg.use.get_config -> pkg.use.config",
+            },
+            id="attribute-on-call-returning-module",
+        ),
     ],
 )
 def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges):
