@@ -9,6 +9,26 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Decorators on classes are matched.** The per-file decorator index only
+  read the decorator list of `def` statements, so a decorated `class` was
+  invisible to every decorator-driven plugin query (`decorated_decls`,
+  `find_handler_decorators`, …) — e.g. `@shared_task` on a class was left
+  dead by the celery plugin. `class` decorators are now indexed alongside
+  `def` decorators.
+
+- **Attribute access on a module held in a variable or returned by a call
+  resolves.** `m = importlib.import_module('pkg.config'); m.NAME`,
+  `m = config; m.NAME` and `def f(): return config` + `f().NAME` emitted no
+  edge to `pkg.config.NAME`, so the attribute was reported dead. The per-file
+  walk now evaluates the root of an attribute chain syntactically (a
+  top-level variable's assigned value, a same-file function's `return`
+  expressions, a dynamic-import call with a literal target) and, when it is a
+  module, emits the same parallel `use → module` / `use → module.NAME`
+  reachability edges an aliased-module chain does. Still file-local: no type
+  inference and no cross-file reads in the walk.
+
 ## [0.14.1] - 2026-09-01
 
 ### Fixed

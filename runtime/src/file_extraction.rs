@@ -193,8 +193,8 @@ pub(crate) struct FileExtraction {
     /// to absolute modules. Powers the import-resolving decorator /
     /// construction / call queries via [`imports_local_from_facts`].
     pub(crate) import_facts: Vec<ImportFact>,
-    /// Per top-level `def` that carries at least one `Name`-rooted
-    /// decorator, the decorators on it (source order). Powers
+    /// Per top-level `def` / `class` that carries at least one
+    /// `Name`-rooted decorator, the decorators on it (source order). Powers
     /// `find_decorated_decls`, `find_handler_decorators`, and
     /// `find_handler_decorators_via`.
     pub(crate) decorator_rows: ByNameRange<Vec<CalleeDescriptor>>,
@@ -517,6 +517,14 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                     }
                 }
                 class_method_params.push((range_key(cls.name.range()), names));
+                let descriptors: Vec<CalleeDescriptor> = cls
+                    .decorator_list
+                    .iter()
+                    .filter_map(decorator_descriptor)
+                    .collect();
+                if !descriptors.is_empty() {
+                    decorator_rows.push((range_key(cls.name.range()), descriptors));
+                }
                 collect_factory_row(&mut factory_rows, cls.name.range(), &cls.body);
             }
             Stmt::ImportFrom(im) => {

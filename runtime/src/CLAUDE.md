@@ -79,6 +79,18 @@ Concrete contract:
   segment that resolves as a submodule or as a global-scope decl
   emits a parallel `use → target` edge. The walk stops on the first
   segment that resolves as neither (or at the chain's end).
+* **Attribute chains on module-valued expressions.** The same walk
+  applies when the chain's root only *evaluates* to a module: a
+  top-level variable whose assigned value is one (`m = config`,
+  `m = importlib.import_module('pkg.config')`), a call to a same-file
+  top-level function whose `return` expressions are one
+  (`def f(): return config` then `f().NAME`), or a dynamic-import
+  call with a literal target. `RefWalker::module_values_of` decides
+  this syntactically from the file's own AST (bounded recursion, no
+  type inference, no cross-file reads) and emits the parallel
+  `use → module` / `use → module.NAME` edges. No alias edge is
+  emitted — the use site never names the alias; the variable /
+  function it does name takes the local edge as usual.
 
 This applies equally to:
 

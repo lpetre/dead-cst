@@ -985,6 +985,33 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             },
             id="attribute-on-variable-bound-by-import-module",
         ),
+        pytest.param(
+            # Plain re-binding of an aliased module: ``m = config`` makes
+            # ``m.NAME`` a use of ``pkg.config.NAME`` too. The ``m``
+            # assignment keeps its own alias edges; the use site edges to
+            # ``m`` plus the parallel module / decl edges.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": "from pkg import config\nm = config\nWHO = m.NAME\n",
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.m",
+                "pkg.use.config -> pkg.config",
+                "pkg.use.config -> pkg.use",
+                "pkg.use.m -> pkg.config",
+                "pkg.use.m -> pkg.use",
+                "pkg.use.m -> pkg.use.config",
+            },
+            id="attribute-on-variable-rebinding-aliased-module",
+        ),
     ],
 )
 def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges):

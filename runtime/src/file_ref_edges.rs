@@ -27,8 +27,9 @@ use compact_str::{CompactString, ToCompactString};
 use ruff_db::files::File;
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_python_ast::visitor::{walk_expr, walk_stmt, Visitor};
-use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt};
+use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt, StmtFunctionDef};
 use ruff_text_size::{Ranged, TextRange};
+use rustc_hash::FxHashMap;
 use ty_project::Db as ProjectDb;
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::definition::{DefinitionKind, DefinitionState, TargetKind};
@@ -57,6 +58,162 @@ enum Resolution {
         spec: ImportPayload,
         bound_name: CompactString,
     },
+}
+
+/// A module object an expression (syntactically) evaluates to, in the
+/// same `(spec, bound_name, chain)` terms a `Use` member spec carries.
+/// Produced by [`RefWalker::module_values_of`] for the roots of
+/// attribute chains that don't bottom out directly at an import alias
+/// — a top-level variable holding a module, a call to a same-file
+/// function that returns one, a dynamic-import call with a literal
+/// target — so `m.NAME` / `f().NAME` land on the same upstream nodes
+/// `alias.NAME` would.
+struct ModuleValue {
+    spec: ImportPayload,
+    bound_name: CompactString,
+    /// Attribute segments already applied on the way to the module
+    /// value (`m = pkg.sub` → `["sub"]`); the use site's own chain is
+    /// appended after these.
+    chain: Vec<CompactString>,
+}
+
+/// Recursion cap for [`RefWalker::module_values_of`]. Each hop is one
+/// syntactic indirection (variable → its value, call → the callee's
+/// `return` expressions); real code is one or two deep, and the cap
+/// keeps self-referential shapes (`def f(): return f()`, loop-carried
+/// rebinds) finite.
+const MODULE_VALUE_MAX_DEPTH: u8 = 6;
+
+/// Syntactic per-file index of module-scope statements that
+/// [`RefWalker::module_values_of`] follows: the value expression bound
+/// by each `NAME = value` / `NAME: T = value`, and each top-level
+/// `def`, keyed by the bound name's range (matching
+/// [`NodeData::name_range`]). Built once per [`file_to_refspecs`] call
+/// from the file's own AST — still no cross-file reads.
+#[derive(Default)]
+struct ModuleScopeIndex<'ast> {
+    values: FxHashMap<(u32, u32), &'ast Expr>,
+    funcs: FxHashMap<(u32, u32), &'ast StmtFunctionDef>,
+}
+
+impl<'ast> ModuleScopeIndex<'ast> {
+    fn build(body: &'ast [Stmt]) -> Self {
+        let mut index = Self::default();
+        index.collect(body);
+        index
+    }
+
+    /// Module-scope statements only: compound statements (`if` /
+    /// `try` / `for` / `while` / `with`) are entered because their
+    /// bodies still bind in the global scope, but `def` / `class`
+    /// bodies are not.
+    fn collect(&mut self, body: &'ast [Stmt]) {
+        for stmt in body {
+            match stmt {
+                Stmt::Assign(assign) => {
+                    for target in &assign.targets {
+                        if let Expr::Name(n) = target {
+                            self.values
+                                .insert(range_key(n.range()), assign.value.as_ref());
+                        }
+                    }
+                }
+                Stmt::AnnAssign(assign) => {
+                    if let (Expr::Name(n), Some(value)) = (assign.target.as_ref(), &assign.value) {
+                        self.values.insert(range_key(n.range()), value.as_ref());
+                    }
+                }
+                Stmt::FunctionDef(func) => {
+                    self.funcs.insert(range_key(func.name.range()), func);
+                }
+                Stmt::If(s) => {
+                    self.collect(&s.body);
+                    for clause in &s.elif_else_clauses {
+                        self.collect(&clause.body);
+                    }
+                }
+                Stmt::Try(s) => {
+                    self.collect(&s.body);
+                    for handler in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        self.collect(&h.body);
+                    }
+                    self.collect(&s.orelse);
+                    self.collect(&s.finalbody);
+                }
+                Stmt::For(s) => {
+                    self.collect(&s.body);
+                    self.collect(&s.orelse);
+                }
+                Stmt::While(s) => {
+                    self.collect(&s.body);
+                    self.collect(&s.orelse);
+                }
+                Stmt::With(s) => self.collect(&s.body),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Every `return <expr>` value in a function body, entering compound
+/// statements but not nested `def` / `class` bodies (their returns
+/// belong to them).
+fn collect_return_values<'ast>(body: &'ast [Stmt], out: &mut Vec<&'ast Expr>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Return(r) => {
+                if let Some(value) = &r.value {
+                    out.push(value.as_ref());
+                }
+            }
+            Stmt::If(s) => {
+                collect_return_values(&s.body, out);
+                for clause in &s.elif_else_clauses {
+                    collect_return_values(&clause.body, out);
+                }
+            }
+            Stmt::Try(s) => {
+                collect_return_values(&s.body, out);
+                for handler in &s.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_return_values(&h.body, out);
+                }
+                collect_return_values(&s.orelse, out);
+                collect_return_values(&s.finalbody, out);
+            }
+            Stmt::For(s) => {
+                collect_return_values(&s.body, out);
+                collect_return_values(&s.orelse, out);
+            }
+            Stmt::While(s) => {
+                collect_return_values(&s.body, out);
+                collect_return_values(&s.orelse, out);
+            }
+            Stmt::With(s) => collect_return_values(&s.body, out),
+            Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_return_values(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Peel an attribute chain back to whatever it is rooted at. Unlike
+/// [`collapse_attribute_chain`] the root may be any expression (a
+/// call, a subscript, …); `segments` are the attribute names in
+/// source order.
+fn peel_attribute_chain(expr: &Expr) -> (&Expr, Vec<&str>) {
+    let mut segments: Vec<&str> = Vec::new();
+    let mut current = expr;
+    while let Expr::Attribute(attr) = current {
+        segments.push(attr.attr.as_str());
+        current = &attr.value;
+    }
+    segments.reverse();
+    (current, segments)
 }
 use crate::helpers::{
     detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, range_key,
@@ -97,6 +254,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
     let parsed = parsed_module(db, file).load(db);
     let dead_ranges = detect_dead_ranges(&parsed);
     let tc_ranges = detect_type_checking_ranges(&parsed);
+    let module_scope = ModuleScopeIndex::build(&parsed.syntax().body);
     let index = semantic_index(db, file).load(db);
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
@@ -127,6 +285,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
             model: &model,
             dead_ranges: &dead_ranges,
             tc_ranges: &tc_ranges,
+            module_scope: &module_scope,
             specs: &mut specs,
             warnings: &mut warnings,
             nested_context: false,
@@ -155,6 +314,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
             model: &model,
             dead_ranges: &dead_ranges,
             tc_ranges: &tc_ranges,
+            module_scope: &module_scope,
             specs: &mut specs,
             warnings: &mut warnings,
             nested_context: false,
@@ -337,6 +497,9 @@ struct RefWalker<'a, 'db> {
     /// `TYPE_CHECKING` as `True`); `find_local_bindings` recovers it
     /// from the scope-wide reachable bindings.
     tc_ranges: &'a [TextRange],
+    /// Module-scope `NAME = value` / `def` index for
+    /// [`Self::module_values_of`].
+    module_scope: &'a ModuleScopeIndex<'a>,
     specs: &'a mut Vec<RefSpec>,
     /// Per-file warnings buffer. Workers push pure-rust strings; the
     /// driver flushes them to Python logging from the main thread.
@@ -587,11 +750,29 @@ impl<'db> RefWalker<'_, 'db> {
                     // If the resolved alias is an import, emit a
                     // parallel `Use` member spec through it
                     // (Principle 2) — resolved at assembly.
-                    let node_data = &self.self_nodes.nodes[dst_local as usize];
-                    if matches!(node_data.kind, NodeKind::Import) {
-                        if let Some(spec) = node_data.imports.clone() {
-                            self.emit_member_use(&spec, name.id.as_str(), extra_chain);
+                    let self_nodes = self.self_nodes;
+                    let node_data = &self_nodes.nodes[dst_local as usize];
+                    match node_data.kind {
+                        NodeKind::Import => {
+                            if let Some(spec) = node_data.imports.clone() {
+                                self.emit_member_use(&spec, name.id.as_str(), extra_chain);
+                            }
                         }
+                        // `m = <module-valued expr>` then `m.NAME`: the
+                        // attribute access is a use of `NAME` inside
+                        // that module. Same parallel edges as through
+                        // an alias, minus the alias edge (the use
+                        // never names it).
+                        NodeKind::Variable if !extra_chain.is_empty() => {
+                            if let Some(&value) =
+                                self.module_scope.values.get(&node_data.name_range)
+                            {
+                                let mut values = Vec::new();
+                                self.module_values_of(value, 1, &mut values);
+                                self.emit_module_values(&values, extra_chain);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Resolution::NestedImport { spec, bound_name } => {
@@ -600,6 +781,164 @@ impl<'db> RefWalker<'_, 'db> {
             }
         }
         self.current_flags = 0;
+    }
+
+    /// Emit one `Use` member spec per module value, with `extra_chain`
+    /// (the use site's own attribute segments) appended to the value's
+    /// chain. Flags come from `current_flags`, so callers set them
+    /// for the reference first.
+    fn emit_module_values(&mut self, values: &[ModuleValue], extra_chain: &[&str]) {
+        for value in values {
+            let chain: Vec<&str> = value
+                .chain
+                .iter()
+                .map(CompactString::as_str)
+                .chain(extra_chain.iter().copied())
+                .collect();
+            self.emit_member_use(&value.spec, &value.bound_name, &chain);
+        }
+    }
+
+    /// The module object(s) `expr` evaluates to, decided syntactically
+    /// from this file alone (no type inference, no cross-file reads —
+    /// the walk's file-locality contract):
+    ///
+    /// * a `Name` bound to an import alias (module-scope or nested) is
+    ///   that alias's module;
+    /// * a `Name` bound to a top-level variable is whatever the
+    ///   variable's assigned value is (recursively);
+    /// * an attribute chain on either is the root's module with the
+    ///   segments appended (the assembly-side chain walk decides which
+    ///   are submodules);
+    /// * `importlib.import_module('a.b')` is `a.b`; `__import__('a.b')`
+    ///   is `a` unless a fromlist is given, in which case it is `a.b`
+    ///   (CPython's return-value rule);
+    /// * a call to a same-file top-level function is whatever its
+    ///   `return` expressions are (recursively).
+    ///
+    /// Anything else yields nothing. Bounded by
+    /// [`MODULE_VALUE_MAX_DEPTH`].
+    fn module_values_of(&self, expr: &Expr, depth: u8, out: &mut Vec<ModuleValue>) {
+        if depth > MODULE_VALUE_MAX_DEPTH {
+            return;
+        }
+        let (root, segments) = peel_attribute_chain(expr);
+        let mut found: Vec<ModuleValue> = Vec::new();
+        match root {
+            Expr::Name(name) => self.module_values_of_name(name, depth, &mut found),
+            Expr::Call(call) => self.module_values_of_call(call, depth, &mut found),
+            _ => {}
+        }
+        for mut value in found {
+            value
+                .chain
+                .extend(segments.iter().map(|s| s.to_compact_string()));
+            out.push(value);
+        }
+    }
+
+    fn module_values_of_name(&self, name: &ExprName, depth: u8, out: &mut Vec<ModuleValue>) {
+        if !matches!(name.ctx, ruff_python_ast::ExprContext::Load) {
+            return;
+        }
+        for resolution in self.find_local_bindings(name, &[]) {
+            match resolution {
+                Resolution::Alias(local) => {
+                    let node_data = &self.self_nodes.nodes[local as usize];
+                    match node_data.kind {
+                        NodeKind::Import => {
+                            if let Some(spec) = &node_data.imports {
+                                out.push(ModuleValue {
+                                    spec: spec.clone(),
+                                    bound_name: name.id.as_str().to_compact_string(),
+                                    chain: Vec::new(),
+                                });
+                            }
+                        }
+                        NodeKind::Variable => {
+                            if let Some(&value) =
+                                self.module_scope.values.get(&node_data.name_range)
+                            {
+                                self.module_values_of(value, depth + 1, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Resolution::NestedImport { spec, bound_name } => out.push(ModuleValue {
+                    spec,
+                    bound_name,
+                    chain: Vec::new(),
+                }),
+            }
+        }
+    }
+
+    fn module_values_of_call(
+        &self,
+        call: &ruff_python_ast::ExprCall,
+        depth: u8,
+        out: &mut Vec<ModuleValue>,
+    ) {
+        // Dynamic import with a literal target: the call *returns* the
+        // module. Parse failures are silently skipped here — the normal
+        // walk of the call site is what reports them.
+        if let Some(kind) = detect_dynamic_call(&call.func) {
+            let DynamicParseResult::Ok {
+                name,
+                fromlist,
+                explicit_package,
+                explicit_level,
+            } = parse_dynamic_args(kind, call)
+            else {
+                return;
+            };
+            let file_pkg = file_package_name(self.model.db(), self.file);
+            let pkg = explicit_package.or(file_pkg.as_deref());
+            let Ok(target) = resolve_dynamic_target(kind, &name, explicit_level, pkg) else {
+                return;
+            };
+            let module: CompactString = match kind {
+                crate::ingest::DynamicKind::DunderImport if fromlist.is_empty() => target
+                    .split('.')
+                    .next()
+                    .unwrap_or(&target)
+                    .to_compact_string(),
+                _ => target.to_compact_string(),
+            };
+            out.push(ModuleValue {
+                spec: ImportPayload {
+                    module,
+                    decl: None,
+                    star: false,
+                },
+                bound_name: CompactString::default(),
+                chain: Vec::new(),
+            });
+            return;
+        }
+        // `f()` where `f` is a top-level function of this file: the
+        // call evaluates to whatever `f` returns.
+        let Expr::Name(callee) = call.func.as_ref() else {
+            return;
+        };
+        for resolution in self.find_local_bindings(callee, &[]) {
+            let Resolution::Alias(local) = resolution else {
+                continue;
+            };
+            let node_data = &self.self_nodes.nodes[local as usize];
+            if !matches!(node_data.kind, NodeKind::Function) {
+                continue;
+            }
+            let Some(&func) = self.module_scope.funcs.get(&node_data.name_range) else {
+                continue;
+            };
+            let mut returns: Vec<&Expr> = Vec::new();
+            collect_return_values(&func.body, &mut returns);
+            for value in returns {
+                self.module_values_of(value, depth + 1, out);
+            }
+        }
     }
 
     /// `import X[.Y.Z][ as A]` inside a function/class body. No alias
@@ -821,6 +1160,21 @@ impl<'ast> Visitor<'ast> for RefWalker<'_, '_> {
             if let Some((root, segments)) = collapse_attribute_chain(expr) {
                 self.emit_name_use(root, &segments);
                 return;
+            }
+            // Chain rooted at a call (`f().NAME`,
+            // `importlib.import_module('m').NAME`): when the call
+            // evaluates to a module, the segments are a use inside
+            // it. Then fall through so the call itself (callee,
+            // arguments, dynamic-import spec) is walked as usual.
+            let (root, segments) = peel_attribute_chain(expr);
+            if let Expr::Call(call) = root {
+                let mut values = Vec::new();
+                self.module_values_of_call(call, 0, &mut values);
+                if !values.is_empty() {
+                    self.current_flags = self.flags_for_range(expr.range());
+                    self.emit_module_values(&values, &segments);
+                    self.current_flags = 0;
+                }
             }
         }
         // Recognize dynamic-import calls before falling through to a
