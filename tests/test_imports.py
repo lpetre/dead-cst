@@ -954,6 +954,37 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             },
             id="attribute-on-call-returning-module",
         ),
+        pytest.param(
+            # Same shape, but the module lands in a *variable* via a
+            # dynamic import: ``m = importlib.import_module('pkg.config')``
+            # binds ``m`` to the ``pkg.config`` module (the assignment
+            # already carries the ``DYNAMIC_IMPORT`` edge ``m -> pkg.config``),
+            # so ``m.NAME`` is a use of ``pkg.config.NAME``. Today the use
+            # only emits ``WHO -> m``; the module and decl edges are
+            # missing and ``pkg.config.NAME`` is reported dead.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": (
+                    "import importlib\nm = importlib.import_module('pkg.config')\nWHO = m.NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.m",
+                "pkg.use.importlib -> pkg.use",
+                "pkg.use.m -> pkg.config",
+                "pkg.use.m -> pkg.use",
+                "pkg.use.m -> pkg.use.importlib",
+            },
+            id="attribute-on-variable-bound-by-import-module",
+        ),
     ],
 )
 def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges):
