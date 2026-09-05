@@ -23,7 +23,8 @@ use ty_module_resolver::{resolve_module, ModuleName};
 use ty_project::Db as ProjectDb;
 
 use crate::file_payload::{
-    external_fqname_for, file_to_nodes, walk_exports_chain, ImportPayload, NodeRef,
+    external_fqname_for, file_to_nodes, walk_exports_chain, ChainStep, FileNodes, ImportPayload,
+    ModuleValue, NodeKind, NodeRef,
 };
 use crate::graph::DeclKey;
 use crate::helpers::importing_file;
@@ -99,7 +100,7 @@ pub(crate) struct MemberRef {
     pub(crate) role: MemberRole,
     pub(crate) spec: ImportPayload,
     pub(crate) bound_name: CompactString,
-    pub(crate) chain: Vec<CompactString>,
+    pub(crate) chain: Vec<ChainStep>,
 }
 
 /// Unresolved descriptor for a dynamic import. `target` is already
@@ -323,10 +324,20 @@ fn resolve_binding(
 }
 
 /// `Use` arm: port of the old `RefWalker::emit_upstream`. Classifies
-/// the loading target, walks the submodule chain, lands on the deepest
-/// module reached plus any terminal decl — *without* skipping past
+/// the loading target, walks the chain, lands on the deepest module
+/// reached plus any terminal decl — *without* skipping past
 /// star-reexport aliases (the use side keeps the intermediary star
 /// import alive; see [`MemberRole`]).
+///
+/// When the chain lands on a decl that itself denotes a module (a
+/// variable holding one, a function returning one, a re-exporting
+/// import alias — see [`ModuleValue`]) and steps remain, the decl's
+/// descriptor is spliced in and the walk continues from there
+/// ([`splice_through`]). That is the cross-file hop: `from helpers
+/// import get_config` + `get_config().NAME` lands on
+/// `helpers.get_config`, reads its return descriptor, and carries on to
+/// `pkg.config.NAME`. Every payload read is recorded in `touched`, so
+/// the resolve cache re-runs the entry when any hop's file changes.
 fn resolve_use(
     db: &dyn ProjectDb,
     anchor: File,
@@ -334,10 +345,38 @@ fn resolve_use(
     touched: &mut Touched,
 ) -> ResolvedMember {
     let mut out = ResolvedMember::default();
-    let spec = &member.spec;
-    let bound_name = member.bound_name.as_str();
-    if spec.module.is_empty() {
-        return out;
+    resolve_use_into(
+        db,
+        anchor,
+        &member.spec,
+        member.bound_name.as_str(),
+        &member.chain,
+        0,
+        touched,
+        &mut out,
+    );
+    out
+}
+
+/// Hop cap for [`resolve_use_into`] recursion through
+/// [`splice_through`]. Real chains are one or two hops deep; the cap
+/// keeps `def f(): return f()`-style self-reference finite (standing in
+/// for a visited set, like `resolve_member_in_file`'s depth).
+const USE_SPLICE_DEPTH_CAP: u32 = 8;
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_use_into(
+    db: &dyn ProjectDb,
+    anchor: File,
+    spec: &ImportPayload,
+    bound_name: &str,
+    chain: &[ChainStep],
+    depth: u32,
+    touched: &mut Touched,
+    out: &mut ResolvedMember,
+) {
+    if spec.module.is_empty() || depth > USE_SPLICE_DEPTH_CAP {
+        return;
     }
     let module_first_seg = spec
         .module
@@ -346,7 +385,7 @@ fn resolve_use(
         .unwrap_or("")
         .to_compact_string();
 
-    let mut adjusted_chain: Vec<&str> = member.chain.iter().map(CompactString::as_str).collect();
+    let mut adjusted_chain: &[ChainStep] = chain;
     let loading_target: CompactString;
     let mut decl_tail: Option<CompactString> = None;
 
@@ -379,9 +418,9 @@ fn resolve_use(
                             .iter()
                             .take(n)
                             .zip(&loading_extras)
-                            .all(|(a, b)| *a == *b);
+                            .all(|(step, seg)| matches!(step, ChainStep::Attr(a) if a == seg));
                     if prefix_matches {
-                        adjusted_chain.drain(..n);
+                        adjusted_chain = &adjusted_chain[n..];
                         loading_target = spec.module.clone();
                     } else {
                         loading_target = module_first_seg;
@@ -400,19 +439,19 @@ fn resolve_use(
     // genuinely-unresolved targets emit nothing.
     let top_level = loading_target.split('.').next().unwrap_or(&loading_target);
     let Some(start_mn) = ModuleName::new(&loading_target) else {
-        return out;
+        return;
     };
     let Some(start_module) = resolve_module(db, importing_file(db, anchor), &start_mn) else {
-        return out;
+        return;
     };
     let Some(start_file) = start_module.file(db) else {
-        return out;
+        return;
     };
     if start_module
         .search_path(db)
         .is_some_and(|sp| sp.is_standard_library())
     {
-        return out;
+        return;
     }
     if start_module
         .search_path(db)
@@ -423,12 +462,13 @@ fn resolve_use(
             fqname,
             file: start_file,
         });
-        return out;
+        return;
     }
 
     // Decl-style alias: land on the upstream module and the decl
     // inside it. Attribute access past a decl is field access on the
-    // decl's value, which we don't model.
+    // decl's value, which we don't model — unless the decl denotes a
+    // module, in which case the remaining chain is spliced through it.
     //
     // Use sites land on whatever's in exports_by_name (including
     // star-reexport aliases). Don't walk through star aliases here —
@@ -443,18 +483,32 @@ fn resolve_use(
                 out.targets.push(ResolvedNode::from_node_ref(
                     target_nodes.refs[local_idx as usize],
                 ));
+                splice_through(
+                    db,
+                    anchor,
+                    target_nodes,
+                    local_idx,
+                    adjusted_chain,
+                    depth,
+                    touched,
+                    out,
+                );
             }
         }
-        return out;
+        return;
     }
 
     // Module-style alias: walk the chain submodule-by-submodule,
     // land on one module (deepest reached) plus at most one
-    // terminal decl.
+    // terminal decl. A `Call` step on a module ends the walk (modules
+    // aren't callable).
     let mut current_file = start_file;
     let mut current_path: CompactString = loading_target.clone();
     let mut terminal_decl_refs: Vec<ResolvedNode> = Vec::new();
-    for seg in &adjusted_chain {
+    for (i, step) in adjusted_chain.iter().enumerate() {
+        let ChainStep::Attr(seg) = step else {
+            break;
+        };
         let candidate = compact_str::format_compact!("{current_path}.{seg}");
         let submodule_file = resolve_dotted_module(db, anchor, &candidate).and_then(|m| m.file(db));
         if let Some(sub_file) = submodule_file {
@@ -464,18 +518,99 @@ fn resolve_use(
         }
         // Not a submodule — check for decl in current_file's exports.
         let target_nodes = nodes_payload(db, current_file, touched);
-        if let Some(locals) = target_nodes.exports_by_name.get(*seg) {
+        if let Some(locals) = target_nodes.exports_by_name.get(seg.as_str()) {
             for &local_idx in locals {
                 terminal_decl_refs.push(ResolvedNode::from_node_ref(
                     target_nodes.refs[local_idx as usize],
                 ));
+                splice_through(
+                    db,
+                    anchor,
+                    target_nodes,
+                    local_idx,
+                    &adjusted_chain[i + 1..],
+                    depth,
+                    touched,
+                    out,
+                );
             }
         }
         break;
     }
     out.targets.push(ResolvedNode::Module(current_file));
     out.targets.extend(terminal_decl_refs);
-    out
+}
+
+/// Continue a `Use` walk past a decl it landed on, when `rest` steps
+/// remain and the decl denotes a module:
+///
+/// * a variable: its `module_values`, then `rest`;
+/// * a function: only under a leading `Call` (the descriptor is of the
+///   call's value), then the steps after it;
+/// * a non-star import alias (a re-export): its own import payload —
+///   an alias is a module-denoting binding like any other;
+/// * anything else: nothing (field access on a value we don't model).
+///
+/// `nodes` was loaded through [`nodes_payload`] by the caller, so the
+/// read is already in `touched`.
+#[allow(clippy::too_many_arguments)]
+fn splice_through(
+    db: &dyn ProjectDb,
+    anchor: File,
+    nodes: &FileNodes,
+    local_idx: u32,
+    rest: &[ChainStep],
+    depth: u32,
+    touched: &mut Touched,
+    out: &mut ResolvedMember,
+) {
+    if rest.is_empty() {
+        return;
+    }
+    let node = &nodes.nodes[local_idx as usize];
+    let alias_value: Vec<ModuleValue>;
+    let (values, rest): (&[ModuleValue], &[ChainStep]) = match node.kind {
+        NodeKind::Variable => (&node.module_values, rest),
+        NodeKind::Function => match rest.split_first() {
+            Some((ChainStep::Call, after)) => (&node.module_values, after),
+            _ => return,
+        },
+        NodeKind::Import => {
+            let Some(spec) = &node.imports else {
+                return;
+            };
+            if spec.star || node.flags & crate::graph::NodeFlags::STAR_REEXPORT != 0 {
+                return;
+            }
+            let bound_name = node
+                .fqname
+                .rsplit_once('.')
+                .map(|(_, tail)| tail)
+                .unwrap_or(&node.fqname)
+                .to_compact_string();
+            alias_value = vec![ModuleValue {
+                spec: spec.clone(),
+                bound_name,
+                steps: Vec::new(),
+            }];
+            (&alias_value, rest)
+        }
+        _ => return,
+    };
+    for value in values {
+        let mut chain: Vec<ChainStep> = value.steps.clone();
+        chain.extend_from_slice(rest);
+        resolve_use_into(
+            db,
+            anchor,
+            &value.spec,
+            &value.bound_name,
+            &chain,
+            depth + 1,
+            touched,
+            out,
+        );
+    }
 }
 
 /// Resolve a [`DynamicRef`] from `anchor`: the target module itself

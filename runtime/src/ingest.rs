@@ -26,11 +26,13 @@ use std::path::{Path, PathBuf};
 use compact_str::{CompactString, ToCompactString};
 use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
-use ruff_python_ast::{Expr, ExprName, Stmt};
+use ruff_python_ast::{Expr, ExprCall, ExprName, Stmt};
 use ruff_text_size::Ranged;
 use ty_module_resolver::{resolve_module, search_paths, Module, ModuleName, ModuleResolveMode};
 use ty_project::Db as ProjectDb;
 use ty_python_core::definition::DefinitionKind;
+
+use crate::file_payload::ChainStep;
 
 pub(crate) fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
     if kind.is_import() {
@@ -593,6 +595,73 @@ pub(crate) fn collapse_attribute_chain(expr: &Expr) -> Option<(&ExprName, Vec<&s
             _ => return None,
         }
     }
+}
+
+/// Peel an access chain back to whatever it is rooted at, recording
+/// every `.attr` and `(...)` on the way as a [`ChainStep`]. Unlike
+/// [`collapse_attribute_chain`] the chain may pass through calls
+/// (`f().NAME`, `mod.get().NAME`) and the root may be any expression.
+/// A dynamic-import call (`importlib.import_module(...)` /
+/// `__import__(...)`) is never peeled: it is returned as the root so
+/// the caller can treat its *value* as the module it loads.
+///
+/// Returns `(root, steps in source order, the peeled calls in source
+/// order)` — the calls so a walker can still visit their arguments.
+pub(crate) fn peel_value_chain(expr: &Expr) -> (&Expr, Vec<ChainStep>, Vec<&ExprCall>) {
+    let mut steps: Vec<ChainStep> = Vec::new();
+    let mut calls: Vec<&ExprCall> = Vec::new();
+    let mut current = expr;
+    loop {
+        match current {
+            Expr::Attribute(attr) => {
+                steps.push(ChainStep::Attr(attr.attr.as_str().to_compact_string()));
+                current = &attr.value;
+            }
+            Expr::Call(call) if detect_dynamic_call(&call.func).is_none() => {
+                steps.push(ChainStep::Call);
+                calls.push(call);
+                current = &call.func;
+            }
+            _ => break,
+        }
+    }
+    steps.reverse();
+    calls.reverse();
+    (current, steps, calls)
+}
+
+/// The module a dynamic-import call with a literal target *evaluates
+/// to*, absolutized against `file`'s package: `importlib.import_module(
+/// 'a.b')` is `a.b`; `__import__('a.b')` is `a` unless a fromlist is
+/// given, in which case it is `a.b` (CPython's return-value rule).
+/// `None` for anything that isn't a well-formed dynamic import — the
+/// walk's own visit of the call site is what reports those.
+pub(crate) fn dynamic_call_module(
+    db: &dyn ProjectDb,
+    file: File,
+    call: &ExprCall,
+) -> Option<CompactString> {
+    let kind = detect_dynamic_call(&call.func)?;
+    let DynamicParseResult::Ok {
+        name,
+        fromlist,
+        explicit_package,
+        explicit_level,
+    } = parse_dynamic_args(kind, call)
+    else {
+        return None;
+    };
+    let file_pkg = file_package_name(db, file);
+    let pkg = explicit_package.or(file_pkg.as_deref());
+    let target = resolve_dynamic_target(kind, &name, explicit_level, pkg).ok()?;
+    Some(match kind {
+        DynamicKind::DunderImport if fromlist.is_empty() => target
+            .split('.')
+            .next()
+            .unwrap_or(&target)
+            .to_compact_string(),
+        _ => target.to_compact_string(),
+    })
 }
 
 /// True iff `dotted` resolves to *some* module (project, stdlib, or
