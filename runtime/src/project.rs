@@ -15,10 +15,10 @@ use pyo3::types::PyType;
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
 use ruff_db::system::{OsSystem, SystemPathBuf};
+use ruff_ranged_value::RangedValue;
 use ruff_text_size::TextRange;
 use ty_project::metadata::options::{EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
-use ty_project::metadata::value::RangedValue;
 use ty_project::watch::{ChangeEvent as TyChangeEvent, ChangedKind, CreatedKind, DeletedKind};
 use ty_project::{Db as ProjectDb, ProjectDatabase, ProjectMetadata};
 use ty_python_core::program::UseDefaultStrategy;
@@ -39,8 +39,9 @@ use crate::file_ref_edges::{file_to_refspecs, FileRefSpecs};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::{intern_kind, NativeGraph, SymbolNode};
 use crate::helpers::{
-    file_path_string, is_dunder_name, locate_class_seed, range_key, rel_path, resolve_member_def,
-    CallArgs, ReloadLog, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT, NODE_FLAG_UNRESOLVED,
+    file_path_string, is_dunder_name, locate_class_seed, python_file, range_key, rel_path,
+    resolve_member_def, CallArgs, ReloadLog, MODULE_ALIAS_MARKER, NODE_FLAG_ENTRYPOINT,
+    NODE_FLAG_UNRESOLVED,
 };
 use crate::ingest::emit_visitor_warning;
 use crate::progress::{
@@ -628,8 +629,11 @@ pub(crate) fn build_project_graph(
                                 // seed — `SemanticIndex::load` lazily rebuilds in
                                 // ingredient-reuse mode — and that rare reload is
                                 // re-cleared right after the plugin pass.
-                                ty_python_core::semantic_index(local_db, file).clear();
-                                parsed_module(local_db, file).clear();
+                                // TODO(ty-sync): `SemanticIndex::clear` was a
+                                // fork-only addition (lpetre/ruff@ca70e77); the
+                                // index stays resident until that work is redone
+                                // on top of upstream ty.
+                                parsed_module(local_db, python_file(local_db, file)).clear();
                             });
                             db_tx.send(local_db).expect("channel open");
                             counters_inner.populate_inc();
@@ -3339,7 +3343,7 @@ impl ProjectContext {
         let ty_events: Vec<TyChangeEvent> =
             events.iter().map(|e| e.borrow(py).to_ty_event()).collect();
         let before = self.db.zalsa().current_revision();
-        self.db.apply_changes(&ty_events, None);
+        self.db.apply_changes(&ty_events);
         self.db.zalsa().current_revision() != before
     }
 
@@ -3681,8 +3685,9 @@ impl ProjectContext {
             let outputs_ref = this.outputs.read();
             if let Some(outputs) = outputs_ref.as_ref() {
                 for file in outputs.reload_log.drain() {
-                    ty_python_core::semantic_index(&this.db, file).clear();
-                    parsed_module(&this.db, file).clear();
+                    // TODO(ty-sync): re-clear the semantic index too once
+                    // `SemanticIndex::clear` is restored (see populate above).
+                    parsed_module(&this.db, python_file(&this.db, file)).clear();
                 }
             }
         }

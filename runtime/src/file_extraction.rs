@@ -28,7 +28,7 @@ use smallvec::SmallVec;
 use ty_project::Db as ProjectDb;
 
 use crate::helpers::{
-    extract_call_kwargs, find_main_block_range, range_key, resolve_relative_import,
+    extract_call_kwargs, find_main_block_range, python_file, range_key, resolve_relative_import,
     top_level_assign_to_name, unwrap_subscripted_callee, CallArgs, LocalImports,
     MODULE_ALIAS_MARKER,
 };
@@ -56,7 +56,7 @@ type ByNameRange<T> = Vec<((u32, u32), T)>;
 /// the construction/factory queries. We only record callees that bottom
 /// out at a bare `Name` (via [`collapse_attribute_chain`]) — every matcher
 /// rejects non-`Name` roots, so deeper shapes can't match anyway.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct CalleeDescriptor {
     pub(crate) root_name: CompactString,
     pub(crate) attrs: SmallVec<[CompactString; 2]>,
@@ -69,7 +69,7 @@ pub(crate) struct CalleeDescriptor {
 /// without re-walking the AST. Relative `from` imports are resolved to
 /// their absolute module here (the only file-local input is the file's
 /// own package), so the fact carries no `level`/relativity.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) enum ImportFact {
     /// `from <absolute> import <name> [as <local>], …` — `names` is
     /// `(imported_name, local_name)` for each alias.
@@ -89,7 +89,7 @@ pub(crate) enum ImportFact {
 /// call site: `find_calls_to_imported` resolves it through the file's
 /// imports (via [`match_callee_chain`]) and `find_calls_on_var` matches
 /// the `<owner>.<attr>` shape (`attrs == [attr]`, `root_name == owner`).
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct CalleeChain {
     pub(crate) root_name: CompactString,
     pub(crate) attrs: SmallVec<[CompactString; 2]>,
@@ -98,7 +98,7 @@ pub(crate) struct CalleeChain {
 /// String content of a positional call argument, recorded so the
 /// `nth_positional_string` / `string_or_string_collection` reads can be
 /// replayed at a query-time `arg_index` without the AST.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) enum StringArg {
     /// A single `"…"` literal — `nth_positional_string` returns it; a
     /// collection read sees a one-element list.
@@ -113,7 +113,7 @@ pub(crate) enum StringArg {
 /// call-site queries replay. Only calls carrying at least one
 /// string-bearing positional argument are recorded — every query captures
 /// such an argument, so a call without one can never produce a result.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct CallSiteFact {
     /// Last attribute segment of the callee (`load_extension` in
     /// `bot.load_extension(x)`), for *any* receiver shape; `None` when the
@@ -163,7 +163,7 @@ impl CallSiteFact {
 /// queries. Grows one field per migrated query; see the module docs for
 /// the ownership contract that lets the parsed module be cleared behind
 /// this query.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct FileExtraction {
     /// Byte range of the `if __name__ == "__main__":` block, if the
     /// file has one. Powers `find_main_blocks_indices`.
@@ -458,7 +458,7 @@ fn callee_descriptor(call: &ExprCall, capture_kwargs: bool) -> Option<CalleeDesc
 /// read and the parsed module can already be gone.
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
 pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction {
-    let parsed = parsed_module(db, file).load(db);
+    let parsed = parsed_module(db, python_file(db, file)).load(db);
     let source = source_text(db, file);
 
     let main_block_range = if source.contains("__main__") {

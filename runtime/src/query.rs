@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn is_ident_continue_rejects_punctuation_and_whitespace() {
-        for byte in [b'.', b',', b' ', b'\t', b'\n', b'(', b')', b'-', b'#', b':'] {
+        for byte in *b"., \t\n()-#:" {
             assert!(!_is_ident_continue(byte));
         }
     }

@@ -29,6 +29,7 @@ use ruff_db::files::{File, FilePath};
 use ruff_python_ast::{Expr, ExprName, Stmt};
 use ruff_text_size::Ranged;
 use ty_module_resolver::{resolve_module, search_paths, ModuleName, ModuleResolveMode};
+use ty_project::Db as ProjectDb;
 use ty_python_core::definition::DefinitionKind;
 
 pub(crate) fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
@@ -59,11 +60,11 @@ pub(crate) fn decl_kind_str(kind: &DefinitionKind<'_>) -> Option<&'static str> {
 /// resolve (invalid syntax or too many leading dots) — downstream
 /// classification can treat that as an unresolved target.
 pub(crate) fn from_module_string(
-    db: &dyn ty_python_semantic::Db,
+    db: &dyn ProjectDb,
     file: File,
     stmt: &ruff_python_ast::StmtImportFrom,
 ) -> CompactString {
-    ModuleName::from_import_statement(db, file, stmt)
+    ModuleName::from_import_statement(db, crate::helpers::importing_file(db, file), stmt)
         .map(|n| n.as_str().to_compact_string())
         .unwrap_or_default()
 }
@@ -108,12 +109,18 @@ pub(crate) fn pep503_canonicalize(name: &str) -> CompactString {
 /// Site-packages roots ty's resolver is configured with, canonicalised
 /// upfront so the worker thread that runs ``build_dist_lookup`` doesn't
 /// need to borrow ``db`` (Salsa's ``ProjectDatabase`` is !Sync).
-pub(crate) fn site_packages_roots(db: &dyn ty_python_semantic::Db) -> Vec<PathBuf> {
-    search_paths(db, ModuleResolveMode::StubsAllowed)
-        .filter(|sp| sp.is_site_packages())
-        .filter_map(|sp| sp.as_system_path().map(|p| p.as_str()))
-        .map(|s| std::fs::canonicalize(s).unwrap_or_else(|_| PathBuf::from(s)))
-        .collect()
+pub(crate) fn site_packages_roots(db: &dyn ProjectDb) -> Vec<PathBuf> {
+    search_paths(
+        db,
+        crate::helpers::resolver_environment(db),
+        ModuleResolveMode::Typing,
+    )
+    .filter(|sp| sp.is_site_packages())
+    // `SearchPath` no longer exposes its system path directly; its
+    // `Display` impl renders the bare path for every on-disk variant.
+    .map(|sp| sp.to_string())
+    .map(|s| std::fs::canonicalize(&s).unwrap_or_else(|_| PathBuf::from(s)))
+    .collect()
 }
 
 /// Build the dist-file lookup by walking ``*.dist-info/`` under every
@@ -536,7 +543,7 @@ pub(crate) fn resolve_dynamic_target(
 /// Package name (i.e. enclosing package) of `file`. For
 /// `pkg/__init__.py` this is `"pkg"`; for `pkg/sub.py` this is
 /// `"pkg"`; for a top-level `mod.py` this is `None`.
-pub(crate) fn file_package_name(db: &dyn ty_python_semantic::Db, file: File) -> Option<String> {
+pub(crate) fn file_package_name(db: &dyn ProjectDb, file: File) -> Option<String> {
     let module = crate::helpers::canonical_module_for_file(db, file)?;
     let name = module.name(db);
     let path_str = match file.path(db) {
@@ -591,12 +598,8 @@ pub(crate) fn collapse_attribute_chain(expr: &Expr) -> Option<(&ExprName, Vec<&s
 /// True iff `dotted` resolves to *some* module (project, stdlib, or
 /// third-party) as seen from `anchor`. Used to disambiguate
 /// "submodule" vs "decl in module" for `from X import Y`.
-pub(crate) fn module_name_resolves(
-    dotted: &str,
-    anchor: File,
-    db: &dyn ty_python_semantic::Db,
-) -> bool {
+pub(crate) fn module_name_resolves(dotted: &str, anchor: File, db: &dyn ProjectDb) -> bool {
     ModuleName::new(dotted)
-        .and_then(|n| resolve_module(db, anchor, &n))
+        .and_then(|n| resolve_module(db, crate::helpers::importing_file(db, anchor), &n))
         .is_some()
 }

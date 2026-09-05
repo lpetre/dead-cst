@@ -31,10 +31,10 @@ use ruff_python_ast::{Expr, ExprName, ExprStringLiteral, Stmt};
 use ruff_text_size::{Ranged, TextRange};
 use ty_project::Db as ProjectDb;
 use ty_python_core::ast_ids::HasScopedUseId;
-use ty_python_core::definition::{DefinitionKind, DefinitionState, TargetKind};
+use ty_python_core::definition::DefinitionKind;
 use ty_python_core::place::PlaceExprRef;
 use ty_python_core::scope::FileScopeId;
-use ty_python_core::{semantic_index, SemanticIndexRef};
+use ty_python_core::{semantic_index, SemanticIndex};
 use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
@@ -59,8 +59,8 @@ enum Resolution {
     },
 }
 use crate::helpers::{
-    detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, range_key,
-    EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
+    detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, program_file, python_file,
+    range_key, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
 };
 use crate::ingest::{
     collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
@@ -79,7 +79,7 @@ use crate::ingest::{
 /// `dead_cst._visitor` Python logger from the main thread once all
 /// per-file workers have finished — keeps `file_to_refspecs` itself
 /// GIL-free so workers run inside `py.allow_threads` cleanly.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct FileRefSpecs {
     pub(crate) specs: Box<[RefSpec]>,
     pub(crate) warnings: Box<[String]>,
@@ -94,20 +94,17 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
     let mut specs: Vec<RefSpec> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    let parsed = parsed_module(db, file).load(db);
+    let parsed = parsed_module(db, python_file(db, file)).load(db);
     let dead_ranges = detect_dead_ranges(&parsed);
     let tc_ranges = detect_type_checking_ranges(&parsed);
-    let index = semantic_index(db, file).load(db);
+    let index = semantic_index(db, program_file(db, file));
     let global = FileScopeId::global();
     let use_def_map = index.use_def_map(global);
-    let model = SemanticModel::new(db, file);
+    let model = SemanticModel::new(db, program_file(db, file));
 
     // (a) Per-Definition: walk every value-bearing AST owned by each
     //     global-scope decl, attribute name uses to that decl.
-    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
-        let DefinitionState::Defined(def) = state else {
-            continue;
-        };
+    for (_def_id, def, _used) in use_def_map.definitions_with_usage() {
         if def.file(db) != file || def.file_scope(db) != global {
             continue;
         }
@@ -122,7 +119,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
             file,
             db,
             parsed: &parsed,
-            index: &index,
+            index,
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
@@ -150,7 +147,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
             file,
             db,
             parsed: &parsed,
-            index: &index,
+            index,
             self_nodes,
             model: &model,
             dead_ranges: &dead_ranges,
@@ -197,10 +194,7 @@ pub(crate) fn file_to_refspecs(db: &dyn ProjectDb, file: File) -> FileRefSpecs {
     //     targets, and applies the `_handle_fromlist`
     //     namespace-vs-submodule disambiguation — all cross-file work
     //     lives there, not here.
-    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
-        let DefinitionState::Defined(def) = state else {
-            continue;
-        };
+    for (_def_id, def, _used) in use_def_map.definitions_with_usage() {
         if def.file(db) != file || def.file_scope(db) != global {
             continue;
         }
@@ -324,7 +318,7 @@ struct RefWalker<'a, 'db> {
     db: &'db dyn ProjectDb,
     #[allow(dead_code)]
     parsed: &'a ParsedModuleRef,
-    index: &'a SemanticIndexRef<'db>,
+    index: &'a SemanticIndex<'db>,
     self_nodes: &'a FileNodes,
     model: &'a SemanticModel<'db>,
     /// Statically-dead source regions for this file. Uses originating
@@ -450,7 +444,7 @@ impl<'db> RefWalker<'_, 'db> {
             // `in_string_annotation` flag routes them through the
             // end-of-scope fallback.
             let bindings = if first && !self.in_string_annotation {
-                let use_id = name.scoped_use_id(db, scope_id.to_scope_id(db, self.file));
+                let use_id = name.scoped_use_id(db, program_file(self.db, self.file));
                 use_def_map.bindings_at_use(use_id)
             } else {
                 use_def_map.end_of_scope_symbol_bindings(symbol_id)
@@ -491,7 +485,7 @@ impl<'db> RefWalker<'_, 'db> {
                         continue;
                     };
                     let bound_name = sym.name().as_str().to_compact_string();
-                    let spec = import_payload_for(kind, db, self.file, self.parsed);
+                    let spec = import_payload_for(kind, self.db, self.file, self.parsed);
                     results.push(Resolution::NestedImport { spec, bound_name });
                 }
             }
@@ -632,7 +626,7 @@ impl<'db> RefWalker<'_, 'db> {
     /// allowed at module level") so it cannot occur in runnable
     /// Python — it is skipped rather than fanned out.
     fn emit_nested_import_from(&mut self, stmt: &ruff_python_ast::StmtImportFrom) {
-        let module_str = from_module_string(self.model.db(), self.file, stmt);
+        let module_str = from_module_string(self.db, self.file, stmt);
         if module_str.is_empty() {
             return;
         }
@@ -721,7 +715,7 @@ impl<'db> RefWalker<'_, 'db> {
                 explicit_package,
                 explicit_level,
             } => {
-                let file_pkg = file_package_name(self.model.db(), self.file);
+                let file_pkg = file_package_name(self.db, self.file);
                 let pkg = explicit_package.or(file_pkg.as_deref());
                 match resolve_dynamic_target(kind, &name, explicit_level, pkg) {
                     Ok(target) => self.specs.push(RefSpec {
@@ -961,7 +955,7 @@ fn walk_owned<'a, 'db>(
             let value = a.value(parsed);
             if target_is_dunder_all(a.target(parsed)) {
                 v.emit_dunder_all_edges(value);
-            } else if let TargetKind::Sequence(_, unpack) = a.target_kind() {
+            } else if let Some(unpack) = a.unpack() {
                 // `c, d = a, b` produces one Definition per LHS
                 // name, each with `value` set to the whole RHS
                 // `(a, b)`. Walk only the matching RHS element when

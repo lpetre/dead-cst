@@ -18,11 +18,11 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 pyo3 = { version = "0.22", features = ["abi3-py311", "multiple-pymethods"] }
 # `compact_str` must stay version-compatible with the vendored ruff/ty
-# workspace (vendor/ruff pins 0.9) so the inline-string types unify.
+# workspace (vendor/ruff pins 0.10) so the inline-string types unify.
 # salsa's `compact_str` feature provides `salsa::Update` for it;
 # get-size2's `compact-str` feature provides `GetSize`.
-compact_str = "0.9"
-salsa = { version = "0.26", features = ["compact_str"] }
+compact_str = "0.10"
+salsa = { version = "0.28", features = ["compact_str"] }
 libloading = "0.8"
 ty_project = { path = "../vendor/ruff/crates/ty_project" }
 ty_python_core = { path = "../vendor/ruff/crates/ty_python_core" }
@@ -35,10 +35,11 @@ ruff_source_file = { path = "../vendor/ruff/crates/ruff_source_file" }
 ruff_text_size = { path = "../vendor/ruff/crates/ruff_text_size" }
 ty_ide = { path = "../vendor/ruff/crates/ty_ide" }
 ruff_memory_usage = { path = "../vendor/ruff/crates/ruff_memory_usage" }
-get-size2 = { version = "0.8.0", features = ["smallvec", "compact-str"] }
+ruff_ranged_value = { path = "../vendor/ruff/crates/ruff_ranged_value" }
+get-size2 = { version = "0.10", features = ["smallvec", "compact-str"] }
 rustc-hash = "2.0"
 smallvec = { version = "1.13", features = ["union", "const_generics", "const_new"] }
-indicatif = "0.17"
+indicatif = "0.18"
 rayon = "1.10"
 crossbeam-channel = "0.5"
 regex = "1"

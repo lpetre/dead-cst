@@ -9,6 +9,22 @@ two versions.
 
 ## [Unreleased]
 
+### Changed
+
+- **Vendored `ruff` (ty) submodule bumped to upstream `astral-sh/ruff@a592ffe1`**
+  (2026-09-04, ~1740 commits past the previous `lpetre/ruff@ca70e77` pin). The
+  fork-only "search-path cache by top-level component" patch is dropped:
+  upstream's directory-listing candidate rejection (astral-sh/ruff#25962)
+  covers the same many-search-paths case. The runtime now keys ty queries on
+  `ProgramFile` / `ImportingFile` (single project program). Toolchain moves to
+  Rust 1.98.0; `salsa` 0.26 → 0.28, `compact_str` 0.9 → 0.10, `get-size2`
+  0.8 → 0.10.
+- **Per-file semantic-index eviction is temporarily disabled.**
+  `SemanticIndex::clear` was a fork-only addition with no upstream
+  equivalent, so semantic indices stay resident after extraction until that
+  work is redone on top of upstream ty. Parsed-AST eviction is unaffected.
+  Expect higher peak memory on very large trees.
+
 ## [0.14.1] - 2026-09-01
 
 ### Fixed
