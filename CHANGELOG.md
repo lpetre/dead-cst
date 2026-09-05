@@ -19,11 +19,15 @@ two versions.
   `ProgramFile` / `ImportingFile` (single project program). Toolchain moves to
   Rust 1.98.0; `salsa` 0.26 → 0.28, `compact_str` 0.9 → 0.10, `get-size2`
   0.8 → 0.10.
-- **Per-file semantic-index eviction is temporarily disabled.**
-  `SemanticIndex::clear` was a fork-only addition with no upstream
-  equivalent, so semantic indices stay resident after extraction until that
-  work is redone on top of upstream ty. Parsed-AST eviction is unaffected.
-  Expect higher peak memory on very large trees.
+- **Per-file semantic-index eviction re-ported onto upstream ty.** The
+  fork-only clearable semantic index (`lpetre/ruff@ca70e77`) is replaced by a
+  smaller patch on top of upstream: `semantic_index()` now returns a
+  `SemanticIndexRef` guard loaded from a retained `SemanticIndexHandle`, and
+  `SemanticIndexHandle::clear` releases the whole index. A rebuild replays the
+  salsa ingredients of the initial build in creation order instead of looking
+  them up by AST node, so it needs no extra node-keyed maps. The populate
+  fan-out and the post-plugin-pass reload sweep clear the index exactly as
+  before.
 
 ## [0.14.1] - 2026-09-01
 
