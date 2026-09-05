@@ -424,3 +424,95 @@ def test_pytest_plugin_fixture_flag_is_measurable(build_plugin_graph):
     without_fixture = {n.fqname for n in graph.reachable(seed_flags=seed & ~fixture)}
     assert "tests.conftest.only_fixture" in with_fixture
     assert "tests.conftest.only_fixture" not in without_fixture
+
+
+def test_pytest_plugin_matches_fixture_anywhere_in_decorator_stack(
+    build_plugin_graph, reachable_fqnames
+):
+    """``decorated_decls`` reads the *whole* decorator list, so a
+    ``@pytest.fixture`` is matched whether it sits on top, in the middle,
+    or at the bottom of a stack -- including behind decorators the
+    matcher cannot classify (``@(lambda f: f)``, ``@noop()(noop)``)."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import functools
+            import pytest
+            from pytest import fixture
+
+            def noop(f):
+                return f
+
+            @pytest.fixture
+            @noop
+            def match_on_top():
+                return 1
+
+            @noop
+            @pytest.fixture(scope="module")
+            @functools.lru_cache(maxsize=None)
+            def match_in_middle():
+                return 2
+
+            @noop
+            @functools.wraps(noop)
+            @fixture
+            def match_at_bottom():
+                return 3
+
+            @noop()(noop)
+            @(lambda f: f)
+            @pytest.fixture
+            def match_behind_unclassifiable():
+                return 4
+
+            @noop
+            @functools.lru_cache(maxsize=None)
+            def not_a_fixture():
+                return 5
+            """,
+        },
+        [native.NativePlugin.pytest()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "tests.fixtures.match_on_top" in reached
+    assert "tests.fixtures.match_in_middle" in reached
+    assert "tests.fixtures.match_at_bottom" in reached
+    assert "tests.fixtures.match_behind_unclassifiable" in reached
+    assert "tests.fixtures.not_a_fixture" not in reached
+
+
+def test_pytest_plugin_reads_kwargs_from_matching_decorator_in_stack(build_plugin_graph):
+    """``decorated_decls_with_args`` returns the kwargs of the decorator
+    that *matched*, not of whichever decorator happens to be first in the
+    stack: the ``name=`` alias on the inner ``@pytest.fixture`` is what
+    the ``test -> fixture`` edge is keyed on."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            import functools
+            import pytest
+
+            def noop(name=None):
+                return lambda f: f
+
+            @noop(name="decoy")
+            @functools.lru_cache(maxsize=None)
+            @pytest.fixture(name="renamed")
+            def underlying():
+                return 4
+            """,
+            "tests/test_x.py": """
+            def test_uses(renamed):
+                assert renamed == 4
+            """,
+        },
+        [native.NativePlugin.pytest()],
+    )
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    test_idx = by_fqname["tests.test_x.test_uses"]
+    fixture_idx = by_fqname["tests.fixtures.underlying"]
+    assert (test_idx, fixture_idx, 0) in [(s, d, f) for (s, d, f) in graph.edges()]
