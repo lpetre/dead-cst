@@ -24,8 +24,8 @@ two versions.
 
 ### Changed
 
-- **Vendored `ruff` (ty) submodule bumped to upstream `astral-sh/ruff@a592ffe1`**
-  (2026-09-04, ~1740 commits past the previous `lpetre/ruff@ca70e77` pin). The
+- **Vendored `ruff` (ty) submodule bumped to upstream `astral-sh/ruff@0451200c`**
+  (2026-09-05, ~1740 commits past the previous `lpetre/ruff@ca70e77` pin). The
   fork-only "search-path cache by top-level component" patch is dropped:
   upstream's directory-listing candidate rejection (astral-sh/ruff#25962)
   covers the same many-search-paths case. The runtime now keys ty queries on
