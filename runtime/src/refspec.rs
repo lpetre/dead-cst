@@ -27,7 +27,8 @@ use crate::file_payload::{
     ModuleValue, NodeKind, NodeRef,
 };
 use crate::graph::DeclKey;
-use crate::ingest::module_name_resolves;
+use crate::helpers::importing_file;
+use crate::ingest::{module_name_resolves, resolve_dotted_module};
 
 /// One unresolved reference edge, expressed entirely in this file's
 /// local terms. `src` is the local index (into
@@ -35,7 +36,9 @@ use crate::ingest::module_name_resolves;
 /// owning node; `flags` are the edge flags (dead-branch /
 /// dynamic-import) computed locally. The `target` is resolved by the
 /// assembly pass — see [`Target`].
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(
+    Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::SalsaValue, get_size2::GetSize,
+)]
 pub(crate) struct RefSpec {
     pub(crate) src: u32,
     pub(crate) target: Target,
@@ -53,7 +56,9 @@ pub(crate) struct RefSpec {
 ///   zero-or-more upstream nodes.
 /// * `Dynamic` — an unresolved `__import__` / `importlib.import_module`
 ///   target. The assembly pass runs [`resolve_dynamic`].
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(
+    Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::SalsaValue, get_size2::GetSize,
+)]
 pub(crate) enum Target {
     Local(u32),
     Member(MemberRef),
@@ -76,7 +81,7 @@ pub(crate) enum Target {
 ///   upstream namespace — including star-reexport aliases, which the
 ///   use keeps alive — and silently drops failures.
 #[derive(
-    Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize,
+    Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::SalsaValue, get_size2::GetSize,
 )]
 pub(crate) enum MemberRole {
     Binding,
@@ -88,7 +93,9 @@ pub(crate) enum MemberRole {
 /// the old `emit_upstream` took; for `Binding` it carries the per-kind
 /// `(module, decl)` resolution input the old `file_to_edges` alias loop
 /// computed (with `bound_name` empty and `chain` unused).
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(
+    Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::SalsaValue, get_size2::GetSize,
+)]
 pub(crate) struct MemberRef {
     pub(crate) role: MemberRole,
     pub(crate) spec: ImportPayload,
@@ -101,7 +108,9 @@ pub(crate) struct MemberRef {
 /// only the owning file's package name — a self-property), so
 /// resolution here is anchor-light: module probes + upstream
 /// `exports_by_name` lookups.
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(
+    Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::SalsaValue, get_size2::GetSize,
+)]
 pub(crate) struct DynamicRef {
     pub(crate) target: CompactString,
     pub(crate) fromlist: Vec<CompactString>,
@@ -230,7 +239,7 @@ fn resolve_binding(
             let candidate = compact_str::format_compact!("{}.{}", spec.module, decl);
             if module_name_resolves(&candidate, anchor, db) {
                 let namespace_has_decl = ModuleName::new(&spec.module)
-                    .and_then(|mn| resolve_module(db, anchor, &mn))
+                    .and_then(|mn| resolve_module(db, importing_file(db, anchor), &mn))
                     .and_then(|m| m.file(db))
                     .map(|f| {
                         nodes_payload(db, f, touched)
@@ -257,7 +266,8 @@ fn resolve_binding(
         out.unresolved = true;
         return out;
     };
-    let Some(target_module) = resolve_module(db, anchor, &target_module_name) else {
+    let Some(target_module) = resolve_module(db, importing_file(db, anchor), &target_module_name)
+    else {
         out.unresolved = true;
         return out;
     };
@@ -431,7 +441,7 @@ fn resolve_use_into(
     let Some(start_mn) = ModuleName::new(&loading_target) else {
         return;
     };
-    let Some(start_module) = resolve_module(db, anchor, &start_mn) else {
+    let Some(start_module) = resolve_module(db, importing_file(db, anchor), &start_mn) else {
         return;
     };
     let Some(start_file) = start_module.file(db) else {
@@ -500,9 +510,7 @@ fn resolve_use_into(
             break;
         };
         let candidate = compact_str::format_compact!("{current_path}.{seg}");
-        let submodule_file = ModuleName::new(&candidate)
-            .and_then(|mn| resolve_module(db, anchor, &mn))
-            .and_then(|m| m.file(db));
+        let submodule_file = resolve_dotted_module(db, anchor, &candidate).and_then(|m| m.file(db));
         if let Some(sub_file) = submodule_file {
             current_file = sub_file;
             current_path = candidate;
@@ -629,7 +637,7 @@ pub(crate) fn resolve_dynamic(
         // Treat as decl-style: resolve target to file, look up
         // entry in its exports_by_name.
         let target_file = ModuleName::new(&dynamic.target)
-            .and_then(|n| resolve_module(db, anchor, &n))
+            .and_then(|n| resolve_module(db, importing_file(db, anchor), &n))
             .and_then(|m| m.file(db));
         if let Some(target_file) = target_file {
             let target_nodes = nodes_payload(db, target_file, touched);
@@ -656,10 +664,7 @@ fn resolve_module_target(
     out: &mut SmallVec<[ResolvedNode; 4]>,
 ) {
     let top_level = dotted.split('.').next().unwrap_or(dotted);
-    let Some(mn) = ModuleName::new(dotted) else {
-        return;
-    };
-    let Some(module) = resolve_module(db, anchor, &mn) else {
+    let Some(module) = resolve_dotted_module(db, anchor, dotted) else {
         return;
     };
     let Some(target_file) = module.file(db) else {

@@ -14,7 +14,7 @@
 //!
 //! Pattern cribbed from `function_known_decorators` in
 //! `vendor/ruff/crates/ty_python_semantic/src/types/infer.rs`, which is
-//! the closest analogue (tracked fn, salsa::Update derive on the
+//! the closest analogue (tracked fn, salsa::SalsaValue derive on the
 //! carrier struct).
 
 use compact_str::{CompactString, ToCompactString};
@@ -28,7 +28,7 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 use ty_module_resolver::resolve_module;
 use ty_project::Db as ProjectDb;
-use ty_python_core::definition::{Definition, DefinitionKind, DefinitionState};
+use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::place::{PlaceExprRef, ScopedPlaceId};
 use ty_python_core::scope::FileScopeId;
 use ty_python_core::semantic_index;
@@ -36,8 +36,8 @@ use ty_python_core::semantic_index;
 use crate::graph::{DeclKey, NodeFlags};
 use crate::helpers::{
     classify_base, collect_all_imports_local, detect_dead_ranges, file_default_flags,
-    iter_top_level_classes, module_fqname_for_file, position, range_key, scan_noqa_directives,
-    NODE_FLAGS_NOQA_PIN,
+    importing_file, iter_top_level_classes, module_fqname_for_file, position, program_file,
+    python_file, range_key, scan_noqa_directives, NODE_FLAGS_NOQA_PIN,
 };
 use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 
@@ -63,7 +63,7 @@ use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 /// `NodeRef`: they only ever appear as resolution *outputs*
 /// ([`crate::refspec::ResolvedNode::External`]) and are interned
 /// directly into the builder by the assembly pass.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) enum NodeRef {
     Def(DeclKey),
     Module(File),
@@ -98,7 +98,7 @@ pub(crate) fn def_key<'db>(
 /// memoized + accessible from per-file salsa-tracked queries. Wraps
 /// `crate::ingest::DistLookup` (HashMap<PathBuf, String>) with the
 /// derives needed for salsa-tracked return.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct ProjectDistLookup {
     pub(crate) map: std::collections::HashMap<std::path::PathBuf, CompactString>,
 }
@@ -127,7 +127,7 @@ pub(crate) fn project_dist_lookup(db: &dyn ProjectDb) -> ProjectDistLookup {
 /// [`crate::project::ResolveCache`] compares each file's fingerprint
 /// against the previous build's to find the *effectively changed* file
 /// set that drives read-set eviction.
-#[salsa::tracked(heap_size = ruff_memory_usage::heap_size)]
+#[salsa::tracked(returns(copy), heap_size = ruff_memory_usage::heap_size)]
 pub(crate) fn resolution_surface_fp(db: &dyn ProjectDb, file: File) -> u64 {
     use std::hash::{Hash, Hasher};
     let payload = file_to_nodes(db, file);
@@ -181,7 +181,7 @@ pub(crate) fn external_fqname_for(
 /// Pure rust so it can live inside a salsa-tracked function's return
 /// value. The assembly pass converts these to `Py<SymbolNode>` in a
 /// single GIL acquisition at the end of the build.
-#[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Clone, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct NodeData {
     pub(crate) fqname: CompactString,
     pub(crate) kind: NodeKind,
@@ -215,7 +215,7 @@ pub(crate) struct NodeData {
 /// Compact 1-byte discriminant for the graph's `kind` field. Mirrors
 /// `graph::VALID_KINDS` exactly and converts to the static `&str` at
 /// `Py<SymbolNode>` materialization time.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, salsa::SalsaValue, get_size2::GetSize)]
 #[repr(u8)]
 pub(crate) enum NodeKind {
     Function = 0,
@@ -259,7 +259,9 @@ impl NodeKind {
 /// Per-alias import metadata. Same fields as the python-facing
 /// `Import` pyclass, but without the `Py` envelope so it can live
 /// inside `NodeData`.
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(
+    Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::SalsaValue, get_size2::GetSize,
+)]
 pub(crate) struct ImportPayload {
     pub(crate) module: CompactString,
     pub(crate) decl: Option<CompactString>,
@@ -272,7 +274,9 @@ pub(crate) struct ImportPayload {
 /// `resolve_use`, and `Call` is consumed when the chain lands on a
 /// function decl that carries a return [`ModuleValue`] (so `f().NAME`
 /// and `f.NAME` stay distinct).
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+#[derive(
+    Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::SalsaValue, get_size2::GetSize,
+)]
 pub(crate) enum ChainStep {
     Attr(CompactString),
     Call,
@@ -295,7 +299,7 @@ pub(crate) enum ChainStep {
 /// this file's own use-def chain (same-file hops folded in, no
 /// cross-file reads); cross-file hops happen at assembly, where
 /// `resolve_use` splices a landed decl's `module_values` into the walk.
-#[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Clone, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct ModuleValue {
     pub(crate) spec: ImportPayload,
     pub(crate) bound_name: CompactString,
@@ -344,7 +348,7 @@ pub(crate) struct ModuleValue {
 ///   for the codemod). Stubs also carry `NodeData::is_overload`
 ///   in `nodes` and are excluded from `exports_by_name` so cross-module
 ///   `from mod import f` resolves to the impl only.
-#[derive(Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) struct FileNodes {
     pub(crate) nodes: Box<[NodeData]>,
     pub(crate) refs: Box<[NodeRef]>,
@@ -378,7 +382,7 @@ pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ClassBaseSpec; 2]>);
 ///   `module` (a `from`-import, an attribute access on an imported
 ///   module, or a same-file alias of one). Resolution maps it to the
 ///   member's canonical definition range.
-#[derive(Debug, Clone, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) enum ClassBaseSpec {
     LocalClass((u32, u32)),
     ModuleMember {
@@ -445,7 +449,7 @@ fn is_overload_decorator(
 /// `ingest_decls`.
 #[salsa::tracked(returns(ref), heap_size = ruff_memory_usage::heap_size)]
 pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
-    let parsed = parsed_module(db, file).load(db);
+    let parsed = parsed_module(db, python_file(db, file)).load(db);
     let source = source_text(db, file);
     let line_index = line_index(db, file);
     let module_fqname = module_fqname_for_file(db, file);
@@ -479,7 +483,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     refs.push(NodeRef::Module(file));
     ref_to_local.insert(NodeRef::Module(file), 0);
 
-    let index = semantic_index(db, file).load(db);
+    let index = semantic_index(db, program_file(db, file));
     let global = FileScopeId::global();
     let place_table = index.place_table(global);
     let use_def_map = index.use_def_map(global);
@@ -521,10 +525,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     // explorer / blast-radius queries.
     let dead_ranges = detect_dead_ranges(&parsed);
 
-    for (_def_id, state, _used) in use_def_map.all_definitions_with_usage() {
-        let DefinitionState::Defined(def) = state else {
-            continue;
-        };
+    for (_def_id, def, _used) in use_def_map.definitions_with_usage() {
         if def.file(db) != file || def.file_scope(db) != global {
             continue;
         }
@@ -864,7 +865,9 @@ pub(crate) fn walk_exports_chain(
         // upstream decl. Skip emitting it here.
         if let Some(upstream_module) = target_nodes.star_reexports.get(key.1.as_str()) {
             if let Some(mn) = ty_module_resolver::ModuleName::new(upstream_module) {
-                if let Some(upstream) = ty_module_resolver::resolve_module(db, key.0, &mn) {
+                if let Some(upstream) =
+                    ty_module_resolver::resolve_module(db, importing_file(db, key.0), &mn)
+                {
                     if let Some(upstream_file) = upstream.file(db) {
                         stack.push((upstream_file, key.1.clone()));
                         continue;
@@ -884,7 +887,7 @@ pub(crate) fn walk_exports_chain(
 
 pub(crate) fn import_payload_for_pure<'db>(
     kind: &DefinitionKind<'db>,
-    db: &'db dyn ty_python_semantic::Db,
+    db: &'db dyn ProjectDb,
     file: File,
     parsed: &ruff_db::parsed::ParsedModuleRef,
 ) -> ImportPayload {
@@ -907,7 +910,11 @@ pub(crate) fn import_payload_for_pure<'db>(
         }
         DefinitionKind::ImportFromSubmodule(k) => ImportPayload {
             module: from_module_string(db, file, k.import(parsed)),
-            decl: Some(k.module(parsed).id.as_str().to_compact_string()),
+            decl: k
+                .import(parsed)
+                .module
+                .as_ref()
+                .map(|m| m.id.as_str().to_compact_string()),
             star: false,
         },
         DefinitionKind::StarImport(k) => ImportPayload {
@@ -946,6 +953,6 @@ pub(crate) fn import_payload_for_pure<'db>(
 pub(crate) fn parent_module_file(db: &dyn ProjectDb, file: File) -> Option<File> {
     let module = crate::helpers::canonical_module_for_file(db, file)?;
     let parent_name = module.name(db).parent()?;
-    let parent_module = resolve_module(db, file, &parent_name)?;
+    let parent_module = resolve_module(db, importing_file(db, file), &parent_name)?;
     parent_module.file(db)
 }

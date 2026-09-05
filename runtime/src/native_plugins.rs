@@ -59,7 +59,8 @@ use crate::flag_registry::FlagRegistry;
 use crate::graph::EdgeFlags;
 use crate::helpers::{
     collect_modules_imports_local, decorators_match_imports, file_path_string,
-    matched_call_target_any, top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
+    matched_call_target_any, python_file, top_level_assign_to_name, ArgValue, CallArgs,
+    FactoryCallFinder,
 };
 use crate::ingest::file_package_name;
 use crate::project::FrozenView;
@@ -242,11 +243,11 @@ pub(crate) fn extract_plugin_jobs(
 /// endpoint is a *file-local* index (position in the file's own
 /// ``FileNodes.refs`` array), never a global graph index — the harness
 /// translates to global indices at apply time. Salsa-cached as the
-/// per-file plugin's output, so it must be pure rust + ``salsa::Update``
+/// per-file plugin's output, so it must be pure rust + ``salsa::SalsaValue``
 /// (no ``File`` handle, no global idx — both would couple the cache to
 /// project-wide assemble order). Mirrors the project-wide [`PreparedOp`]
 /// variants, restricted to a single file's index space.
-#[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, Clone, Eq, PartialEq, salsa::SalsaValue, get_size2::GetSize)]
 pub(crate) enum FileLocalOp {
     /// Reachability edge between two nodes in this file (`PreparedOp::Edge`
     /// shape). Both endpoints are file-local indices.
@@ -333,7 +334,7 @@ impl<'db> FileContext<'db> {
 
     /// The parsed module for this file (salsa-cached).
     pub(crate) fn parsed(&self) -> ruff_db::parsed::ParsedModuleRef {
-        parsed_module(self.db, self.file).load(self.db)
+        parsed_module(self.db, python_file(self.db, self.file)).load(self.db)
     }
 
     // --- file-local query helpers ------------------------------------------

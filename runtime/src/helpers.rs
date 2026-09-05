@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
 use ruff_db::parsed::{parsed_module, ParsedModuleRef};
 use ruff_db::system::SystemPath;
+use ruff_db::PythonFile;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{walk_expr, Visitor};
 use ruff_python_ast::{Expr, ExprName, Stmt, StmtClassDef};
@@ -16,11 +17,13 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_module_resolver::Module;
 use ty_module_resolver::{
-    file_to_module, resolve_module, search_paths, ModuleName, ModuleResolveMode,
+    file_to_module, resolve_module, system_module_search_paths, ImportingFile, ModuleName,
+    ResolverEnvironment,
 };
 use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 use ty_python_core::definition::{Definition, DefinitionKind};
+use ty_python_core::program_file::ProgramFile;
 use ty_python_core::{global_scope, place_table, use_def_map};
 
 use crate::file_payload::{
@@ -47,6 +50,32 @@ pub(crate) const MODULE_ALIAS_MARKER: &str = "<module>";
 /// bindings. `CompactString` keeps the typical short identifier
 /// inline; probes with `&str` go through `Borrow<str>`.
 pub(crate) type LocalImports = FxHashMap<CompactString, CompactString>;
+
+/// ty keys its semantic queries on a [`ProgramFile`] (file + program).
+/// dead-cst analyses every file under the single project program, so
+/// the key is derived from the project directly instead of via ty's
+/// `Db::program_file`, which re-checks the include globs on every call.
+pub(crate) fn program_file<'db>(db: &'db dyn ProjectDb, file: File) -> ProgramFile<'db> {
+    db.project().program(db).program_file(db, file)
+}
+
+/// Parser key (file + Python version) that `parsed_module` is keyed on.
+pub(crate) fn python_file<'db>(db: &'db dyn ProjectDb, file: File) -> PythonFile<'db> {
+    program_file(db, file).python_file(db)
+}
+
+/// Module-resolution key for `resolve_module` / `from_import_statement`.
+/// The `File` variant defers interning the `(file, environment)` pair
+/// until the resolver actually needs it.
+pub(crate) fn importing_file<'db>(db: &'db dyn ProjectDb, file: File) -> ImportingFile<'db> {
+    ImportingFile::File(file, resolver_environment(db))
+}
+
+/// The project program's module-resolution environment (search paths +
+/// Python version).
+pub(crate) fn resolver_environment<'db>(db: &'db dyn ProjectDb) -> ResolverEnvironment<'db> {
+    db.project().program(db).resolver_environment(db)
+}
 
 pub(crate) fn is_dunder_name(fqname: &str) -> bool {
     let name = fqname.rsplit('.').next().unwrap_or("");
@@ -196,7 +225,7 @@ const MEMBER_RESOLVE_DEPTH_CAP: u32 = 16;
 /// `ide_support`), the building block for the store-side first-hop
 /// classification.
 fn local_member_defs<'db>(db: &'db dyn ProjectDb, file: File, name: &str) -> Vec<Definition<'db>> {
-    let scope = global_scope(db, file);
+    let scope = global_scope(db, program_file(db, file));
     let table = place_table(db, scope);
     let Some(symbol_id) = table.symbol_id(name) else {
         return Vec::new();
@@ -582,7 +611,7 @@ pub(crate) fn resolve_member_def(
         return None;
     }
     let module_name = ModuleName::new(module)?;
-    let module_file = resolve_module(db, anchor, &module_name)?.file(db)?;
+    let module_file = resolve_module(db, importing_file(db, anchor), &module_name)?.file(db)?;
     resolve_member_in_file(db, module_file, name, anchor, depth, reloads, touched)
 }
 
@@ -612,7 +641,7 @@ fn resolve_member_in_file(
     // of these files changed.
     reloads.record(file);
     touched.record(file);
-    let parsed = parsed_module(db, file).load(db);
+    let parsed = parsed_module(db, python_file(db, file)).load(db);
     local_member_defs(db, file, name)
         .into_iter()
         .find_map(|def| {
@@ -1022,7 +1051,7 @@ impl<'ast, 'a> Visitor<'ast> for FactoryCallFinder<'a> {
 /// every non-string expression collapses to ``Unknown``. Re-exported from
 /// [`crate::native_plugins::plugin_api`] (pyo3-free) so external plugins
 /// can read decorator/constructor arguments too.
-#[derive(Clone, Debug, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue, get_size2::GetSize)]
 pub enum ArgValue {
     Str(CompactString),
     Unknown,
@@ -1032,7 +1061,7 @@ pub enum ArgValue {
 /// The map itself is crate-internal (it carries an `FxHashMap`, which the
 /// curated airlock doesn't expose); external plugins read values through
 /// the [`CallArgs::get`] / [`CallArgs::str_value`] accessors.
-#[derive(Clone, Debug, Default, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, salsa::SalsaValue, get_size2::GetSize)]
 pub struct CallArgs {
     pub(crate) kwargs: FxHashMap<CompactString, ArgValue>,
 }
@@ -1858,11 +1887,11 @@ fn relative_to_module_name(rel: &str) -> Option<String> {
 /// path) or when the file isn't on any search path at all. Callers
 /// should fall back to a path-mangle in that case.
 pub(crate) fn canonical_module_for_file<'db>(
-    db: &'db dyn ty_module_resolver::Db,
+    db: &'db dyn ProjectDb,
     file: File,
 ) -> Option<Module<'db>> {
     let name = canonical_module_name_for_file(db, file)?;
-    resolve_module(db, file, &name)
+    resolve_module(db, importing_file(db, file), &name)
 }
 
 /// Same logic as :func:`canonical_module_for_file` but stops at the
@@ -1871,23 +1900,20 @@ pub(crate) fn canonical_module_for_file<'db>(
 /// needs the dotted name. Callers that go on to walk the parent module
 /// (``parent_module_file``, ``file_package_name``) still go through
 /// the ``Module``-returning wrapper above.
-pub(crate) fn canonical_module_name_for_file(
-    db: &dyn ty_module_resolver::Db,
-    file: File,
-) -> Option<ModuleName> {
+pub(crate) fn canonical_module_name_for_file(db: &dyn ProjectDb, file: File) -> Option<ModuleName> {
     let file_path = match file.path(db) {
         FilePath::System(p) => p,
-        _ => return file_to_module(db, file).map(|m| m.name(db).clone()),
+        _ => {
+            let resolver_file = program_file(db, file).resolver_file(db);
+            return file_to_module(db, resolver_file).map(|m| m.name(db).clone());
+        }
     };
 
     // Collect every search path that physically contains the file.
     // Typical projects have ≤ 5 search paths and a file usually lives
     // under 1–2 of them, so the SmallVec stays inline.
     let mut candidates: smallvec::SmallVec<[(usize, ModuleName); 4]> = smallvec::SmallVec::new();
-    for sp in search_paths(db, ModuleResolveMode::StubsAllowed) {
-        let Some(sp_path) = sp.as_system_path() else {
-            continue;
-        };
+    for sp_path in system_module_search_paths(db, resolver_environment(db)) {
         let Ok(rel) = file_path.strip_prefix(sp_path) else {
             continue;
         };
@@ -1922,7 +1948,7 @@ pub(crate) fn canonical_module_name_for_file(
     // Multiple containing paths -- specificity tiebreak with round-trip.
     candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     for (_, name) in candidates {
-        let Some(resolved) = resolve_module(db, file, &name) else {
+        let Some(resolved) = resolve_module(db, importing_file(db, file), &name) else {
             continue;
         };
         let Some(resolved_file) = resolved.file(db) else {
@@ -1977,7 +2003,12 @@ mod tests {
     }
 
     fn parse_stmts(source: &str) -> Vec<Stmt> {
-        parse_module(source).unwrap().into_syntax().body
+        parse_module(source)
+            .unwrap()
+            .into_syntax()
+            .body
+            .into_iter()
+            .collect()
     }
 
     // -- is_dunder_name ----------------------------------------------------
