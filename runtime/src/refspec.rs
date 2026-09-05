@@ -27,7 +27,7 @@ use crate::file_payload::{
 };
 use crate::graph::DeclKey;
 use crate::helpers::importing_file;
-use crate::ingest::module_name_resolves;
+use crate::ingest::{module_name_resolves, resolve_dotted_module};
 
 /// One unresolved reference edge, expressed entirely in this file's
 /// local terms. `src` is the local index (into
@@ -456,9 +456,7 @@ fn resolve_use(
     let mut terminal_decl_refs: Vec<ResolvedNode> = Vec::new();
     for seg in &adjusted_chain {
         let candidate = compact_str::format_compact!("{current_path}.{seg}");
-        let submodule_file = ModuleName::new(&candidate)
-            .and_then(|mn| resolve_module(db, importing_file(db, anchor), &mn))
-            .and_then(|m| m.file(db));
+        let submodule_file = resolve_dotted_module(db, anchor, &candidate).and_then(|m| m.file(db));
         if let Some(sub_file) = submodule_file {
             current_file = sub_file;
             current_path = candidate;
@@ -531,10 +529,7 @@ fn resolve_module_target(
     out: &mut SmallVec<[ResolvedNode; 4]>,
 ) {
     let top_level = dotted.split('.').next().unwrap_or(dotted);
-    let Some(mn) = ModuleName::new(dotted) else {
-        return;
-    };
-    let Some(module) = resolve_module(db, importing_file(db, anchor), &mn) else {
+    let Some(module) = resolve_dotted_module(db, anchor, dotted) else {
         return;
     };
     let Some(target_file) = module.file(db) else {

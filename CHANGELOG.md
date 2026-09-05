@@ -9,6 +9,19 @@ two versions.
 
 ## [Unreleased]
 
+### Performance
+
+- **Speculative submodule probes skip single-file parents.** Reference
+  resolution probes `module.name` as a possible submodule for every name it
+  follows through an import alias. Each distinct miss made ty scan every
+  search path, which is linear in the number of search paths per probe and
+  dominated `assemble` in workspaces with hundreds of editable members (the
+  shape the dropped fork-side search-path cache was written for). The parent
+  is now resolved first and the probe is skipped when it is a plain module,
+  which cannot have submodules. On a 9,300-file synthetic corpus with 300
+  extra search paths this brings the cold build from 10.7 s back to 4.2 s
+  (assemble 8.7 s → 1.7 s) and cuts peak RSS by about a third.
+
 ### Changed
 
 - **Vendored `ruff` (ty) submodule bumped to upstream `astral-sh/ruff@a592ffe1`**

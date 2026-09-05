@@ -28,7 +28,7 @@ use pyo3::prelude::*;
 use ruff_db::files::{File, FilePath};
 use ruff_python_ast::{Expr, ExprName, Stmt};
 use ruff_text_size::Ranged;
-use ty_module_resolver::{resolve_module, search_paths, ModuleName, ModuleResolveMode};
+use ty_module_resolver::{resolve_module, search_paths, Module, ModuleName, ModuleResolveMode};
 use ty_project::Db as ProjectDb;
 use ty_python_core::definition::DefinitionKind;
 
@@ -599,7 +599,40 @@ pub(crate) fn collapse_attribute_chain(expr: &Expr) -> Option<(&ExprName, Vec<&s
 /// third-party) as seen from `anchor`. Used to disambiguate
 /// "submodule" vs "decl in module" for `from X import Y`.
 pub(crate) fn module_name_resolves(dotted: &str, anchor: File, db: &dyn ProjectDb) -> bool {
-    ModuleName::new(dotted)
-        .and_then(|n| resolve_module(db, crate::helpers::importing_file(db, anchor), &n))
-        .is_some()
+    resolve_dotted_module(db, anchor, dotted).is_some()
+}
+
+/// Resolve the dotted module name `dotted` as seen from `anchor`.
+///
+/// This is the entry point for *speculative* lookups: dead-cst probes
+/// `module.name` as a possible submodule for every name it follows
+/// through an import alias, and the vast majority of those probes miss.
+/// A miss makes ty scan every search path for a name it has never seen
+/// before, which is linear in the number of search paths for each
+/// distinct probe — the dominant cost in workspaces with hundreds of
+/// editable members. A single-file module can't have submodules, so
+/// the parent is resolved first (memoized by ty) and the probe is
+/// skipped outright when the parent is one.
+pub(crate) fn resolve_dotted_module<'db>(
+    db: &'db dyn ProjectDb,
+    anchor: File,
+    dotted: &str,
+) -> Option<Module<'db>> {
+    resolve_module_name(db, anchor, &ModuleName::new(dotted)?)
+}
+
+fn resolve_module_name<'db>(
+    db: &'db dyn ProjectDb,
+    anchor: File,
+    name: &ModuleName,
+) -> Option<Module<'db>> {
+    if let Some(parent) = name.parent() {
+        if resolve_module_name(db, anchor, &parent)?
+            .kind(db)
+            .is_module()
+        {
+            return None;
+        }
+    }
+    resolve_module(db, crate::helpers::importing_file(db, anchor), name)
 }
