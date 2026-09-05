@@ -38,7 +38,7 @@ use ty_python_core::{semantic_index, SemanticIndexRef};
 use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
-    def_key, file_to_nodes, import_payload_for_pure as import_payload_for, FileNodes,
+    def_key, file_to_nodes, import_payload_for_pure as import_payload_for, ChainStep, FileNodes,
     ImportPayload, NodeData, NodeKind, NodeRef,
 };
 use crate::refspec::{DynamicRef, MemberRef, MemberRole, RefSpec, Target};
@@ -63,8 +63,8 @@ use crate::helpers::{
     EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
 };
 use crate::ingest::{
-    collapse_attribute_chain, detect_dynamic_call, file_package_name, from_module_string,
-    paired_unpack_rhs, parse_dynamic_args, resolve_dynamic_target,
+    detect_dynamic_call, dynamic_call_module, file_package_name, from_module_string,
+    paired_unpack_rhs, parse_dynamic_args, peel_value_chain, resolve_dynamic_target,
     stmt_creates_top_level_definition, target_is_dunder_all, DynamicParseResult,
 };
 
@@ -377,7 +377,7 @@ impl<'db> RefWalker<'_, 'db> {
     /// Emit an unresolved `Use`-role member spec (the parallel
     /// upstream-reachability edges past an import alias). The
     /// assembly pass resolves it via `resolve_member`.
-    fn emit_member_use(&mut self, spec: &ImportPayload, bound_name: &str, extra_chain: &[&str]) {
+    fn emit_member_use(&mut self, spec: &ImportPayload, bound_name: &str, chain: &[ChainStep]) {
         if spec.module.is_empty() {
             return;
         }
@@ -387,7 +387,7 @@ impl<'db> RefWalker<'_, 'db> {
                 role: MemberRole::Use,
                 spec: spec.clone(),
                 bound_name: bound_name.to_compact_string(),
-                chain: extra_chain.iter().map(|s| s.to_compact_string()).collect(),
+                chain: chain.to_vec(),
             }),
             flags: self.current_flags,
         });
@@ -573,33 +573,89 @@ impl<'db> RefWalker<'_, 'db> {
         Vec::new()
     }
 
-    fn emit_name_use(&mut self, name: &ExprName, extra_chain: &[&str]) {
+    /// Emit the specs for a use of `name` with `steps` (the attribute /
+    /// call chain applied to it at the use site) — the local alias
+    /// edge, plus a parallel `Use` member spec whenever the binding
+    /// denotes a module: an import alias (its payload), a variable
+    /// holding a module or a function returning one (their
+    /// [`crate::file_payload::ModuleValue`]s, with the use's steps
+    /// appended; a function's descriptor is of the call's value, so it
+    /// applies only under a leading `Call`).
+    fn emit_name_use(&mut self, name: &ExprName, steps: &[ChainStep]) {
         // Names in non-Load context (LHS of `=`, `for x in …`, etc.)
         // are binding sites, not uses — skip to match today's pipeline.
         if !matches!(name.ctx, ruff_python_ast::ExprContext::Load) {
             return;
         }
+        // The leading attribute run (up to the first call) is what the
+        // sibling-submodule-import recovery in `find_local_bindings`
+        // matches against.
+        let leading_attrs: Vec<&str> = steps
+            .iter()
+            .map_while(|step| match step {
+                ChainStep::Attr(attr) => Some(attr.as_str()),
+                ChainStep::Call => None,
+            })
+            .collect();
         self.current_flags = self.flags_for_range(name.range());
-        for resolution in self.find_local_bindings(name, extra_chain) {
+        for resolution in self.find_local_bindings(name, &leading_attrs) {
             match resolution {
                 Resolution::Alias(dst_local) => {
                     self.emit_local(dst_local);
-                    // If the resolved alias is an import, emit a
-                    // parallel `Use` member spec through it
-                    // (Principle 2) — resolved at assembly.
-                    let node_data = &self.self_nodes.nodes[dst_local as usize];
-                    if matches!(node_data.kind, NodeKind::Import) {
-                        if let Some(spec) = node_data.imports.clone() {
-                            self.emit_member_use(&spec, name.id.as_str(), extra_chain);
+                    // Parallel `Use` member spec through a
+                    // module-denoting binding (Principle 2) — resolved
+                    // at assembly.
+                    let self_nodes = self.self_nodes;
+                    let node_data = &self_nodes.nodes[dst_local as usize];
+                    match node_data.kind {
+                        NodeKind::Import => {
+                            if let Some(spec) = &node_data.imports {
+                                self.emit_member_use(spec, name.id.as_str(), steps);
+                            }
                         }
+                        NodeKind::Variable if !steps.is_empty() => {
+                            self.emit_module_values(&node_data.module_values, steps);
+                        }
+                        NodeKind::Function => {
+                            if let Some((ChainStep::Call, rest)) = steps.split_first() {
+                                self.emit_module_values(&node_data.module_values, rest);
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Resolution::NestedImport { spec, bound_name } => {
-                    self.emit_member_use(&spec, &bound_name, extra_chain);
+                    self.emit_member_use(&spec, &bound_name, steps);
                 }
             }
         }
         self.current_flags = 0;
+    }
+
+    /// One `Use` member spec per module value, with `rest` (the use
+    /// site's remaining steps) appended to the value's own steps.
+    fn emit_module_values(
+        &mut self,
+        values: &[crate::file_payload::ModuleValue],
+        rest: &[ChainStep],
+    ) {
+        for value in values {
+            let mut chain: Vec<ChainStep> = value.steps.clone();
+            chain.extend_from_slice(rest);
+            self.emit_member_use(&value.spec, &value.bound_name, &chain);
+        }
+    }
+
+    /// Walk a call's arguments (positional and keyword) without
+    /// re-walking its callee — used for calls that sit inside an
+    /// access chain the chain spec already covers.
+    fn visit_call_arguments(&mut self, call: &ruff_python_ast::ExprCall) {
+        for arg in &call.arguments.args {
+            self.visit_expr(arg);
+        }
+        for kw in &call.arguments.keywords {
+            self.visit_expr(&kw.value);
+        }
     }
 
     /// `import X[.Y.Z][ as A]` inside a function/class body. No alias
@@ -610,9 +666,16 @@ impl<'db> RefWalker<'_, 'db> {
         for alias in &stmt.names {
             let dotted = alias.name.id.as_str();
             let first_seg = dotted.split('.').next().unwrap_or(dotted);
-            let (bound_name, synthetic_chain): (&str, Vec<&str>) = match &alias.asname {
+            let (bound_name, synthetic_chain): (&str, Vec<ChainStep>) = match &alias.asname {
                 Some(asname) => (asname.id.as_str(), Vec::new()),
-                None => (first_seg, dotted.split('.').skip(1).collect()),
+                None => (
+                    first_seg,
+                    dotted
+                        .split('.')
+                        .skip(1)
+                        .map(|seg| ChainStep::Attr(seg.to_compact_string()))
+                        .collect(),
+                ),
             };
             let spec = ImportPayload {
                 module: compact_str::ToCompactString::to_compact_string(&dotted),
@@ -813,14 +876,44 @@ impl<'ast> Visitor<'ast> for RefWalker<'_, '_> {
             self.emit_name_use(n, &[]);
             return;
         }
-        // Collapse attribute chains rooted at a `Name`. The chain
-        // segments past the root become `extra_chain` so the `Use`
-        // member spec can walk submodule segments past an aliased
-        // module at resolution time.
+        // Collapse access chains (`a.b`, `a.b().c`, `f().x`) to their
+        // root. The steps past the root ride on the `Use` member spec
+        // so the assembly walk can follow submodules / exports (and,
+        // through a decl that denotes a module, keep going) at
+        // resolution time. Calls inside the chain still get their
+        // arguments walked; their callee is covered by the chain.
         if matches!(expr, Expr::Attribute(_)) {
-            if let Some((root, segments)) = collapse_attribute_chain(expr) {
-                self.emit_name_use(root, &segments);
-                return;
+            let (root, steps, calls) = peel_value_chain(expr);
+            match root {
+                Expr::Name(name) => {
+                    self.emit_name_use(name, &steps);
+                    for call in calls {
+                        self.visit_call_arguments(call);
+                    }
+                    return;
+                }
+                // Rooted at a dynamic-import call: its *value* is the
+                // module it loads, so the steps are a use inside it.
+                // The call itself is then visited as usual (dynamic
+                // spec + argument walk).
+                Expr::Call(call) => {
+                    if let Some(module) = dynamic_call_module(self.model.db(), self.file, call) {
+                        let spec = ImportPayload {
+                            module,
+                            decl: None,
+                            star: false,
+                        };
+                        self.current_flags = self.flags_for_range(expr.range());
+                        self.emit_member_use(&spec, "", &steps);
+                        self.current_flags = 0;
+                    }
+                    self.visit_expr(root);
+                    for call in calls {
+                        self.visit_call_arguments(call);
+                    }
+                    return;
+                }
+                _ => {}
             }
         }
         // Recognize dynamic-import calls before falling through to a

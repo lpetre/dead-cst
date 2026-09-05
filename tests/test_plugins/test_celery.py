@@ -149,6 +149,40 @@ def test_celery_plugin_marks_shared_tasks(build_plugin_graph, reachable_fqnames)
     assert "app.tasks.helper" not in reached
 
 
+def test_celery_plugin_marks_shared_task_on_class(build_plugin_graph, reachable_fqnames):
+    """``@shared_task`` on a *class* must be matched exactly like it is on a
+    function: the decorator matcher (``decorated_decls``) has to read the
+    decorator list of ``ClassDef`` statements, not just ``FunctionDef``."""
+    graph = build_plugin_graph(
+        {
+            "app/__init__.py": "",
+            "app/tasks.py": """
+            from celery import shared_task
+
+            @shared_task
+            class BareClassTask:
+                def run(self): pass
+
+            @shared_task(name="explicit")
+            class CalledClassTask:
+                def run(self): pass
+
+            @shared_task
+            def function_task(): pass
+
+            class Helper:
+                def run(self): pass
+            """,
+        },
+        [native.NativePlugin.celery()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "app.tasks.function_task" in reached
+    assert "app.tasks.BareClassTask" in reached
+    assert "app.tasks.CalledClassTask" in reached
+    assert "app.tasks.Helper" not in reached
+
+
 @pytest.mark.parametrize(
     "src, expected",
     [

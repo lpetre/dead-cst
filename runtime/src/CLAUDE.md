@@ -79,6 +79,26 @@ Concrete contract:
   segment that resolves as a submodule or as a global-scope decl
   emits a parallel `use → target` edge. The walk stops on the first
   segment that resolves as neither (or at the chain's end).
+* **Attribute chains on module-denoting bindings.** The same walk
+  applies when the chain's root is not an import statement but still
+  denotes a module: a top-level variable holding one (`m = config`,
+  `m = importlib.import_module('pkg.config')`, `m = pkg.sub`), a
+  top-level function whose `return` expressions denote one (`def f():
+  return config`, so `f().NAME`), or a re-exporting import alias in
+  the upstream file. Such bindings carry a `ModuleValue` — an
+  `ImportPayload` plus the steps already applied — computed per file
+  by `helpers::module_values_for_def` from the file's own use-def
+  chain (same-file hops folded in, mirroring `classify_base`; no type
+  inference, no cross-file reads). The walk emits the usual `Use`
+  member spec from it, and `resolve_use` splices a landed decl's
+  `ModuleValue`s into the chain walk at assembly, which is where
+  cross-file hops happen (`from helpers import get_config` then
+  `get_config().NAME` lands on `helpers.get_config`, reads its return
+  descriptor, and continues to `pkg.config.NAME`). Chains carry
+  `ChainStep::Call` alongside attribute segments so `f().NAME` and
+  `f.NAME` stay distinct; a `Call` on a module ends the walk. No
+  alias edge is emitted for the use — it never names the alias; the
+  variable / function it does name takes the local edge as usual.
 
 This applies equally to:
 

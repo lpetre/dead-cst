@@ -307,17 +307,19 @@ IMPORT_BASE_EDGES = frozenset(
             },
             id="relative-import",
         ),
-        # libcst follows the reexport chain at the use site, so `g.f()`
-        # picks up parallel `p.x.a -> p.chain.functions` /
-        # `p.x.a -> p.functions.f` edges (in addition to the alias
-        # edges on `p.x.g`). The rust backend stops at the alias edge
-        # — `p.x.g` already points at `p.chain.functions`, but no
-        # parallel use-site edges fan through that chain.
+        # `g.f()` follows the reexport chain at the use site: the chain
+        # lands on `p.chain.functions` (a re-exporting import alias,
+        # which denotes the module it imports), so the `f` segment is
+        # spliced through it and resolves inside `p.functions` —
+        # parallel `p.x.a -> p.functions` / `p.x.a -> p.functions.f`
+        # edges in addition to the alias edges on `p.x.g`.
         pytest.param(
             "from p.chain import functions as g\ndef a(): g.f()",
             {
                 "p.x.a -> p.chain",
                 "p.x.a -> p.chain.functions",
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
                 "p.x.a -> p.x",
                 "p.x.a -> p.x.g",
                 "p.x.g -> p.chain",
@@ -374,15 +376,17 @@ IMPORT_BASE_EDGES = frozenset(
             },
             id="module-level-call-of-imported-symbol",
         ),
-        # Same reexport-chain divergence as `import-chain-via-reexport`
-        # above: libcst emits parallel use-site edges through the
-        # chain (`p.x.a -> p.chain.functions`, `p.x.a -> p.functions.f`),
-        # rust stops at the alias edge on `p.x.functions`.
+        # Same reexport-chain walk as `import-chain-via-reexport`
+        # above, through an un-aliased `from p.chain import functions`:
+        # the use site reaches `p.functions.f` through the re-exporting
+        # alias on `p.chain`.
         pytest.param(
             "from p.chain import functions\ndef a(): functions.f()",
             {
                 "p.x.a -> p.chain",
                 "p.x.a -> p.chain.functions",
+                "p.x.a -> p.functions",
+                "p.x.a -> p.functions.f",
                 "p.x.a -> p.x",
                 "p.x.a -> p.x.functions",
                 "p.x.functions -> p.chain",
@@ -916,6 +920,167 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
                 "mod.os -> mod",
             },
             id="subscript-assignment-target-emits-uses",
+        ),
+        pytest.param(
+            # An attribute chain rooted at a *call* whose return value is
+            # a module must still resolve the attribute segments. ty infers
+            # ``get_config()`` as the ``pkg.config`` module object, so
+            # ``get_config().NAME`` is a use of ``pkg.config.NAME`` exactly
+            # like ``config.NAME`` would be -- the use emits the parallel
+            # reachability edges to the module and the decl (no alias edge:
+            # the use site never names the ``config`` alias). Only
+            # ``WHO -> get_config`` is emitted today; without the attribute
+            # edges ``pkg.config.NAME`` is reported dead.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": (
+                    "from pkg import config\n"
+                    "def get_config():\n"
+                    "    return config\n"
+                    "WHO = get_config().NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.get_config",
+                "pkg.use.config -> pkg.config",
+                "pkg.use.config -> pkg.use",
+                "pkg.use.get_config -> pkg.config",
+                "pkg.use.get_config -> pkg.use",
+                "pkg.use.get_config -> pkg.use.config",
+            },
+            id="attribute-on-call-returning-module",
+        ),
+        pytest.param(
+            # Same shape, but the module lands in a *variable* via a
+            # dynamic import: ``m = importlib.import_module('pkg.config')``
+            # binds ``m`` to the ``pkg.config`` module (the assignment
+            # already carries the ``DYNAMIC_IMPORT`` edge ``m -> pkg.config``),
+            # so ``m.NAME`` is a use of ``pkg.config.NAME``. Today the use
+            # only emits ``WHO -> m``; the module and decl edges are
+            # missing and ``pkg.config.NAME`` is reported dead.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": (
+                    "import importlib\nm = importlib.import_module('pkg.config')\nWHO = m.NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.m",
+                "pkg.use.importlib -> pkg.use",
+                "pkg.use.m -> pkg.config",
+                "pkg.use.m -> pkg.use",
+                "pkg.use.m -> pkg.use.importlib",
+            },
+            id="attribute-on-variable-bound-by-import-module",
+        ),
+        pytest.param(
+            # Plain re-binding of an aliased module: ``m = config`` makes
+            # ``m.NAME`` a use of ``pkg.config.NAME`` too. The ``m``
+            # assignment keeps its own alias edges; the use site edges to
+            # ``m`` plus the parallel module / decl edges.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": "from pkg import config\nm = config\nWHO = m.NAME\n",
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.m",
+                "pkg.use.config -> pkg.config",
+                "pkg.use.config -> pkg.use",
+                "pkg.use.m -> pkg.config",
+                "pkg.use.m -> pkg.use",
+                "pkg.use.m -> pkg.use.config",
+            },
+            id="attribute-on-variable-rebinding-aliased-module",
+        ),
+        pytest.param(
+            # Cross-file: the module-returning function lives in another
+            # file. The use lands on ``helpers.get_config`` (it is
+            # called), and resolution follows ``get_config``'s return
+            # descriptor into ``pkg.config`` for the ``NAME`` segment.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/helpers.py": "from pkg import config\ndef get_config():\n    return config\n",
+                "pkg/use.py": "from pkg.helpers import get_config\nWHO = get_config().NAME\n",
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.helpers -> pkg",
+                "pkg.helpers.config -> pkg.config",
+                "pkg.helpers.config -> pkg.helpers",
+                "pkg.helpers.get_config -> pkg.config",
+                "pkg.helpers.get_config -> pkg.helpers",
+                "pkg.helpers.get_config -> pkg.helpers.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.helpers",
+                "pkg.use.WHO -> pkg.helpers.get_config",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.get_config",
+                "pkg.use.get_config -> pkg.helpers",
+                "pkg.use.get_config -> pkg.helpers.get_config",
+                "pkg.use.get_config -> pkg.use",
+            },
+            id="attribute-on-call-to-imported-module-returning-function",
+        ),
+        pytest.param(
+            # Chain through a call on an aliased module:
+            # ``helpers.get_config().NAME``. The ``get_config`` segment
+            # lands on the decl, the ``Call`` step consumes its return
+            # descriptor, and ``NAME`` resolves inside ``pkg.config``.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\n",
+                "pkg/helpers.py": "from pkg import config\ndef get_config():\n    return config\n",
+                "pkg/use.py": "from pkg import helpers\nWHO = helpers.get_config().NAME\n",
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.helpers -> pkg",
+                "pkg.helpers.config -> pkg.config",
+                "pkg.helpers.config -> pkg.helpers",
+                "pkg.helpers.get_config -> pkg.config",
+                "pkg.helpers.get_config -> pkg.helpers",
+                "pkg.helpers.get_config -> pkg.helpers.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.helpers",
+                "pkg.use.WHO -> pkg.helpers.get_config",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.helpers",
+                "pkg.use.helpers -> pkg.helpers",
+                "pkg.use.helpers -> pkg.use",
+            },
+            id="attribute-on-call-through-aliased-module",
         ),
     ],
 )

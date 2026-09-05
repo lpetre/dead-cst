@@ -200,6 +200,11 @@ pub(crate) struct NodeData {
     /// Python-visible (a loaded graph behaves correctly off the anchor edges).
     pub(crate) is_overload: bool,
     pub(crate) imports: Option<ImportPayload>,
+    /// Module(s) this binding denotes when it is not an import: a
+    /// variable holding a module, or a function returning one (the
+    /// descriptor is of the *call's* value). Empty for everything else.
+    /// See [`ModuleValue`].
+    pub(crate) module_values: Vec<ModuleValue>,
     /// Byte range of the bound *name* (ty's `DefinitionKind::target_range`),
     /// stashed so the assembly pass can rebuild its `(File, place_id,
     /// range)` decl index without re-parsing the module. `(0, 0)` for
@@ -259,6 +264,42 @@ pub(crate) struct ImportPayload {
     pub(crate) module: CompactString,
     pub(crate) decl: Option<CompactString>,
     pub(crate) star: bool,
+}
+
+/// One step of an access chain applied to a module-denoting root:
+/// `.name` or `(...)`. A `Use` member spec's chain is a list of these;
+/// `Attr` segments are walked as submodule-or-export lookups by
+/// `resolve_use`, and `Call` is consumed when the chain lands on a
+/// function decl that carries a return [`ModuleValue`] (so `f().NAME`
+/// and `f.NAME` stay distinct).
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, salsa::Update, get_size2::GetSize)]
+pub(crate) enum ChainStep {
+    Attr(CompactString),
+    Call,
+}
+
+/// "The value bound here denotes a module." The [`ImportPayload`]-shaped
+/// descriptor that lets a non-import binding act as an import alias for
+/// attribute access: `m = importlib.import_module('pkg.config')` or
+/// `m = config` on a variable, and the `return` expression(s) on a
+/// function (`def f(): return config`, so `f()` denotes `pkg.config`).
+///
+/// `spec` + `bound_name` are exactly what an import alias node carries;
+/// `steps` are the attribute / call steps already applied on the way
+/// to the module (`m = pkg.sub` records `pkg` with `[Attr("sub")]`).
+/// A use site's own chain is appended after them and the whole thing
+/// is resolved by the one `resolve_use` walk — a module held in a
+/// variable and a module bound by `import` are the same case there.
+///
+/// Derived per file by [`crate::helpers::module_values_for_def`] from
+/// this file's own use-def chain (same-file hops folded in, no
+/// cross-file reads); cross-file hops happen at assembly, where
+/// `resolve_use` splices a landed decl's `module_values` into the walk.
+#[derive(Debug, Clone, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+pub(crate) struct ModuleValue {
+    pub(crate) spec: ImportPayload,
+    pub(crate) bound_name: CompactString,
+    pub(crate) steps: Vec<ChainStep>,
 }
 
 /// Salsa-tracked output of [`file_to_nodes`]. Parallel arrays plus a
@@ -432,6 +473,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
         flags: default_flags,
         is_overload: false,
         imports: None,
+        module_values: Vec::new(),
         name_range: (0, 0),
     });
     refs.push(NodeRef::Module(file));
@@ -532,6 +574,12 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
         } else {
             None
         };
+        let module_values = match node_kind {
+            NodeKind::Variable | NodeKind::Function => {
+                crate::helpers::module_values_for_def(db, file, &parsed, kind)
+            }
+            _ => Vec::new(),
+        };
 
         let mut flags: u32 = default_flags;
         let import_noqa_pin = matches!(node_kind, NodeKind::Import)
@@ -573,6 +621,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
             flags,
             is_overload,
             imports: import_spec.clone(),
+            module_values,
             name_range: (target_range.start().to_u32(), target_range.end().to_u32()),
         };
         // Same triple `def_key` would mint, reusing the `place_id` /
@@ -610,6 +659,7 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
                         flags: star_flags,
                         is_overload: false,
                         imports: import_spec.clone(),
+                        module_values: Vec::new(),
                         name_range: (target_range.start().to_u32(), target_range.end().to_u32()),
                     };
                     let star_key = NodeRef::StarStmt(file, range_key(target_range));
