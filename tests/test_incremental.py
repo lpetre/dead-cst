@@ -445,6 +445,22 @@ _INCREMENTAL_SCENARIOS = {
         {"base.py": "class A: pass\nclass B: pass\nAlias = B\n"},
         ["base.py"],
     ),
+    "module_returning_function_retargets": (
+        # `get_config().NAME` in use.py resolves through helpers.py's
+        # return descriptor. Editing *only* helpers.py to return a
+        # different module must re-resolve use.py's chain (its memo
+        # entry's read set includes helpers.py) so `NAME` moves from
+        # pkg.config to pkg.other.
+        {
+            "pkg/__init__.py": "",
+            "pkg/config.py": "NAME = 1\n",
+            "pkg/other.py": "NAME = 2\n",
+            "pkg/helpers.py": "from pkg import config, other\ndef get_config():\n    return config\n",
+            "pkg/use.py": "from pkg.helpers import get_config\nWHO = get_config().NAME\n",
+        },
+        {"pkg/helpers.py": "from pkg import config, other\ndef get_config():\n    return other\n"},
+        ["pkg/helpers.py"],
+    ),
     "dynamic_import_change": (
         {
             "a.py": "def f(): pass\n",

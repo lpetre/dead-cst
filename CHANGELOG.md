@@ -21,13 +21,15 @@ two versions.
 - **Attribute access on a module held in a variable or returned by a call
   resolves.** `m = importlib.import_module('pkg.config'); m.NAME`,
   `m = config; m.NAME` and `def f(): return config` + `f().NAME` emitted no
-  edge to `pkg.config.NAME`, so the attribute was reported dead. The per-file
-  walk now evaluates the root of an attribute chain syntactically (a
-  top-level variable's assigned value, a same-file function's `return`
-  expressions, a dynamic-import call with a literal target) and, when it is a
-  module, emits the same parallel `use → module` / `use → module.NAME`
-  reachability edges an aliased-module chain does. Still file-local: no type
-  inference and no cross-file reads in the walk.
+  edge to `pkg.config.NAME`, so the attribute was reported dead. A variable
+  or function whose value denotes a module now carries the same descriptor
+  an import alias does, and attribute chains on it resolve through the same
+  path as `alias.NAME` — including across files (`from helpers import
+  get_config` then `get_config().NAME` follows `get_config`'s return into
+  `pkg.config`), with incremental rebuilds tracking every file the hop
+  reads. Access chains through calls (`mod.get().NAME`) are followed the
+  same way. The per-file walk stays file-local: no type inference and no
+  cross-file reads.
 
 ## [0.14.1] - 2026-09-01
 

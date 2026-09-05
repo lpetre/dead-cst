@@ -23,9 +23,13 @@ use ty_project::{Db as ProjectDb, ProjectDatabase};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::{global_scope, place_table, use_def_map};
 
-use crate::file_payload::ClassBaseSpec;
+use crate::file_payload::{
+    import_payload_for_pure, ChainStep, ClassBaseSpec, ImportPayload, ModuleValue,
+};
 use crate::graph::{EdgeFlags, NodeFlags};
-use crate::ingest::{collapse_attribute_chain, from_module_string};
+use crate::ingest::{
+    collapse_attribute_chain, dynamic_call_module, from_module_string, peel_value_chain,
+};
 use crate::project::BuildOutputs;
 
 /// Sentinel value stored in a file's local imports map (the value half
@@ -289,6 +293,195 @@ fn classify_name_def<'db>(
             classify_base(db, file, parsed, assign.value(parsed)?, depth + 1)
         }
         _ => None,
+    }
+}
+
+/// The [`ModuleValue`]s a global-scope definition denotes, for
+/// [`crate::file_payload::file_to_nodes`]: a variable's assigned value
+/// (`m = config`, `m = importlib.import_module('pkg.config')`,
+/// `m = pkg.sub`) or, for a function, the value of *calling* it — every
+/// `return` expression in its body that denotes a module. Same-file
+/// hops (a variable bound to another variable, a call to a same-file
+/// function) are folded in here via this file's use-def chain, mirroring
+/// [`classify_base`]; nothing cross-file is read. Empty for anything
+/// that cannot syntactically denote a module.
+pub(crate) fn module_values_for_def(
+    db: &dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    kind: &DefinitionKind<'_>,
+) -> Vec<ModuleValue> {
+    let mut out: Vec<ModuleValue> = Vec::new();
+    match kind {
+        DefinitionKind::Assignment(assign) => {
+            classify_module_value(db, file, parsed, assign.value(parsed), &[], 0, &mut out);
+        }
+        DefinitionKind::AnnotatedAssignment(assign) => {
+            if let Some(value) = assign.value(parsed) {
+                classify_module_value(db, file, parsed, value, &[], 0, &mut out);
+            }
+        }
+        DefinitionKind::Function(func) => {
+            let mut returns: Vec<&Expr> = Vec::new();
+            collect_return_values(&func.node(parsed).body, &mut returns);
+            for value in returns {
+                classify_module_value(db, file, parsed, value, &[], 0, &mut out);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Describe the module(s) `expr` denotes, with `trailing` steps applied
+/// after it, into `out`. Peels the access chain to its root, then:
+///
+/// * a `Name` is classified through each of its reachable definitions
+///   ([`classify_module_value_def`]);
+/// * a dynamic-import call with a literal target is that module
+///   ([`dynamic_call_module`]);
+/// * anything else denotes nothing.
+fn classify_module_value(
+    db: &dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    expr: &Expr,
+    trailing: &[ChainStep],
+    depth: u32,
+    out: &mut Vec<ModuleValue>,
+) {
+    if depth > MEMBER_RESOLVE_DEPTH_CAP {
+        return;
+    }
+    let (root, mut steps, _calls) = peel_value_chain(expr);
+    steps.extend_from_slice(trailing);
+    match root {
+        Expr::Name(name) => {
+            let symbol = name.id.as_str();
+            for def in local_member_defs(db, file, symbol) {
+                classify_module_value_def(db, file, parsed, def, symbol, &steps, depth, out);
+            }
+        }
+        Expr::Call(call) => {
+            if let Some(module) = dynamic_call_module(db, file, call) {
+                out.push(ModuleValue {
+                    spec: ImportPayload {
+                        module,
+                        decl: None,
+                        star: false,
+                    },
+                    bound_name: CompactString::default(),
+                    steps,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One definition of a chain root `name`, with `steps` applied to it:
+/// an import binding is the module its payload names; an assignment
+/// follows its right-hand side; a function consumes a leading `Call`
+/// step and follows its `return` expressions. Anything else (a class,
+/// a parameter, …) denotes no module.
+#[allow(clippy::too_many_arguments)]
+fn classify_module_value_def<'db>(
+    db: &'db dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    def: Definition<'db>,
+    name: &str,
+    steps: &[ChainStep],
+    depth: u32,
+    out: &mut Vec<ModuleValue>,
+) {
+    let kind = def.kind(db);
+    match kind {
+        DefinitionKind::Import(_)
+        | DefinitionKind::ImportFrom(_)
+        | DefinitionKind::ImportFromSubmodule(_)
+        | DefinitionKind::StarImport(_) => {
+            let spec = import_payload_for_pure(kind, db, file, parsed);
+            if !spec.module.is_empty() {
+                out.push(ModuleValue {
+                    spec,
+                    bound_name: name.to_compact_string(),
+                    steps: steps.to_vec(),
+                });
+            }
+        }
+        DefinitionKind::Assignment(assign) => {
+            classify_module_value(
+                db,
+                file,
+                parsed,
+                assign.value(parsed),
+                steps,
+                depth + 1,
+                out,
+            );
+        }
+        DefinitionKind::AnnotatedAssignment(assign) => {
+            if let Some(value) = assign.value(parsed) {
+                classify_module_value(db, file, parsed, value, steps, depth + 1, out);
+            }
+        }
+        DefinitionKind::Function(func) => {
+            let Some((ChainStep::Call, rest)) = steps.split_first() else {
+                return;
+            };
+            let mut returns: Vec<&Expr> = Vec::new();
+            collect_return_values(&func.node(parsed).body, &mut returns);
+            for value in returns {
+                classify_module_value(db, file, parsed, value, rest, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every `return <expr>` value in a function body, entering compound
+/// statements but not nested `def` / `class` bodies (their returns
+/// belong to them).
+fn collect_return_values<'ast>(body: &'ast [Stmt], out: &mut Vec<&'ast Expr>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Return(r) => {
+                if let Some(value) = &r.value {
+                    out.push(value.as_ref());
+                }
+            }
+            Stmt::If(s) => {
+                collect_return_values(&s.body, out);
+                for clause in &s.elif_else_clauses {
+                    collect_return_values(&clause.body, out);
+                }
+            }
+            Stmt::Try(s) => {
+                collect_return_values(&s.body, out);
+                for handler in &s.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_return_values(&h.body, out);
+                }
+                collect_return_values(&s.orelse, out);
+                collect_return_values(&s.finalbody, out);
+            }
+            Stmt::For(s) => {
+                collect_return_values(&s.body, out);
+                collect_return_values(&s.orelse, out);
+            }
+            Stmt::While(s) => {
+                collect_return_values(&s.body, out);
+                collect_return_values(&s.orelse, out);
+            }
+            Stmt::With(s) => collect_return_values(&s.body, out),
+            Stmt::Match(s) => {
+                for case in &s.cases {
+                    collect_return_values(&case.body, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
