@@ -527,6 +527,125 @@ def test_remove_test_only_query_drops_test_set(runner, project):
     assert "-def used" not in result.stdout
 
 
+def test_analyze_dead_tests_query_reports_tests_backing_nothing_live(runner, project):
+    """``--query dead-tests`` reports a test that only exercises code no
+    non-test seed reaches, plus the code only that test kept alive. A
+    test that touches production-reachable code stays out."""
+    root = project(
+        {
+            "mod.py": """
+            def used():
+                pass
+
+            def dead_helper():
+                pass
+            """,
+            "test_mod.py": """
+            from mod import used, dead_helper
+
+            def test_dead():
+                dead_helper()
+
+            def test_live():
+                used()
+            """,
+        }
+    )
+    result = runner.invoke(
+        app,
+        ["analyze", str(root), "-e", "mod.used", "--plugin", "pytest", "--query", "dead-tests"],
+    )
+    assert result.exit_code == 1
+    assert "test_mod.test_dead" in result.stdout
+    assert "mod.dead_helper" in result.stdout
+    assert "test_mod.test_live" not in result.stdout
+    assert "mod.used" not in result.stdout
+
+
+def test_analyze_dead_tests_query_without_test_plugin_warns(runner, project):
+    root = project(
+        {
+            "mod.py": "def dead_helper():\n    pass\n",
+            "test_mod.py": "from mod import dead_helper\n\ndef test_dead():\n    dead_helper()\n",
+        }
+    )
+    result = runner.invoke(app, ["analyze", str(root), "--query", "dead-tests"])
+    assert result.exit_code == 0
+    assert "no test plugin registered" in result.stderr
+    assert "Dead symbols" not in result.stdout
+
+
+def test_analyze_dead_tests_query_from_loaded_graph(runner, project, tmp_path):
+    """The query runs against a ``--graph`` file too (pure-Python
+    ``LoadedGraph`` path), as long as the graph was built with a test
+    plugin so the ``test/testcase`` flag is in the registry."""
+    root = project(
+        {
+            "mod.py": """
+            def used():
+                pass
+
+            def dead_helper():
+                pass
+            """,
+            "test_mod.py": """
+            from mod import used, dead_helper
+
+            def test_dead():
+                dead_helper()
+
+            def test_live():
+                used()
+            """,
+        }
+    )
+    graph_file = tmp_path / "graph.bin"
+    build = runner.invoke(
+        app,
+        ["build", str(root), "-e", "mod.used", "--plugin", "pytest", "-o", str(graph_file)],
+    )
+    assert build.exit_code == 0, build.stderr
+    result = runner.invoke(
+        app,
+        ["analyze", str(root), "--graph", str(graph_file), "--query", "dead-tests"],
+    )
+    assert result.exit_code == 1
+    assert "test_mod.test_dead" in result.stdout
+    assert "test_mod.test_live" not in result.stdout
+
+
+def test_remove_dead_tests_query_drops_only_dead_tests(runner, project):
+    root = project(
+        {
+            "mod.py": """
+            def used():
+                pass
+
+            def dead_helper():
+                pass
+            """,
+            "test_mod.py": """
+            from mod import used, dead_helper
+
+            def test_dead():
+                dead_helper()
+
+            def test_live():
+                used()
+            """,
+        }
+    )
+    result = runner.invoke(
+        app,
+        ["remove", str(root), "-e", "mod.used", "--plugin", "pytest", "--query", "dead-tests"],
+    )
+    assert result.exit_code == 0
+    assert "-def test_dead" in result.stdout
+    assert "-def dead_helper" in result.stdout
+    assert "-def test_live" not in result.stdout
+    assert "-def used" not in result.stdout
+
+
 # ---------------------------------------------------------------------------
 # build + --graph round-trip
 # ---------------------------------------------------------------------------

@@ -3,12 +3,13 @@ from __future__ import annotations
 import threading
 import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Sequence, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Sequence, TypedDict
 
 from .graph import EdgeFlags
 
 if TYPE_CHECKING:
     from dead_cst import _native as native
+    from dead_cst.graph import SymbolNode
 
 
 #: Public, ordered list of progress phases. The polling thread fires
@@ -88,6 +89,102 @@ def _iter_dead_indices(
         for idx in ctx.indices_where(kind=kind):
             if idx not in reachable:
                 yield idx
+
+
+# Kinds that count as "code" a test can exercise. Modules are anchors,
+# imports are aliases (the walk passes *through* them to what they bind),
+# and externals live outside the project — none of them is something a
+# test "uses" in the sense :func:`_dead_test_indices` cares about.
+_CODE_KINDS: frozenset[str] = frozenset({"function", "class", "variable", "type_alias"})
+
+
+def _forward_closure(
+    out: Sequence[Sequence[int]],
+    roots: Iterable[int],
+    *,
+    expand: Callable[[int], bool],
+) -> set[int]:
+    """Nodes reachable from ``roots`` over ``out``, only expanding a
+    visited node's successors when ``expand(idx)`` holds. Roots are
+    always included."""
+    seen: set[int] = set()
+    stack = list(roots)
+    while stack:
+        idx = stack.pop()
+        if idx in seen:
+            continue
+        seen.add(idx)
+        if expand(idx):
+            stack.extend(out[idx])
+    return seen
+
+
+def _dead_test_indices(
+    nodes: Sequence[SymbolNode],
+    edges: Iterable[tuple[int, int, int]],
+    *,
+    seed_flags: int,
+    testcase_flag: int,
+    test_seed_flags: int,
+) -> set[int]:
+    """Positional indices of every dead test plus whatever only those
+    tests keep alive.
+
+    A test (a node carrying ``testcase_flag``) is *dead* when nothing it
+    references — transitively, through import aliases, fixtures, and
+    the code they in turn reference — is reachable from a non-test seed
+    (``seed_flags & ~test_seed_flags``). Such a test only exercises code
+    that is itself dead in production, so removing the test (and the
+    code it was propping up) loses nothing a production entrypoint can
+    observe.
+
+    The per-test walk deliberately does not expand ``module`` nodes: a
+    test *importing from* a production module executes that module's
+    body, but a module-level call to a live function is not the test
+    exercising it. Module-attribute uses (``pkg.lib.f()``) resolve to
+    direct decl edges, so stopping at modules loses nothing the test
+    actually touches.
+
+    The returned set is the blast radius of dropping the dead tests
+    from the seed set — the diff between the full reachable set and the
+    set reachable from every other seed — so it includes each dead test
+    and every decl only dead tests reach. A decl a live test (or any
+    other seed, a ``test/fixture`` included) also reaches stays out.
+    """
+    out: list[list[int]] = [[] for _ in nodes]
+    incoming: list[list[int]] = [[] for _ in nodes]
+    for src, dst, _flags in edges:
+        out[src].append(dst)
+        incoming[dst].append(src)
+
+    seeds = [idx for idx, node in enumerate(nodes) if node.flags & seed_flags]
+    production_seeds = [idx for idx in seeds if not nodes[idx].flags & test_seed_flags]
+    production = _forward_closure(out, production_seeds, expand=lambda _idx: True)
+    production_code = [idx for idx in production if nodes[idx].kind in _CODE_KINDS]
+
+    # A test is live iff its module-stopping forward closure meets
+    # ``production_code``. Walking backwards from every production decl
+    # instead answers that for all tests in one pass: forward, a module
+    # never expands, so backwards we never step onto a module predecessor.
+    live: set[int] = set()
+    stack = list(production_code)
+    while stack:
+        idx = stack.pop()
+        if idx in live:
+            continue
+        live.add(idx)
+        stack.extend(pred for pred in incoming[idx] if nodes[pred].kind != "module")
+
+    dead_tests = {
+        idx for idx, node in enumerate(nodes) if node.flags & testcase_flag and idx not in live
+    }
+    if not dead_tests:
+        return set()
+    full = _forward_closure(out, seeds, expand=lambda _idx: True)
+    kept = _forward_closure(
+        out, (idx for idx in seeds if idx not in dead_tests), expand=lambda _idx: True
+    )
+    return full - kept
 
 
 def _safe_invoke_callback(cb: ProgressCallback, event: str, **kwargs: Any) -> None:
@@ -733,6 +830,33 @@ class Analysis:
         full = set(ctx.reachable_indices(seed_flags=seed_flags))
         without = set(ctx.reachable_indices(seed_flags=seed_flags & ~flags))
         return full - without
+
+    def dead_tests(self, *, seed_flags: int | None = None) -> set[int]:
+        """Indices of every dead test plus whatever only dead tests keep
+        alive. A test (a ``test/testcase``-flagged node) is dead when
+        nothing it references is reachable from a non-test seed — it
+        only exercises code that is itself dead in production. The
+        result is the blast radius of dropping those tests: the diff
+        between ``reachable_indices(seed_flags)`` and the same closure
+        without the dead tests seeding it. ``seed_flags`` defaults to the
+        registry-derived
+        :meth:`native.ProjectContext.default_seed_mask`. Empty when no
+        test plugin is registered (no ``test/testcase`` flag exists).
+        """
+        ctx = self.materialize_all()
+        testcase = ctx.node_flag("test/testcase")
+        if testcase is None:
+            return set()
+        if seed_flags is None:
+            seed_flags = ctx.default_seed_mask()
+        fixture = ctx.node_flag("test/fixture") or 0
+        return _dead_test_indices(
+            ctx.nodes(),
+            ctx.edges(),
+            seed_flags=seed_flags,
+            testcase_flag=testcase,
+            test_seed_flags=testcase | fixture,
+        )
 
     def node_flag(self, name: str) -> int | None:
         """Resolve a node-flag bit by its registered ``owner/name`` (e.g.

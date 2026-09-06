@@ -82,7 +82,7 @@ dead-cst analyze ROOT [OPTIONS]
 | Option | Description |
 |---|---|
 | `--graph` | Load a pre-built graph from disk; mutually exclusive with all build inputs |
-| `--query` | Reachability question: `dead` (default) or `test-only` |
+| `--query` | Reachability question: `dead` (default), `test-only`, or `dead-tests` |
 | `-e, --entrypoint` | Entrypoint as a file path or FQN (repeatable) |
 | `--entrypoint-regex` | Entrypoint as a regex (repeatable) |
 | `-p, --path` | Search path spec (repeatable) |
@@ -96,6 +96,8 @@ Without `--exit-zero`, the exit code is 1 if dead code is found, 0 otherwise.
 
 `--query test-only` runs `kept_alive_by_flags_only(NodeFlags.TESTCASE)` — the blast-radius diff between "alive with the test suite" and "alive without it" — and reports the set that would go dark if the tests went away. The test functions themselves are included (they are `TESTCASE`-flagged), so the result is the wholesale "the test suite and everything that backs it" set.
 
+`--query dead-tests` answers the inverse question: which tests can go? A test is *dead* when nothing it references — transitively, through import aliases, fixtures, and the code they in turn call — is reachable from a non-test seed, so it only exercises code that is itself dead in production. The result is the blast radius of dropping those tests: each dead test plus every decl only dead tests keep alive (a helper a live test also reaches stays put). Requires a test plugin (`--plugin pytest` / `--plugin unittest`) so tests carry the `test/testcase` flag; `dead-cst remove --query dead-tests | git apply` deletes the tests and the dead code they were propping up together.
+
 ### `dead-cst remove`
 
 Emit a unified diff that removes the dead code. The command never touches source files itself — pipe the patch into `git apply` (preferred in a git checkout) or POSIX `patch -p1` (handy when running from a subdirectory or outside git), or write it to a file with `-o` and apply later.
@@ -107,7 +109,7 @@ dead-cst remove ROOT [OPTIONS]
 | Option | Description |
 |---|---|
 | `--graph` | Load a pre-built graph from disk; mutually exclusive with all build inputs |
-| `--query` | Reachability question: `dead` (default) or `test-only` |
+| `--query` | Reachability question: `dead` (default), `test-only`, or `dead-tests` |
 | `-e, --entrypoint` | Entrypoint as a file path or FQN (repeatable) |
 | `--entrypoint-regex` | Entrypoint as a regex (repeatable) |
 | `-p, --path` | Search path spec (repeatable) |
@@ -151,6 +153,13 @@ for node in analysis.dead():
 from dead_cst.graph import NodeFlags
 for node in analysis.kept_alive_by_flags_only(NodeFlags.TESTCASE):
     print(f"test-only: {node.fqname}")
+
+# "Which tests only exercise code that is dead in production?" — the
+# ``dead-cst remove --query dead-tests`` set: those tests plus whatever
+# only they keep alive.
+ctx = analysis.materialize_all()
+for node in ctx.nodes_at(sorted(analysis.dead_tests())):
+    print(f"dead test set: {node.fqname}")
 
 # Rewrite source files to drop every unreachable decl + now-unused import.
 from dead_cst.codemod import remove_code

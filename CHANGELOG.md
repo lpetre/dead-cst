@@ -9,6 +9,24 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+
+- **`--query dead-tests` on `analyze` / `remove`, and `Analysis.dead_tests()`.**
+  The existing `test-only` query answers "what would die without the test
+  suite" and so always includes every test. `dead-tests` answers the inverse:
+  a test is *dead* when nothing it references (transitively, through import
+  aliases, fixtures, and the code they call) is reachable from a non-test
+  seed — it only exercises code that is itself dead in production. The result
+  is the blast radius of dropping those tests: each dead test plus every decl
+  only dead tests keep alive, so `dead-cst remove --query dead-tests | git
+  apply` deletes the tests and the dead code they were propping up in one
+  patch while leaving anything a live test also reaches alone. The per-test
+  walk stops at `module` nodes (importing from a module is not exercising the
+  live functions its body happens to call); module-attribute uses resolve to
+  direct decl edges, so nothing a test actually touches is missed. Needs a
+  test plugin so tests carry `test/testcase`; the CLI warns and reports
+  nothing when none is registered.
+
 ### Fixed
 
 - **Dead-module patches apply cleanly for files without a trailing newline.**
