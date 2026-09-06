@@ -14,6 +14,8 @@ pinning -- compare ``test_declarations`` for the matching declaration
 side.
 """
 
+import os
+import subprocess
 import textwrap
 
 import pytest
@@ -370,6 +372,95 @@ def run_remove_code(tmp_path, build_unreachable_nodes):
             """,
             id="nested-tuple-unpacking-not-pruned-per-name",
         ),
+        pytest.param(
+            """
+            def f(): return 1, 2
+            a, b = f()
+            def keep(): pass
+            """,
+            {"mod.f", "mod.a", "mod.b"},
+            """
+            def keep(): pass
+            """,
+            id="tuple-unpacking-all-dead-removes-statement",
+        ),
+        pytest.param(
+            """
+            def f(): return 1, 2
+            [a, b] = f()
+            def keep(): pass
+            """,
+            {"mod.f", "mod.a", "mod.b"},
+            """
+            def keep(): pass
+            """,
+            id="list-target-unpacking-all-dead-removes-statement",
+        ),
+        pytest.param(
+            """
+            def f(): return (1, 2), 3
+            ((a, b), c) = f()
+            def keep(): pass
+            """,
+            {"mod.f", "mod.a", "mod.b", "mod.c"},
+            """
+            def keep(): pass
+            """,
+            id="nested-tuple-unpacking-all-dead-removes-statement",
+        ),
+        pytest.param(
+            """
+            def f(): return 1, 2, 3
+            head, *rest = f()
+            def keep(): pass
+            """,
+            {"mod.f", "mod.head", "mod.rest"},
+            """
+            def keep(): pass
+            """,
+            id="starred-unpacking-all-dead-removes-statement",
+        ),
+        pytest.param(
+            """
+            def f(): return 1, 2
+            (a,
+             b) = f()
+            def keep(): pass
+            """,
+            {"mod.f", "mod.a", "mod.b"},
+            """
+            def keep(): pass
+            """,
+            id="multiline-tuple-unpacking-all-dead-removes-statement",
+        ),
+        pytest.param(
+            """
+            def f(): return 1, 2
+            a, b = c = f()
+            def keep(): return c
+            """,
+            {"mod.a", "mod.b"},
+            """
+            def f(): return 1, 2
+            c = f()
+            def keep(): return c
+            """,
+            id="chained-assign-drops-fully-dead-tuple-target-only",
+        ),
+        pytest.param(
+            """
+            def f(): return 1, 2, 3
+            head, *rest = f()
+            def keep(): return head
+            """,
+            {"mod.rest"},
+            """
+            def f(): return 1, 2, 3
+            head, *rest = f()
+            def keep(): return head
+            """,
+            id="starred-unpacking-not-pruned-per-name",
+        ),
         # ------------------------------------------------------------------
         # AnnAssign -- with and without value
         # ------------------------------------------------------------------
@@ -710,6 +801,36 @@ _LIB = "def used(): pass\ndef unused(): pass\n"
             """,
             id="dead-type-alias-removed-end-to-end",
         ),
+        pytest.param(
+            {
+                "mod.py": """
+                def f(): return 1, 2
+                a, b = f()
+                def main(): pass
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            def main(): pass
+            """,
+            id="tuple-unpack-of-dead-callee-removed-end-to-end",
+        ),
+        pytest.param(
+            {
+                "mod.py": """
+                def f(): return 1, 2
+                a, b = f()
+                def main(): return a
+                """,
+            },
+            {"mod", "mod.main"},
+            """
+            def f(): return 1, 2
+            a, b = f()
+            def main(): return a
+            """,
+            id="tuple-unpack-with-live-name-kept-end-to-end",
+        ),
     ],
 )
 def test_remove_code_rewrites_imports(run_remove_code, tmp_path, files, entrypoints, expected_mod):
@@ -734,6 +855,41 @@ def test_remove_code_rewrites_imports(run_remove_code, tmp_path, files, entrypoi
             {"kept.py": True, "dropped.py": False},
             id="unreachable-module-file-unlinked",
         ),
+        pytest.param(
+            {
+                "kept.py": "def main(): pass\n",
+                "pkg/__init__.py": "",
+                "pkg/sub.py": "def helper(): pass\n",
+                "pkg/deep/__init__.py": "",
+                "pkg/deep/leaf.py": "def leaf(): pass\n",
+            },
+            {"kept"},
+            {
+                "kept.py": True,
+                "pkg/__init__.py": False,
+                "pkg/sub.py": False,
+                "pkg/deep/leaf.py": False,
+                "pkg/deep": False,
+                "pkg": False,
+            },
+            id="dead-package-directory-tree-removed",
+        ),
+        pytest.param(
+            {
+                "kept.py": "from pkg.live import main\n",
+                "pkg/__init__.py": "",
+                "pkg/live.py": "def main(): pass\n",
+                "pkg/dead.py": "def helper(): pass\n",
+            },
+            {"kept", "kept.main"},
+            {
+                "pkg/__init__.py": True,
+                "pkg/live.py": True,
+                "pkg/dead.py": False,
+                "pkg": True,
+            },
+            id="package-with-live-sibling-kept",
+        ),
     ],
 )
 def test_remove_code_unlinks_dead_module_files(
@@ -741,7 +897,26 @@ def test_remove_code_unlinks_dead_module_files(
 ):
     run_remove_code(files, entrypoints)
     for relpath, should_exist in expected_files.items():
-        assert (tmp_path / relpath).exists() is should_exist
+        assert (tmp_path / relpath).exists() is should_exist, relpath
+    # The analysis root is never pruned, even when everything under it dies.
+    assert tmp_path.is_dir()
+
+
+def test_remove_code_leaves_nonempty_package_dir(run_remove_code, tmp_path):
+    """A stray non-module entry (here ``__pycache__``) stops the directory prune."""
+    (tmp_path / "pkg" / "__pycache__").mkdir(parents=True)
+    (tmp_path / "pkg" / "__pycache__" / "sub.cpython-313.pyc").write_bytes(b"")
+    run_remove_code(
+        {
+            "kept.py": "def main(): pass\n",
+            "pkg/__init__.py": "",
+            "pkg/sub.py": "def helper(): pass\n",
+        },
+        {"kept"},
+    )
+    assert not (tmp_path / "pkg" / "sub.py").exists()
+    assert not (tmp_path / "pkg" / "__init__.py").exists()
+    assert (tmp_path / "pkg" / "__pycache__").is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +964,69 @@ def test_generate_patch_emits_deleted_file_header_for_dead_module(
     assert "deleted file mode 100644" in patch
     assert "+++ /dev/null" in patch
     assert (tmp_path / "dropped.py").exists()
+
+
+def _git_apply_check(root, patch: str) -> None:
+    """Commit ``root`` to a throwaway repo and assert ``git apply --check`` accepts ``patch``."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, env=env)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True, env=env)
+    result = subprocess.run(
+        ["git", "apply", "--check", "-"],
+        cwd=root,
+        input=patch,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_generate_patch_deletes_module_without_trailing_newline(build_unreachable_nodes, tmp_path):
+    """``difflib`` copies a newline-less last line verbatim, which truncates
+    the patch mid-line; git needs the ``\\ No newline`` trailer to parse
+    it (and any hunks that follow it)."""
+    unreachable = build_unreachable_nodes(
+        {
+            "kept.py": "def main(): pass\n",
+            "pkg/__init__.py": "",
+            "pkg/sub.py": "def helper(): pass",
+        },
+        {"kept", "kept.main"},
+    )
+    patch = generate_patch(unreachable, tmp_path)
+
+    assert patch == (
+        "diff --git a/pkg/__init__.py b/pkg/__init__.py\n"
+        "deleted file mode 100644\n"
+        "diff --git a/pkg/sub.py b/pkg/sub.py\n"
+        "deleted file mode 100644\n"
+        "--- a/pkg/sub.py\n"
+        "+++ /dev/null\n"
+        "@@ -1 +0,0 @@\n"
+        "-def helper(): pass\n"
+        "\\ No newline at end of file\n"
+    )
+    _git_apply_check(tmp_path, patch)
+
+
+def test_generate_patch_rewrites_module_without_trailing_newline(build_unreachable_nodes, tmp_path):
+    unreachable = build_unreachable_nodes(
+        {"mod.py": "def used(): pass\ndef dead(): pass\nused()"},
+        {"mod.used"},
+    )
+    patch = generate_patch(unreachable, tmp_path)
+
+    assert "-def dead(): pass\n" in patch
+    assert patch.endswith(" used()\n\\ No newline at end of file\n")
+    _git_apply_check(tmp_path, patch)
 
 
 def test_generate_patch_per_subgraph_slice_isolates_decls(build_unreachable_nodes, tmp_path):

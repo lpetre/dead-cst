@@ -9,6 +9,22 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dead-module patches apply cleanly for files without a trailing newline.**
+  `generate_patch` (and so `dead-cst remove`) copied a newline-less last line
+  into the diff verbatim, so `git apply` rejected the patch as corrupt -- or,
+  when another file's hunks followed, misparsed them. Deletion and rewrite
+  hunks now carry git's `\ No newline at end of file` trailer.
+- **`remove_code` prunes directories a dead package leaves empty**, matching
+  what `git apply` does for the equivalent patch. A directory with any other
+  entry (a live sibling, `__pycache__`) is left alone, as is the root.
+- **A tuple / list unpack whose every name is dead is removed as a unit.**
+  `a, b = f()` with `f` dead used to survive the codemod while `def f` was
+  deleted, leaving a `NameError` at import time. `RemoveDeadSymbols` now drops
+  a `Tuple` / `List` assignment target (nested and starred included) when all
+  of its bound names are dead; a partially-live unpack still stays intact.
+
 ## [0.15.0] - 2026-09-06
 
 ### Added
