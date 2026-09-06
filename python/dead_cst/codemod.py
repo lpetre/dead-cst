@@ -44,10 +44,29 @@ class RemoveDeadSymbols(cst.CSTTransformer):
             return cst.RemoveFromParent()
         return updated_node
 
+    def _target_is_dead(self, target: cst.BaseExpression) -> bool:
+        """Whether an assignment target can be dropped as a unit.
+
+        A bare name is dead when the graph says so. A ``Tuple`` / ``List``
+        unpacking target is dead only when *every* name it binds is dead
+        (``a, b = f()`` with ``f`` -- and so ``a`` and ``b`` -- dead);
+        a partially-live unpack stays intact because the RHS arity is not
+        ours to change. Starred elements (``*rest``) bind a name like any
+        other. An empty tuple binds nothing and is never dead.
+        """
+        if isinstance(target, (cst.Tuple, cst.List)):
+            if not target.elements:
+                return False
+            return all(
+                isinstance(el, (cst.Element, cst.StarredElement)) and self._target_is_dead(el.value)
+                for el in target.elements
+            )
+        return self._should_remove(target)
+
     def leave_Assign(self, original_node: cst.Assign, updated_node: cst.Assign):
         new_targets = []
         for orig_target, new_target in zip(original_node.targets, updated_node.targets):
-            if not self._should_remove(orig_target.target):
+            if not self._target_is_dead(orig_target.target):
                 new_targets.append(new_target)
 
         if not new_targets:
@@ -85,6 +104,30 @@ def _import_remove_args(node: SymbolNode) -> tuple[str, str | None, str | None]:
     natural = obj if obj is not None else module.split(".", 1)[0]
     asname = bound if bound != natural else None
     return module, obj, asname
+
+
+def _unified_diff(a: str, b: str, fromfile: str, tofile: str) -> str:
+    """``difflib.unified_diff`` in the dialect ``git apply`` accepts.
+
+    ``difflib`` copies a final line that lacks a trailing newline into
+    the diff verbatim, so the patch ends mid-line and ``git apply``
+    rejects it (``corrupt patch``) or, when another file's hunks follow,
+    misparses the preimage. Git marks such lines with a
+    ``\\ No newline at end of file`` trailer; emit the same so files
+    without a trailing newline -- a dead module being deleted, or a
+    rewritten one -- round-trip through ``git apply``.
+    """
+    out: list[str] = []
+    for line in difflib.unified_diff(
+        a.splitlines(keepends=True),
+        b.splitlines(keepends=True),
+        fromfile=fromfile,
+        tofile=tofile,
+    ):
+        out.append(line)
+        if not line.endswith("\n"):
+            out.append("\n\\ No newline at end of file\n")
+    return "".join(out)
 
 
 def _select_files(
@@ -154,10 +197,28 @@ def _rewrite_one(wrapper, nodes: list[SymbolNode]) -> tuple[str, str]:
     return original, result.code
 
 
+def _prune_empty_dirs(directory: Path, stop: Path) -> None:
+    """Remove ``directory`` and its ancestors below ``stop`` once they are empty.
+
+    Deleting every module of a dead package would otherwise leave its
+    directory behind as an empty (namespace) package -- ``git apply`` of
+    the equivalent patch drops the directory, so the destructive path
+    matches. ``stop`` itself is never removed, and a directory with any
+    remaining entry (a live sibling, ``__pycache__``, ...) ends the walk.
+    """
+    while directory != stop and directory.is_relative_to(stop):
+        try:
+            directory.rmdir()
+        except OSError:
+            return
+        directory = directory.parent
+
+
 def remove_code(dead_nodes: Iterable[SymbolNode], package_path: Path) -> None:
     """Delete every node in ``dead_nodes`` from the source files under ``package_path``.
 
-    Modules are removed by unlinking the file. Functions, classes, and
+    Modules are removed by unlinking the file (and any directory that is
+    left empty, so a dead package disappears whole). Functions, classes, and
     top-level variables are dropped by a LibCST transformer matching on
     ``(fqname, position)`` so a shadowed dead binding does not drag its
     live sibling out with it. Surviving statements, comments, and
@@ -179,6 +240,7 @@ def remove_code(dead_nodes: Iterable[SymbolNode], package_path: Path) -> None:
 
     for path in deleted_modules:
         path.unlink()
+        _prune_empty_dirs(path.parent, package_path)
 
     if not by_file:
         return
@@ -224,15 +286,7 @@ def generate_patch(dead_nodes: Iterable[SymbolNode], root: Path) -> str:
 
     for path in sorted(deleted_modules):
         rel = path.relative_to(root).as_posix()
-        original = path.read_text().splitlines(keepends=True)
-        body = "".join(
-            difflib.unified_diff(
-                original,
-                [],
-                fromfile=f"a/{rel}",
-                tofile="/dev/null",
-            )
-        )
+        body = _unified_diff(path.read_text(), "", f"a/{rel}", "/dev/null")
         chunks.append(f"diff --git a/{rel} b/{rel}\ndeleted file mode 100644\n{body}")
 
     if by_file:
@@ -245,14 +299,7 @@ def generate_patch(dead_nodes: Iterable[SymbolNode], root: Path) -> str:
             if new == original:
                 continue
             rel = path.relative_to(root).as_posix()
-            body = "".join(
-                difflib.unified_diff(
-                    original.splitlines(keepends=True),
-                    new.splitlines(keepends=True),
-                    fromfile=f"a/{rel}",
-                    tofile=f"b/{rel}",
-                )
-            )
+            body = _unified_diff(original, new, f"a/{rel}", f"b/{rel}")
             chunks.append(f"diff --git a/{rel} b/{rel}\n{body}")
 
     return "".join(chunks)
