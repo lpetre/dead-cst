@@ -216,12 +216,6 @@ pub(crate) struct BuildOutputs {
     /// input through the same resolver (`locate_member_seed`) so every
     /// spelling of one decorator lands on the same key.
     pub(crate) decorated_by_target: FxHashMap<(File, (u32, u32)), DecoratedRows>,
-    /// The textual fallback for the same rows: every decorator spec keyed
-    /// by its symbolic `module.name` (or the local decl's fqname), whether
-    /// or not it resolved. Lets a query match a decorator whose module
-    /// isn't installed (or isn't a module at all, `pytest.mark.parametrize`)
-    /// exactly as the old import-syntax matcher did.
-    pub(crate) decorated_by_text: FxHashMap<CompactString, DecoratedRows>,
     /// Per-file plugin facts, keyed by topic **name** (the salsa-stable key the
     /// per-file side emits under — see [`crate::native_plugins::FileLocalOp`]).
     /// Collected from every file's `per_file_plugin_ops` in `assemble_graph`,
@@ -754,14 +748,10 @@ pub(crate) fn build_project_graph(
         &resolve_cache.class_base_memo,
         &assemble_dir_ids,
     );
-    let DecoratorIndices {
-        decorated_by_target,
-        decorated_by_text,
-    } = build_decorator_indices(
+    let decorated_by_target = build_decorator_indices(
         db,
         &project_files,
         &decl_by_name_range,
-        &builder.nodes,
         &resolve_cache.class_base_memo,
         &assemble_dir_ids,
     );
@@ -818,7 +808,6 @@ pub(crate) fn build_project_graph(
         children_by_node,
         external_base_children,
         decorated_by_target,
-        decorated_by_text,
         children_by_parent,
         topic_facts,
         reload_log,
@@ -2808,31 +2797,22 @@ fn build_class_hierarchy_indices(
     }
 }
 
-/// Project-wide decorator indices produced in a single pass over the
-/// per-file `decorators` payloads by [`build_decorator_indices`].
-pub(crate) struct DecoratorIndices {
-    pub(crate) decorated_by_target: FxHashMap<(File, (u32, u32)), DecoratedRows>,
-    pub(crate) decorated_by_text: FxHashMap<CompactString, DecoratedRows>,
-}
-
 /// Fold every file's per-file `decorators` payload (see
 /// [`crate::file_payload::FileNodes::decorators`]) into the project-wide
-/// decorator indices — the decorator twin of
+/// `decorated_by_target` index — the decorator twin of
 /// [`build_class_hierarchy_indices`]. A `Local` target resolves inline to
 /// its own `(file, range)`; a `ModuleMember` reads the
-/// `MemberKinds::CALLABLE` memo entry the resolve arm filled. Every spec
-/// is *also* recorded under its textual `module.name` (a local decl under
-/// its fqname) so an unresolvable target still matches by string.
+/// `MemberKinds::CALLABLE` memo entry the resolve arm filled. A spec
+/// whose target did not resolve is dropped: with no definition to key
+/// on, no fqname query can name it.
 fn build_decorator_indices(
     db: &ProjectDatabase,
     project_files: &[File],
     decl_by_name_range: &FxHashMap<(File, (u32, u32)), usize>,
-    nodes: &[crate::builder::GraphNode],
     class_base_memo: &ClassBaseMemo,
     dir_ids: &[u32],
-) -> DecoratorIndices {
+) -> FxHashMap<(File, (u32, u32)), DecoratedRows> {
     let mut by_target: FxHashMap<(File, (u32, u32)), DecoratedRows> = FxHashMap::default();
-    let mut by_text: FxHashMap<CompactString, DecoratedRows> = FxHashMap::default();
     for (pos, &file) in project_files.iter().enumerate() {
         let payload = file_to_nodes(db, file);
         let dir = dir_ids[pos];
@@ -2841,42 +2821,30 @@ fn build_decorator_indices(
                 continue;
             };
             for spec in specs.iter() {
-                let row = (decl_idx, spec.kwargs.clone());
-                match &spec.target {
-                    MemberSpec::Local(rk) => {
-                        by_target.entry((file, *rk)).or_default().push(row.clone());
-                        if let Some(&target_idx) = decl_by_name_range.get(&(file, *rk)) {
-                            by_text
-                                .entry(CompactString::from(nodes[target_idx].fqname.as_str()))
-                                .or_default()
-                                .push(row);
-                        }
-                    }
+                let key = match &spec.target {
+                    MemberSpec::Local(rk) => (file, *rk),
                     MemberSpec::ModuleMember { module, name } => {
-                        if let Some(Some((target_file, target_range))) = class_base_memo.get(&(
+                        match class_base_memo.get(&(
                             module.clone(),
                             name.clone(),
                             dir,
                             MemberKinds::CALLABLE,
                         )) {
-                            by_target
-                                .entry((*target_file, range_key(*target_range)))
-                                .or_default()
-                                .push(row.clone());
+                            Some(Some((target_file, target_range))) => {
+                                (*target_file, range_key(*target_range))
+                            }
+                            _ => continue,
                         }
-                        by_text
-                            .entry(compact_str::format_compact!("{module}.{name}"))
-                            .or_default()
-                            .push(row);
                     }
-                }
+                };
+                by_target
+                    .entry(key)
+                    .or_default()
+                    .push((decl_idx, spec.kwargs.clone()));
             }
         }
     }
-    DecoratorIndices {
-        decorated_by_target: by_target,
-        decorated_by_text: by_text,
-    }
+    by_target
 }
 
 /// Pre-build the fqname -> idx maps used by ``find_declarations``,
@@ -4962,9 +4930,8 @@ fn transitive_subclasses_via_index(
 /// fqname is resolved through [`locate_member_seed`] to the definition it
 /// names and looked up in `decorated_by_target`, so every spelling of
 /// that decorator (direct, aliased, re-exported, sibling-module,
-/// same-file) matches; the textual `decorated_by_text` lookup covers
-/// targets that don't resolve (uninstalled dependency, non-module
-/// attribute). One row per decl, first matching decorator's kwargs.
+/// same-file) matches. An fqname that does not resolve matches nothing.
+/// One row per decl, first matching decorator's kwargs.
 fn find_decorated_decls_core(
     db: ProjectDatabase,
     outputs: &BuildOutputs,
@@ -4973,7 +4940,14 @@ fn find_decorated_decls_core(
 ) -> Vec<(usize, CallArgs)> {
     let mut seen: FxHashSet<usize> = FxHashSet::default();
     let mut out: Vec<(usize, CallArgs)> = Vec::new();
-    let mut take = |rows: &[(usize, CallArgs)]| {
+    for fqn in fqnames {
+        let Some((file, range)) = locate_member_seed(&db, outputs, fqn, MemberKinds::CALLABLE)
+        else {
+            continue;
+        };
+        let Some(rows) = outputs.decorated_by_target.get(&(file, range_key(range))) else {
+            continue;
+        };
         for (idx, args) in rows {
             if seen.insert(*idx) {
                 let args = if extract_args {
@@ -4983,16 +4957,6 @@ fn find_decorated_decls_core(
                 };
                 out.push((*idx, args));
             }
-        }
-    };
-    for fqn in fqnames {
-        if let Some((file, range)) = locate_member_seed(&db, outputs, fqn, MemberKinds::CALLABLE) {
-            if let Some(rows) = outputs.decorated_by_target.get(&(file, range_key(range))) {
-                take(rows);
-            }
-        }
-        if let Some(rows) = outputs.decorated_by_text.get(fqn.as_str()) {
-            take(rows);
         }
     }
     out.sort_unstable_by_key(|(idx, _)| *idx);

@@ -181,7 +181,8 @@ pub(crate) fn locate_class_seed(
 /// spec (or any re-exported / aliased spelling of it) was recorded
 /// under. `kinds` selects which definition kinds may terminate the
 /// resolution. `None` when nothing resolves (an uninstalled dependency,
-/// a member of a non-module such as `pytest.mark.parametrize`).
+/// a member of a non-module such as `pytest.mark.parametrize`, so the
+/// dependency must be importable from the analysis environment).
 pub(crate) fn locate_member_seed(
     db: &ProjectDatabase,
     outputs: &BuildOutputs,
@@ -207,15 +208,16 @@ pub(crate) fn locate_member_seed(
 }
 
 /// Which definition kinds a member resolution may terminate on. Class
-/// bases accept classes only; decorator targets accept classes *and*
-/// functions. Part of the resolve-memo key, so the two never share an
-/// entry.
+/// bases accept classes only; decorator targets accept classes,
+/// functions, and variables (a module-level `deco = Deco(...)` whose
+/// value can't be followed any further *is* the decorator's definition).
+/// Part of the resolve-memo key, so the two never share an entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MemberKinds(u8);
 
 impl MemberKinds {
     pub(crate) const CLASS: MemberKinds = MemberKinds(1);
-    pub(crate) const CALLABLE: MemberKinds = MemberKinds(1 | 2);
+    pub(crate) const CALLABLE: MemberKinds = MemberKinds(1 | 2 | 4);
 
     pub(crate) fn accepts_class(self) -> bool {
         self.0 & 1 != 0
@@ -223,6 +225,10 @@ impl MemberKinds {
 
     pub(crate) fn accepts_function(self) -> bool {
         self.0 & 2 != 0
+    }
+
+    pub(crate) fn accepts_variable(self) -> bool {
+        self.0 & 4 != 0
     }
 }
 
@@ -299,15 +305,13 @@ pub(crate) fn classify_base(
 /// [`MemberSpec`] using only `file`'s own use-def chain — the decorator
 /// twin of [`classify_base`], accepting functions as well as classes:
 ///
-/// * a bare name bound to a same-file `def` / `class` → `Local(range)`;
+/// * a bare name bound to a same-file `def` / `class`, or to a same-file
+///   variable whose value can't be followed (`deco = Deco(...)`) →
+///   `Local(range)`;
 /// * a bare name bound by `from M import n` / `from M import *` / a
 ///   same-file alias of one → `ModuleMember { M, n }`;
 /// * `mod.deco` / `pkg.mod.deco` / `alias.deco` on an imported module →
-///   `ModuleMember` via the file's imports;
-/// * any other bare name bound in this file's global scope (a variable
-///   holding a decorator instance, say) → `ModuleMember` of *this*
-///   file's module, so the project-wide query still matches it by fqname
-///   once resolution gives up and falls back to text.
+///   `ModuleMember` via the file's imports.
 ///
 /// `None` for builtins / unbound names and for decorators whose head is
 /// not a module member at all (`@app.route` on an instance — those are
@@ -316,26 +320,16 @@ pub(crate) fn classify_decorator_head(
     db: &dyn ProjectDb,
     file: File,
     parsed: &ParsedModuleRef,
-    own_module: &str,
     expr: &Expr,
 ) -> Option<MemberSpec> {
     let expr = unwrap_subscripted_callee(expr);
     match expr {
         Expr::Name(name) => {
             let symbol = name.id.as_str();
-            let defs = local_member_defs(db, file, symbol);
-            if defs.is_empty() {
-                return None;
-            }
-            defs.into_iter()
+            local_member_defs(db, file, symbol)
+                .into_iter()
                 .find_map(|def| {
                     classify_name_def(db, file, parsed, def, symbol, 0, MemberKinds::CALLABLE)
-                })
-                .or_else(|| {
-                    Some(MemberSpec::ModuleMember {
-                        module: own_module.to_compact_string(),
-                        name: symbol.to_compact_string(),
-                    })
                 })
         }
         Expr::Attribute(_) => attribute_to_module_member(db, file, parsed, expr)
@@ -384,11 +378,23 @@ fn classify_name_def<'db>(
                 name: name.to_compact_string(),
             })
         }
+        // An assignment is followed through its value (`Alias = Real`);
+        // when the value leads nowhere and variables are acceptable, the
+        // assignment itself is the definition (`deco = Deco(...)`).
         DefinitionKind::Assignment(assign) => {
-            classify_base(db, file, parsed, assign.value(parsed), depth + 1, kinds)
+            classify_base(db, file, parsed, assign.value(parsed), depth + 1, kinds).or_else(|| {
+                kinds
+                    .accepts_variable()
+                    .then(|| MemberSpec::Local(range_key(assign.target(parsed).range())))
+            })
         }
         DefinitionKind::AnnotatedAssignment(assign) => {
-            classify_base(db, file, parsed, assign.value(parsed)?, depth + 1, kinds)
+            let value = assign.value(parsed)?;
+            classify_base(db, file, parsed, value, depth + 1, kinds).or_else(|| {
+                kinds
+                    .accepts_variable()
+                    .then(|| MemberSpec::Local(range_key(assign.target(parsed).range())))
+            })
         }
         _ => None,
     }

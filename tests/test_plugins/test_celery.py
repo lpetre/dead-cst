@@ -278,6 +278,27 @@ _SHARED_TASK_SPELLINGS: list[tuple[str, dict[str, str]]] = [
         },
     ),
     (
+        "first-party-decorator-bound-to-a-variable",
+        {
+            "celery/__init__.py": """
+            def _make():
+                def deco(f):
+                    return f
+                return deco
+
+            shared_task = _make()
+            """,
+            "app.py": """
+            from celery import shared_task
+
+            @shared_task
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
         "builder-chain-on-head-call",
         {
             "app.py": """

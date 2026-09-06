@@ -2089,11 +2089,11 @@ pub mod plugin_api {
         /// alias, a re-export through a package `__init__`, a sibling
         /// module, `from X import *`, or a definition in the decorated
         /// decl's own file. A builder chain on the decorator
-        /// (`@launchable().cpus(16)`) is classified by its head call. A
-        /// decorator whose target can't be resolved (dependency not
-        /// installed, or not a module member such as
-        /// `pytest.mark.parametrize`) still matches by its textual
-        /// `module.name`.
+        /// (`@launchable().cpus(16)`) is classified by its head call. Each
+        /// fqname must name a module member resolvable from the analysis
+        /// environment (an installed dependency or a project module); one
+        /// that does not resolve — or is not a module member at all, such
+        /// as `pytest.mark.parametrize` — matches nothing.
         pub fn decorated_decls(&self, fqnames: &[&str]) -> Vec<usize> {
             let owned: Vec<String> = fqnames.iter().map(|f| f.to_string()).collect();
             self.inner

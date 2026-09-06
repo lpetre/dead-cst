@@ -838,7 +838,7 @@ fn build_decorator_specs(
         let mut specs: SmallVec<[DecoratorSpec; 2]> = SmallVec::new();
         for dec in decorators {
             let (head, call) = decorator_head(&dec.expression);
-            let Some(target) = classify_decorator_head(db, file, parsed, own_module, head) else {
+            let Some(target) = classify_decorator_head(db, file, parsed, head) else {
                 continue;
             };
             let kwargs = call

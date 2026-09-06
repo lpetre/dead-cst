@@ -53,10 +53,12 @@ two versions.
   `MemberSpec` (like class bases) and resolved at assembly, so every spelling
   of one decorator matches: a direct import, an alias, a re-export through a
   package `__init__`, a sibling-module spelling, `from X import *`, and a
-  definition in the decorated decl's own file. A target that does not resolve
-  (dependency not installed, or not a module member such as
-  `pytest.mark.parametrize`) still matches by its textual `module.name`, so
-  nothing the old import-syntax matcher found is lost. The per-file twin runs
+  definition in the decorated decl's own file, including a decorator bound to
+  a module-level variable (`launchable = Launchable(...)`). Matching is by
+  resolution only: each fqname must name a module member resolvable from the
+  analysis environment, so a decorator from a dependency that is not
+  installed, or a non-module attribute such as `pytest.mark.parametrize`,
+  matches nothing. The per-file twin runs
   inside the build fan-out before cross-file resolution exists, so it matches
   by spelling after *its own* file's import / alias following (and same-file
   definitions); re-exports through other files need the project-wide query.
