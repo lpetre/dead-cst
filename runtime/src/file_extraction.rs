@@ -32,7 +32,11 @@ use crate::helpers::{
     resolve_relative_import, top_level_assign_to_name, unwrap_subscripted_callee, CallArgs,
     LocalImports, MODULE_ALIAS_MARKER,
 };
-use crate::ingest::{collapse_attribute_chain, file_package_name, string_literal_list};
+use crate::ingest::{collapse_attribute_chain, file_package_name};
+use crate::string_fold::{
+    fold_string_expr, fold_string_list, scope_bound_names, top_level_string_constants,
+    StringFoldCtx,
+};
 
 /// `(name_range_key, value)` pair. The range key matches the `(start,
 /// end)` `u32` pair the assemble pass stores in `decl_by_name_range` /
@@ -260,7 +264,11 @@ struct FactoryCalleeCollector {
 impl<'a> Visitor<'a> for FactoryCalleeCollector {
     fn visit_expr(&mut self, expr: &'a Expr) {
         if let Expr::Call(call) = expr {
-            if let Some(desc) = callee_descriptor(call, /*capture_kwargs=*/ false) {
+            if let Some(desc) = callee_descriptor(
+                call,
+                /*capture_kwargs=*/ false,
+                &StringFoldCtx::LITERAL_ONLY,
+            ) {
                 self.descriptors.push(desc);
             }
         }
@@ -294,14 +302,17 @@ fn collect_factory_row(
 /// config-independent [`CallSiteFact`] instead of matching against a
 /// query's `attr` / imports / owner — the project-wide queries replay the
 /// match at fan-in.
-struct CallSiteCollector {
+struct CallSiteCollector<'c> {
     sites: Vec<CallSiteFact>,
+    /// String-fold context for this subtree (module constants, narrowed by
+    /// the enclosing scope's shadow set).
+    fold: &'c StringFoldCtx<'c>,
 }
 
-impl<'a> Visitor<'a> for CallSiteCollector {
+impl<'a, 'c> Visitor<'a> for CallSiteCollector<'c> {
     fn visit_expr(&mut self, expr: &'a Expr) {
         if let Expr::Call(call) = expr {
-            if let Some(fact) = build_call_site_fact(call) {
+            if let Some(fact) = build_call_site_fact(call, self.fold) {
                 self.sites.push(fact);
             }
         }
@@ -313,10 +324,10 @@ impl<'a> Visitor<'a> for CallSiteCollector {
 /// no string-bearing positional argument — every call-site query captures
 /// such an argument, so a call without one can never produce a result and
 /// is pruned at extraction time.
-fn build_call_site_fact(call: &ExprCall) -> Option<CallSiteFact> {
+fn build_call_site_fact(call: &ExprCall, fold: &StringFoldCtx<'_>) -> Option<CallSiteFact> {
     let mut string_args: SmallVec<[(usize, StringArg); 1]> = SmallVec::new();
     for (i, arg) in call.arguments.args.iter().enumerate() {
-        if let Some(sa) = string_arg(arg) {
+        if let Some(sa) = string_arg(arg, fold) {
             string_args.push((i, sa));
         }
     }
@@ -337,39 +348,37 @@ fn build_call_site_fact(call: &ExprCall) -> Option<CallSiteFact> {
         callee,
         positional_len: call.arguments.args.len(),
         string_args,
-        kwargs: extract_call_kwargs(call),
+        kwargs: extract_call_kwargs(call, fold),
     })
 }
 
 /// Classify a positional argument expression as a string-bearing
-/// [`StringArg`], or `None` when it carries no string literal. Mirrors the
-/// union of `helpers::nth_positional_string` (single literal) and
-/// `helpers::string_or_string_collection` (list/tuple of literals): a
+/// [`StringArg`], or `None` when it carries no static string. Mirrors the
+/// union of `helpers::nth_positional_string` (single string) and
+/// `helpers::string_or_string_collection` (list/tuple of strings): a
 /// list/tuple with no string elements yields `None` (it can never produce
-/// a hit), so the call isn't recorded on its account.
-fn string_arg(expr: &Expr) -> Option<StringArg> {
+/// a hit), so the call isn't recorded on its account. "String" here is
+/// anything [`fold_string_expr`] resolves — literals, concatenation,
+/// f-strings over `__name__` / module constants.
+fn string_arg(expr: &Expr, fold: &StringFoldCtx<'_>) -> Option<StringArg> {
     match expr {
-        Expr::StringLiteral(s) => Some(StringArg::Lit(s.value.to_str().to_compact_string())),
         Expr::List(list) => {
-            let elems = collect_string_elems(&list.elts);
+            let elems = collect_string_elems(&list.elts, fold);
             (!elems.is_empty()).then_some(StringArg::Coll(elems))
         }
         Expr::Tuple(tup) => {
-            let elems = collect_string_elems(&tup.elts);
+            let elems = collect_string_elems(&tup.elts, fold);
             (!elems.is_empty()).then_some(StringArg::Coll(elems))
         }
-        _ => None,
+        other => fold_string_expr(other, fold).map(StringArg::Lit),
     }
 }
 
-/// String-literal elements of a list/tuple, non-string elements dropped —
+/// Static-string elements of a list/tuple, non-string elements dropped —
 /// the collection half of `helpers::string_or_string_collection`.
-fn collect_string_elems(elts: &[Expr]) -> Vec<CompactString> {
+fn collect_string_elems(elts: &[Expr], fold: &StringFoldCtx<'_>) -> Vec<CompactString> {
     elts.iter()
-        .filter_map(|e| match e {
-            Expr::StringLiteral(s) => Some(s.value.to_str().to_compact_string()),
-            _ => None,
-        })
+        .filter_map(|e| fold_string_expr(e, fold))
         .collect()
 }
 
@@ -379,10 +388,22 @@ fn collect_string_elems(elts: &[Expr]) -> Vec<CompactString> {
 /// name-range); every other statement attributes its calls to the module.
 fn collect_call_sites(
     stmt: &Stmt,
+    fold: &StringFoldCtx<'_>,
     by_decl: &mut ByNameRange<Vec<CallSiteFact>>,
     module_sites: &mut Vec<CallSiteFact>,
 ) {
-    let mut collector = CallSiteCollector { sites: Vec::new() };
+    // Inside a `def` / `class`, names bound anywhere in the subtree shadow
+    // the module constants; module-level statements fold unshadowed.
+    let shadowed =
+        matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_)).then(|| scope_bound_names(stmt));
+    let scoped = match &shadowed {
+        Some(set) => fold.with_shadowed(set),
+        None => *fold,
+    };
+    let mut collector = CallSiteCollector {
+        sites: Vec::new(),
+        fold: &scoped,
+    };
     collector.visit_stmt(stmt);
     if collector.sites.is_empty() {
         return;
@@ -425,26 +446,32 @@ fn collapse_callee(expr: &Expr) -> Option<(CompactString, SmallVec<[CompactStrin
 /// first call in the chain, whose kwargs are captured, so a builder
 /// suffix (`@launchable().cpus(16)`) is peeled and matched as
 /// `@launchable()`. Bare decorators (`@route`) carry empty kwargs.
-fn decorator_descriptor(dec: &Decorator) -> Option<CalleeDescriptor> {
+fn decorator_descriptor(dec: &Decorator, fold: &StringFoldCtx<'_>) -> Option<CalleeDescriptor> {
     let (root_expr, call_form) = decorator_head(&dec.expression);
     let (root_name, attrs) = collapse_callee(root_expr)?;
     Some(CalleeDescriptor {
         root_name,
         attrs,
-        kwargs: call_form.map(extract_call_kwargs).unwrap_or_default(),
+        kwargs: call_form
+            .map(|call| extract_call_kwargs(call, fold))
+            .unwrap_or_default(),
     })
 }
 
 /// Peel a call expression's callee to a [`CalleeDescriptor`]. When
 /// `capture_kwargs` is false the descriptor's `kwargs` is left empty (the
 /// factory walk never reads them, so we skip the work and the alloc).
-fn callee_descriptor(call: &ExprCall, capture_kwargs: bool) -> Option<CalleeDescriptor> {
+fn callee_descriptor(
+    call: &ExprCall,
+    capture_kwargs: bool,
+    fold: &StringFoldCtx<'_>,
+) -> Option<CalleeDescriptor> {
     let (root_name, attrs) = collapse_callee(call.func.as_ref())?;
     Some(CalleeDescriptor {
         root_name,
         attrs,
         kwargs: if capture_kwargs {
-            extract_call_kwargs(call)
+            extract_call_kwargs(call, fold)
         } else {
             CallArgs::default()
         },
@@ -479,10 +506,19 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
     // Enclosing package, used to resolve relative `from` imports to
     // absolute modules so the stored facts are relativity-free.
     let file_package = file_package_name(db, file);
+    // String-fold context: this file's `__name__` plus its top-level
+    // single-binding string constants (see `string_fold`).
+    let module_name = crate::helpers::module_fqname_for_file(db, file);
+    let constants = top_level_string_constants(&parsed.syntax().body, Some(module_name.as_str()));
+    let fold = StringFoldCtx {
+        module_name: Some(module_name.as_str()),
+        constants: Some(&constants),
+        shadowed: None,
+    };
 
     for stmt in &parsed.syntax().body {
         class_defs.visit_stmt(stmt);
-        collect_call_sites(stmt, &mut call_sites_by_decl, &mut module_call_sites);
+        collect_call_sites(stmt, &fold, &mut call_sites_by_decl, &mut module_call_sites);
         match stmt {
             Stmt::FunctionDef(func) => {
                 let names: Vec<CompactString> = param_names(&func.parameters)
@@ -492,7 +528,7 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                 let descriptors: Vec<CalleeDescriptor> = func
                     .decorator_list
                     .iter()
-                    .filter_map(decorator_descriptor)
+                    .filter_map(|dec| decorator_descriptor(dec, &fold))
                     .collect();
                 if !descriptors.is_empty() {
                     decorator_rows.push((range_key(func.name.range()), descriptors));
@@ -519,7 +555,7 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                 let descriptors: Vec<CalleeDescriptor> = cls
                     .decorator_list
                     .iter()
-                    .filter_map(decorator_descriptor)
+                    .filter_map(|dec| decorator_descriptor(dec, &fold))
                     .collect();
                 if !descriptors.is_empty() {
                     decorator_rows.push((range_key(cls.name.range()), descriptors));
@@ -572,15 +608,17 @@ pub(crate) fn file_extraction(db: &dyn ProjectDb, file: File) -> FileExtraction 
                 let Some((target_range, value)) = top_level_assign_to_name(stmt) else {
                     continue;
                 };
-                if let Some(entries) = string_literal_list(value) {
+                if let Some(entries) = fold_string_list(value, &fold) {
                     let name = CompactString::from(
                         &source[target_range.start().to_usize()..target_range.end().to_usize()],
                     );
-                    literal_list_rows.push((name, entries.into_iter().map(Into::into).collect()));
+                    literal_list_rows.push((name, entries));
                 } else if let Expr::Call(call) = value {
                     // `NAME = <callee>(...)` — record the callee descriptor so
                     // `find_instance_constructions` can resolve it at fan-in.
-                    if let Some(desc) = callee_descriptor(call, /*capture_kwargs=*/ true) {
+                    if let Some(desc) =
+                        callee_descriptor(call, /*capture_kwargs=*/ true, &fold)
+                    {
                         construction_rows.push((range_key(target_range), desc));
                     }
                 }

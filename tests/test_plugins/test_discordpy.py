@@ -249,7 +249,11 @@ def test_discordpy_plugin_load_extension_pulls_target_module(build_plugin_graph,
     assert "app.cogs.misc.misc_helper" in reached
 
 
-def test_discordpy_plugin_load_extension_non_literal_dropped(build_plugin_graph, reachable_fqnames):
+def test_discordpy_plugin_load_extension_module_constant_resolves(
+    build_plugin_graph, reachable_fqnames
+):
+    """A module-level string constant folds (see ``string_fold``), so
+    ``load_extension(EXT_NAME)`` keeps the cog alive like a literal would."""
     graph = build_plugin_graph(
         {
             "app/__init__.py": "",
@@ -262,6 +266,29 @@ def test_discordpy_plugin_load_extension_non_literal_dropped(build_plugin_graph,
 
             async def main():
                 await bot.load_extension(EXT_NAME)
+            """,
+            "app/cogs/__init__.py": "",
+            "app/cogs/dynamic.py": """
+            def setup(bot):
+                pass
+            """,
+        },
+        [native.NativePlugin.discordpy()],
+    )
+    assert "app.cogs.dynamic.setup" in reachable_fqnames(graph)
+
+
+def test_discordpy_plugin_load_extension_non_literal_dropped(build_plugin_graph, reachable_fqnames):
+    graph = build_plugin_graph(
+        {
+            "app/__init__.py": "",
+            "app/main.py": """
+            from discord.ext import commands
+
+            bot = commands.Bot(command_prefix="!")
+
+            async def main(ext_name: str):
+                await bot.load_extension(ext_name)
             """,
             "app/cogs/__init__.py": "",
             "app/cogs/dynamic.py": """

@@ -34,6 +34,7 @@ use crate::ingest::{
     collapse_attribute_chain, dynamic_call_module, from_module_string, peel_value_chain,
 };
 use crate::project::BuildOutputs;
+use crate::string_fold::{fold_string_expr, StringFoldCtx};
 
 /// Sentinel value stored in a file's local imports map (the value half
 /// of ``{local_name: target}`` returned by
@@ -1171,18 +1172,22 @@ impl NodeAttrs {
     }
 }
 
-/// Convert one AST argument expression to an ``ArgValue``. Only string
-/// literals are captured; every other expression is ``Unknown``.
-pub(crate) fn extract_arg_value(expr: &Expr) -> ArgValue {
-    match expr {
-        Expr::StringLiteral(s) => ArgValue::Str(s.value.to_str().to_compact_string()),
-        _ => ArgValue::Unknown,
+/// Convert one AST argument expression to an ``ArgValue``. Anything that
+/// folds to a static string under `ctx` (see [`crate::string_fold`]) is
+/// captured; every other expression is ``Unknown``.
+pub(crate) fn extract_arg_value(expr: &Expr, ctx: &StringFoldCtx<'_>) -> ArgValue {
+    match fold_string_expr(expr, ctx) {
+        Some(s) => ArgValue::Str(s),
+        None => ArgValue::Unknown,
     }
 }
 
 /// Extract keyword arguments from a call. Positional args are not
 /// captured — no consumer reads them.
-pub(crate) fn extract_call_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs {
+pub(crate) fn extract_call_kwargs(
+    call: &ruff_python_ast::ExprCall,
+    ctx: &StringFoldCtx<'_>,
+) -> CallArgs {
     let mut kwargs: FxHashMap<CompactString, ArgValue> = FxHashMap::default();
     for kw in &call.arguments.keywords {
         let Some(name) = kw.arg.as_ref() else {
@@ -1190,7 +1195,7 @@ pub(crate) fn extract_call_kwargs(call: &ruff_python_ast::ExprCall) -> CallArgs 
         };
         kwargs.insert(
             name.as_str().to_compact_string(),
-            extract_arg_value(&kw.value),
+            extract_arg_value(&kw.value, ctx),
         );
     }
     CallArgs { kwargs }

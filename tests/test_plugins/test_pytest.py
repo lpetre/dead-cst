@@ -590,3 +590,32 @@ def test_pytest_plugin_reads_kwargs_from_head_call_of_builder_chain(build_plugin
     edges = [(s, d) for (s, d, _) in graph.edges()]
     assert (by_fqname["tests.test_x.test_uses"], fixture_idx) in edges
     assert (by_fqname["tests.test_x.test_decoy"], fixture_idx) not in edges
+
+
+def test_pytest_plugin_folds_f_string_fixture_name(build_plugin_graph):
+    """``decorated_decls_with_args`` folds a ``name=`` kwarg built from a
+    module constant, so ``@fixture(name=f"{PREFIX}_conn")`` publishes
+    ``db_conn`` and the ``test -> fixture`` edge lands."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/fixtures.py": """
+            from pytest import fixture
+
+            PREFIX = "db"
+
+            @fixture(name=f"{PREFIX}_conn")
+            def underlying():
+                return 4
+            """,
+            "tests/test_x.py": """
+            def test_uses(db_conn):
+                assert db_conn == 4
+            """,
+        },
+        [native.NativePlugin.pytest()],
+    )
+    nodes = graph.nodes()
+    by_fqname = {n.fqname: i for i, n in enumerate(nodes)}
+    edges = [(s, d) for (s, d, _) in graph.edges()]
+    assert (by_fqname["tests.test_x.test_uses"], by_fqname["tests.fixtures.underlying"]) in edges

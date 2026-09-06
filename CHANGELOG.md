@@ -9,6 +9,25 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin-query string arguments are constant-folded.** Every string a
+  plugin query captures — `mock.patch` / `mocker.patch` / `monkeypatch`
+  targets, `calls_with_string_arg` / `calls_on_attr` / `calls_on_var`
+  literals, decorator and constructor kwargs (`decorated_decls_with_args`,
+  pytest `fixture(name=...)`), and `NAME = [...]` literal lists — now accepts
+  anything that folds to a static string, not just a bare literal: implicit
+  concatenation, `"a" + "b"`, f-strings, the file's own `__name__`
+  (`patch(f"{__name__}.helper")`), and top-level names bound exactly once to
+  a foldable string in the same file (`MODULE = "pkg.lib"` then
+  `patch(f"{MODULE}.helper")`, including constants built from other
+  constants). Folding is conservative: an interpolation with `!r` / `!a`, a
+  non-empty format spec, or `=` debug text is refused; a constant rebound at
+  module level, named in any `global` statement, or shadowed by any binding
+  in the enclosing `def` / `class` (parameters included) is never used; and
+  constants imported from other files are not followed. See
+  `runtime/src/string_fold.rs`.
+
 ### Performance
 
 - **Speculative submodule probes skip single-file parents.** Reference

@@ -177,6 +177,15 @@ indices. `CallArgs` / `ArgValue` (the captured decorator/constructor kwargs
 returned by `decorated_decls_with_args`) are re-exported from `plugin_api`;
 read a keyword via `CallArgs::str_value(name)`.
 
+Every string these queries hand back (positional string args, `CallArgs`
+kwargs, literal-list elements) is **constant-folded** at extraction time: a
+bare literal, implicit concatenation, `"a" + "b"`, an f-string whose
+interpolations fold, the file's own `__name__`, and top-level names bound
+exactly once to a foldable string in the same file all read as the resulting
+string. Anything else (a call, an imported name, `!r`, a format spec, a name
+shadowed in the enclosing `def` / `class`) is unknown, exactly as a non-literal
+always was. The rules live in `runtime/src/string_fold.rs`.
+
 `PluginOps` — emit ops (each maps to one host `PreparedOp`):
 
 | method | host op | what |

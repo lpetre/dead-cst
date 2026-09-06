@@ -102,6 +102,89 @@ _RECOGNIZED_FORMS: list[tuple[str, str]] = [
             monkeypatch.delattr("pkg.lib.helper")
         """,
     ),
+    # -- statically foldable string targets (see runtime/src/string_fold.rs)
+    (
+        "f-string-without-placeholders",
+        """
+        from unittest.mock import patch
+
+        @patch(f"pkg.lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "implicit-concatenation",
+        """
+        from unittest.mock import patch
+
+        @patch("pkg." "lib.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "string-addition",
+        """
+        from unittest.mock import patch
+
+        @patch("pkg.lib" + ".helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "f-string-over-module-constant",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        @patch(f"{MODULE}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "f-string-over-chained-constants",
+        """
+        from unittest.mock import patch
+
+        PKG = "pkg"
+        MODULE = f"{PKG}.lib"
+
+        @patch(f"{MODULE}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "constant-declared-after-use",
+        """
+        from unittest.mock import patch
+
+        @patch(f"{MODULE}.helper")
+        def test_helper(_): pass
+
+        MODULE = "pkg.lib"
+        """,
+    ),
+    (
+        "constant-plus-literal-in-with-block",
+        """
+        from unittest.mock import patch
+
+        MODULE: str = "pkg.lib"
+
+        def test_helper():
+            with patch(MODULE + ".helper") as m:
+                m.return_value = 2
+        """,
+    ),
+    (
+        "mocker-f-string-over-constant",
+        """
+        MODULE = "pkg.lib"
+
+        def test_helper(mocker):
+            mocker.patch(f"{MODULE}.helper")
+        """,
+    ),
 ]
 
 
@@ -361,3 +444,172 @@ def test_mock_patch_loads_via_cli_loader():
     plugin = _load_plugin("mock_patch")
     assert isinstance(plugin, native.NativePlugin)
     assert plugin.name == "MockPatchPlugin"
+
+
+def test_f_string_over_dunder_name_folds_to_the_test_module(build_plugin_graph, reachable_fqnames):
+    """``patch(f"{__name__}.helper")`` folds ``__name__`` to the file's own
+    module name, so the target resolves to ``tests.test_lib.helper``."""
+    graph = build_plugin_graph(
+        {
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            from unittest.mock import patch
+
+            def helper(): return 1
+
+            def unpatched(): return 2
+
+            @patch(f"{__name__}.helper")
+            def test_helper(_): pass
+            """,
+        },
+        [native.NativePlugin.mock_patch(), native.NativePlugin.pytest()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "tests.test_lib.helper" in reached
+    assert "tests.test_lib.unpatched" not in reached
+
+
+# Each entry is a ``tests/test_lib.py`` body whose patch target must *not*
+# fold: ``pkg.lib.helper`` stays dead because the string is genuinely
+# unknown to static analysis and a wrong fold would fabricate a reference.
+_REFUSED_FOLDS: list[tuple[str, str]] = [
+    (
+        "constant-shadowed-by-local-assignment",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        def test_helper():
+            MODULE = "elsewhere"
+            with patch(f"{MODULE}.helper"):
+                pass
+        """,
+    ),
+    (
+        "constant-shadowed-by-parameter",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        def test_helper(MODULE):
+            with patch(f"{MODULE}.helper"):
+                pass
+        """,
+    ),
+    (
+        "constant-shadowed-by-loop-target",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        def test_helper():
+            for MODULE in ["elsewhere"]:
+                with patch(f"{MODULE}.helper"):
+                    pass
+        """,
+    ),
+    (
+        "constant-rebound-at-module-level",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+        MODULE = "elsewhere"
+
+        @patch(f"{MODULE}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "constant-declared-global-in-a-function",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        def setup():
+            global MODULE
+            MODULE = "elsewhere"
+
+        @patch(f"{MODULE}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "constant-bound-by-a-call",
+        """
+        from unittest.mock import patch
+
+        MODULE = str("pkg.lib")
+
+        @patch(f"{MODULE}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "repr-conversion",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        @patch(f"{MODULE!r}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "format-spec",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        @patch(f"{MODULE:>7}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "debug-text",
+        """
+        from unittest.mock import patch
+
+        MODULE = "pkg.lib"
+
+        @patch(f"{MODULE=}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+    (
+        "imported-constant-is-not-followed",
+        """
+        from unittest.mock import patch
+        from tests.consts import MODULE
+
+        @patch(f"{MODULE}.helper")
+        def test_helper(_): pass
+        """,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "test_source",
+    [src for _, src in _REFUSED_FOLDS],
+    ids=[name for name, _ in _REFUSED_FOLDS],
+)
+def test_refused_fold_leaves_target_dead(build_plugin_graph, reachable_fqnames, test_source):
+    graph = build_plugin_graph(
+        {
+            "pkg/__init__.py": "",
+            "pkg/lib.py": "def helper(): return 1",
+            "tests/__init__.py": "",
+            "tests/consts.py": 'MODULE = "pkg.lib"',
+            "tests/test_lib.py": test_source,
+        },
+        [native.NativePlugin.mock_patch(), native.NativePlugin.pytest()],
+    )
+    assert "pkg.lib.helper" not in reachable_fqnames(graph)
