@@ -82,34 +82,61 @@ pub(crate) fn is_dunder_name(fqname: &str) -> bool {
     name.len() > 4 && name.starts_with("__") && name.ends_with("__")
 }
 
-/// Return ``true`` if any decorator in ``decorators`` matches
-/// ``@<module>.<name>`` (literal module name) or ``@<name>`` for
-/// any ``name`` in ``names``. Trailing ``(...)`` is unwrapped before
-/// the pattern check.
-/// Resolves decorator references through the file's local imports map
-/// (built by :func:`collect_module_imports_local`) — mirrors the libcst
-/// helpers' ``matched_attr_call`` shape. Recognized forms:
+/// Split a decorator expression into its *head* -- the callee of the
+/// first call in the chain, or the whole expression when nothing is
+/// called -- and that first call. Builder-style suffixes after the head
+/// call (`@launchable().cpus(16)`, `@app.route("/").tag("x")`) are
+/// peeled off, so the head is what a matcher classifies and the head
+/// call is where its kwargs come from. The head is returned as written:
+/// callers unwrap a subscripted generic (`@route[T]()`) themselves via
+/// [`unwrap_subscripted_callee`].
+pub(crate) fn decorator_head(expr: &Expr) -> (&Expr, Option<&ruff_python_ast::ExprCall>) {
+    let mut first_call: Option<&ruff_python_ast::ExprCall> = None;
+    let mut current = expr;
+    loop {
+        match current {
+            Expr::Call(call) => {
+                first_call = Some(call);
+                current = &call.func;
+            }
+            Expr::Attribute(attr) => current = &attr.value,
+            _ => break,
+        }
+    }
+    match first_call {
+        Some(call) => (&call.func, Some(call)),
+        None => (expr, None),
+    }
+}
+
+/// Match a decl's decorator list against the file's local import map
+/// (built by :func:`collect_module_imports_local`) -- mirrors the libcst
+/// helpers' ``matched_attr_call`` shape. Each decorator is classified by
+/// its [`decorator_head`]. Recognized forms:
 ///
 /// * ``@<name>(...)`` / ``@<name>`` where ``imports[name]`` is in ``names``
 ///   (covers ``from module import name`` and aliased variants).
 /// * ``@<alias>.<attr>(...)`` / ``@<alias>.<attr>`` where
 ///   ``imports[alias] == MODULE_ALIAS_MARKER`` and ``attr`` is in ``names``
 ///   (covers ``import module`` and ``import module as alias``).
+/// * Either of the above followed by a builder chain
+///   (``@<name>().<method>(...)``): the chain is peeled and the head is
+///   matched as if the suffix were absent.
+///
+/// Returns the head call of the first matching decorator (``None`` inside
+/// the ``Some`` for a bare ``@name``).
 pub(crate) fn decorators_match_imports<'ast>(
     decorators: &'ast [ruff_python_ast::Decorator],
     imports: &LocalImports,
     names: &FxHashSet<&str>,
 ) -> Option<Option<&'ast ruff_python_ast::ExprCall>> {
     for dec in decorators {
-        let (root_expr, call_form) = match &dec.expression {
-            Expr::Call(call) => (&*call.func, Some(call)),
-            other => (other, None),
-        };
+        let (head, call_form) = decorator_head(&dec.expression);
         // Unwrap subscripted-generic callees so ``@route[T]`` /
         // ``@route[T]()`` are classified the same as ``@route`` /
         // ``@route()``.
-        let root_expr = unwrap_subscripted_callee(root_expr);
-        match root_expr {
+        let head = unwrap_subscripted_callee(head);
+        match head {
             Expr::Name(n) => {
                 if let Some(target) = imports.get(n.id.as_str()) {
                     if names.contains(target.as_str()) {
@@ -2716,6 +2743,59 @@ mod tests {
         let got = decorators_match_imports(decorators, &imports, &allowed);
         // Has a call form.
         assert!(matches!(got, Some(Some(_))));
+    }
+
+    #[test]
+    fn decorators_match_imports_peels_builder_chain() {
+        // ``@launchable().cpus(16)`` is classified by its head call
+        // ``launchable()``; the ``.cpus(16)`` suffix is peeled.
+        let stmts = parse_stmts("@launchable(name='x').cpus(16)\ndef f(): pass\n");
+        let decorators = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.decorator_list,
+            _ => unreachable!(),
+        };
+        let mut imports: LocalImports = FxHashMap::default();
+        imports.insert("launchable".into(), "launchable".into());
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
+        allowed.insert("launchable");
+        let got = decorators_match_imports(decorators, &imports, &allowed);
+        let call = got.expect("head matched").expect("head is a call");
+        // The returned call is the *head* call, carrying its kwargs.
+        assert_eq!(call.arguments.keywords.len(), 1);
+        assert_eq!(
+            call.arguments.keywords[0].arg.as_ref().map(|a| a.as_str()),
+            Some("name")
+        );
+    }
+
+    #[test]
+    fn decorators_match_imports_peels_builder_chain_on_module_attr() {
+        let stmts = parse_stmts("@mod.launchable().cpus(16)\ndef f(): pass\n");
+        let decorators = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.decorator_list,
+            _ => unreachable!(),
+        };
+        let mut imports: LocalImports = FxHashMap::default();
+        imports.insert("mod".into(), MODULE_ALIAS_MARKER.into());
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
+        allowed.insert("launchable");
+        assert!(decorators_match_imports(decorators, &imports, &allowed).is_some());
+    }
+
+    #[test]
+    fn decorators_match_imports_suffix_method_is_not_the_head() {
+        // ``@foo().launchable()``: the head is ``foo``, so ``launchable``
+        // in the suffix does not match.
+        let stmts = parse_stmts("@foo().launchable()\ndef f(): pass\n");
+        let decorators = match &stmts[0] {
+            Stmt::FunctionDef(f) => &f.decorator_list,
+            _ => unreachable!(),
+        };
+        let mut imports: LocalImports = FxHashMap::default();
+        imports.insert("launchable".into(), "launchable".into());
+        let mut allowed: FxHashSet<&str> = FxHashSet::default();
+        allowed.insert("launchable");
+        assert!(decorators_match_imports(decorators, &imports, &allowed).is_none());
     }
 
     #[test]

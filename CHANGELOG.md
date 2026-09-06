@@ -44,6 +44,15 @@ two versions.
 
 ### Fixed
 
+- **Decorator matching peels builder chains.** `decorated_decls`,
+  `decorated_decls_with_args`, `handler_decorators`, and
+  `handler_decorators_via` now classify a decorator by its *head* — the
+  callee of the first call in the chain — so `@launchable().cpus(16)` is
+  matched exactly like `@launchable()` (and `@app.route("/").tag("x")` like
+  `@app.route("/")`). The captured kwargs are the head call's. Previously any
+  decorator whose expression passed through a call was silently dropped from
+  the matcher, so such decls were reported dead.
+
 - **Decorators on classes are matched.** The per-file decorator index only
   read the decorator list of `def` statements, so a decorated `class` was
   invisible to every decorator-driven plugin query (`decorated_decls`,

@@ -28,9 +28,9 @@ use smallvec::SmallVec;
 use ty_project::Db as ProjectDb;
 
 use crate::helpers::{
-    extract_call_kwargs, find_main_block_range, python_file, range_key, resolve_relative_import,
-    top_level_assign_to_name, unwrap_subscripted_callee, CallArgs, LocalImports,
-    MODULE_ALIAS_MARKER,
+    decorator_head, extract_call_kwargs, find_main_block_range, python_file, range_key,
+    resolve_relative_import, top_level_assign_to_name, unwrap_subscripted_callee, CallArgs,
+    LocalImports, MODULE_ALIAS_MARKER,
 };
 use crate::ingest::{collapse_attribute_chain, file_package_name, string_literal_list};
 
@@ -420,14 +420,13 @@ fn collapse_callee(expr: &Expr) -> Option<(CompactString, SmallVec<[CompactStrin
     ))
 }
 
-/// Peel one decorator to a [`CalleeDescriptor`]. Strips the call form
-/// (capturing its kwargs) before collapsing the callee; bare decorators
-/// (`@route`) carry empty kwargs.
+/// Peel one decorator to a [`CalleeDescriptor`]. The decorator is
+/// classified by its head (see [`decorator_head`]): the callee of the
+/// first call in the chain, whose kwargs are captured, so a builder
+/// suffix (`@launchable().cpus(16)`) is peeled and matched as
+/// `@launchable()`. Bare decorators (`@route`) carry empty kwargs.
 fn decorator_descriptor(dec: &Decorator) -> Option<CalleeDescriptor> {
-    let (root_expr, call_form) = match &dec.expression {
-        Expr::Call(call) => (&*call.func, Some(call)),
-        other => (other, None),
-    };
+    let (root_expr, call_form) = decorator_head(&dec.expression);
     let (root_name, attrs) = collapse_callee(root_expr)?;
     Some(CalleeDescriptor {
         root_name,
