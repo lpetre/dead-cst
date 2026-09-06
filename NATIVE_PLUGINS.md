@@ -139,14 +139,14 @@ flags }`.
 | `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
 | `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
 | `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
-| `decorated_decls(modules, names)` | `Vec<usize>` | decls decorated by one of `names` imported from one of `modules`; a decorator is classified by its head call, so a builder suffix (`@launchable().cpus(16)`) matches like `@launchable()` |
+| `decorated_decls(fqnames)` | `Vec<usize>` | decls decorated by one of the decorators named by dotted `fqnames` (`"pytest.fixture"`), resolved like `find_subclasses_of_fqn` resolves a base class — a direct import, an alias, a re-export, a sibling-module spelling, `from X import *`, or a same-file definition all match; the fqname must name a module member resolvable from the analysis environment (an unresolvable one, or a non-module attribute like `pytest.mark.parametrize`, matches nothing); a builder suffix (`@launchable().cpus(16)`) is classified by its head call |
 | `constructions(modules, names)` | `Vec<usize>` | `X = Ctor(...)` decls whose `Ctor` is one of `names` imported from one of `modules` |
 | `handler_decorators(attrs)` | `Vec<(String, usize)>` | top-level fns decorated `@<owner>.<attr>(...)` for `attr` in `attrs`; returns `(owner_name, decl_idx)` — the raw textual owner, unresolved |
 | `calls_with_string_arg(modules, name, arg_index)` | `Vec<(usize, String)>` | calls to `name` (imported from one of `modules`) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
 | `calls_on_attr(attr, arg_index)` | `Vec<(usize, String)>` | `<recv>.<attr>(...)` calls (any receiver shape) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
 | `calls_on_var(owner, attr, arg_index, required_positional)` | `Vec<(usize, String)>` | `<owner>.<attr>(...)` calls where `owner` is a bare variable (`mocker`, `monkeypatch`) and the arg at `arg_index` is a string literal; `required_positional` (if set) restricts to calls with exactly that many positional args |
 | `handler_decorators_via(via_attr, attrs)` | `Vec<(String, usize)>` | two-level twin of `handler_decorators`: `@<owner>.<via_attr>.<attr>(...)` (e.g. `via_attr="tree"` for `@bot.tree.command`) |
-| `decorated_decls_with_args(modules, names)` | `Vec<(usize, CallArgs)>` | args-capturing twin of `decorated_decls`: each match paired with its decorator's head-call kwargs (read via `CallArgs`) |
+| `decorated_decls_with_args(fqnames)` | `Vec<(usize, CallArgs)>` | args-capturing twin of `decorated_decls`: each match paired with its decorator's head-call kwargs (read via `CallArgs`) |
 | `factory_decls(modules, ctor_names)` | `Vec<(usize, Vec<String>)>` | fns/classes that *return* an instance of one of `ctor_names` (app-factory shape); `(decl_idx, return_kinds)` |
 | `classes_defining_method(method_name)` | `Vec<usize>` | classes with a top-level `def <method_name>` |
 | `module_surface(module_fqn)` | `Vec<usize>` | the names `from module_fqn import *` would bind |
@@ -298,7 +298,9 @@ plugin is per-file is read **once, at load**.
 `module_local_idx()`, `node_count()`, `node(local_idx)`, `nodes()`,
 `line_span(range)`, `parsed()` (the raw AST), the `main_block_range()`
 convenience, and the ready-made file-local matchers `imports_any_module(modules)`,
-`decorated_decls(modules, names)`, `constructions(modules, names)`, and
+`decorated_decls(fqnames)` (file-local: matches a decorator by its spelling after
+this file's import / alias following or a same-file definition — re-exports through
+*other* files need the project-wide query), `constructions(modules, names)`, and
 `calls(modules, names)` (file-local twins of the project-wide `PluginCtx`
 matchers above). `FileOps` mirrors every `PluginOps` emitter — `keep_alive`,
 `flag_decl(decl_idx, flags)`, and `add_edge(src, dst, flags)` — but in the

@@ -27,7 +27,7 @@ use ty_python_core::program_file::ProgramFile;
 use ty_python_core::{global_scope, place_table, use_def_map};
 
 use crate::file_payload::{
-    import_payload_for_pure, ChainStep, ClassBaseSpec, ImportPayload, ModuleValue,
+    import_payload_for_pure, ChainStep, ImportPayload, MemberSpec, ModuleValue,
 };
 use crate::graph::{EdgeFlags, NodeFlags};
 use crate::ingest::{
@@ -110,57 +110,6 @@ pub(crate) fn decorator_head(expr: &Expr) -> (&Expr, Option<&ruff_python_ast::Ex
     }
 }
 
-/// Match a decl's decorator list against the file's local import map
-/// (built by :func:`collect_module_imports_local`) -- mirrors the libcst
-/// helpers' ``matched_attr_call`` shape. Each decorator is classified by
-/// its [`decorator_head`]. Recognized forms:
-///
-/// * ``@<name>(...)`` / ``@<name>`` where ``imports[name]`` is in ``names``
-///   (covers ``from module import name`` and aliased variants).
-/// * ``@<alias>.<attr>(...)`` / ``@<alias>.<attr>`` where
-///   ``imports[alias] == MODULE_ALIAS_MARKER`` and ``attr`` is in ``names``
-///   (covers ``import module`` and ``import module as alias``).
-/// * Either of the above followed by a builder chain
-///   (``@<name>().<method>(...)``): the chain is peeled and the head is
-///   matched as if the suffix were absent.
-///
-/// Returns the head call of the first matching decorator (``None`` inside
-/// the ``Some`` for a bare ``@name``).
-pub(crate) fn decorators_match_imports<'ast>(
-    decorators: &'ast [ruff_python_ast::Decorator],
-    imports: &LocalImports,
-    names: &FxHashSet<&str>,
-) -> Option<Option<&'ast ruff_python_ast::ExprCall>> {
-    for dec in decorators {
-        let (head, call_form) = decorator_head(&dec.expression);
-        // Unwrap subscripted-generic callees so ``@route[T]`` /
-        // ``@route[T]()`` are classified the same as ``@route`` /
-        // ``@route()``.
-        let head = unwrap_subscripted_callee(head);
-        match head {
-            Expr::Name(n) => {
-                if let Some(target) = imports.get(n.id.as_str()) {
-                    if names.contains(target.as_str()) {
-                        return Some(call_form);
-                    }
-                }
-            }
-            Expr::Attribute(attr) => {
-                if let Expr::Name(prefix) = attr.value.as_ref() {
-                    if imports.get(prefix.id.as_str()).map(CompactString::as_str)
-                        == Some(MODULE_ALIAS_MARKER)
-                        && names.contains(attr.attr.as_str())
-                    {
-                        return Some(call_form);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 pub(crate) fn iter_top_level_classes(
     parsed: &ParsedModuleRef,
 ) -> impl Iterator<Item = &StmtClassDef> {
@@ -222,6 +171,24 @@ pub(crate) fn locate_class_seed(
     // `(File, name_range)` key the assemble pass recorded in
     // `external_base_children` — sibling spellings and re-exports collapse
     // by construction, not via a query-time string scan.
+    locate_member_seed(db, outputs, fqn, MemberKinds::CLASS)
+}
+
+/// Resolve a dotted `fqn` to the canonical `(File, name_range)` of the
+/// definition it names, through the same [`resolve_member_def`] the
+/// assemble pass ran on every observed spec — so a query for
+/// `pkg.deco` lands on the identical key a `from pkg import deco`
+/// spec (or any re-exported / aliased spelling of it) was recorded
+/// under. `kinds` selects which definition kinds may terminate the
+/// resolution. `None` when nothing resolves (an uninstalled dependency,
+/// a member of a non-module such as `pytest.mark.parametrize`, so the
+/// dependency must be importable from the analysis environment).
+pub(crate) fn locate_member_seed(
+    db: &ProjectDatabase,
+    outputs: &BuildOutputs,
+    fqn: &str,
+    kinds: MemberKinds,
+) -> Option<(File, TextRange)> {
     let anchor = *outputs.project_files.first()?;
     let (seed_module, seed_name) = fqn.rsplit_once('.')?;
     // Query-time seed location: the read-set record is irrelevant here
@@ -236,7 +203,33 @@ pub(crate) fn locate_class_seed(
         0,
         &outputs.reload_log,
         &mut scratch,
+        kinds,
     )
+}
+
+/// Which definition kinds a member resolution may terminate on. Class
+/// bases accept classes only; decorator targets accept classes,
+/// functions, and variables (a module-level `deco = Deco(...)` whose
+/// value can't be followed any further *is* the decorator's definition).
+/// Part of the resolve-memo key, so the two never share an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MemberKinds(u8);
+
+impl MemberKinds {
+    pub(crate) const CLASS: MemberKinds = MemberKinds(1);
+    pub(crate) const CALLABLE: MemberKinds = MemberKinds(1 | 2 | 4);
+
+    pub(crate) fn accepts_class(self) -> bool {
+        self.0 & 1 != 0
+    }
+
+    pub(crate) fn accepts_function(self) -> bool {
+        self.0 & 2 != 0
+    }
+
+    pub(crate) fn accepts_variable(self) -> bool {
+        self.0 & 4 != 0
+    }
 }
 
 /// Maximum hops [`resolve_member_def`] / [`classify_base`] follow through
@@ -273,7 +266,7 @@ fn local_member_defs<'db>(db: &'db dyn ProjectDb, file: File, name: &str) -> Vec
     defs
 }
 
-/// Describe one class-base expression as a [`ClassBaseSpec`] using only
+/// Describe one class-base expression as a [`MemberSpec`] using only
 /// `file`'s own use-def chain — the first symbolic hop, no cross-file
 /// resolution (that's [`resolve_member_def`]'s job). Subscripted bases
 /// (`Base[T]`, `Generic[T]`) are unwrapped to the bare callee. `depth`
@@ -284,7 +277,8 @@ pub(crate) fn classify_base(
     parsed: &ParsedModuleRef,
     expr: &Expr,
     depth: u32,
-) -> Option<ClassBaseSpec> {
+    kinds: MemberKinds,
+) -> Option<MemberSpec> {
     if depth > MEMBER_RESOLVE_DEPTH_CAP {
         return None;
     }
@@ -297,18 +291,55 @@ pub(crate) fn classify_base(
             let symbol = name.id.as_str();
             local_member_defs(db, file, symbol)
                 .into_iter()
-                .find_map(|def| classify_name_def(db, file, parsed, def, symbol, depth))
+                .find_map(|def| classify_name_def(db, file, parsed, def, symbol, depth, kinds))
         }
         Expr::Attribute(_) => {
             let (module, name) = attribute_to_module_member(db, file, parsed, expr)?;
-            Some(ClassBaseSpec::ModuleMember { module, name })
+            Some(MemberSpec::ModuleMember { module, name })
         }
         _ => None,
     }
 }
 
+/// Describe a decorator's head expression (see [`decorator_head`]) as a
+/// [`MemberSpec`] using only `file`'s own use-def chain — the decorator
+/// twin of [`classify_base`], accepting functions as well as classes:
+///
+/// * a bare name bound to a same-file `def` / `class`, or to a same-file
+///   variable whose value can't be followed (`deco = Deco(...)`) →
+///   `Local(range)`;
+/// * a bare name bound by `from M import n` / `from M import *` / a
+///   same-file alias of one → `ModuleMember { M, n }`;
+/// * `mod.deco` / `pkg.mod.deco` / `alias.deco` on an imported module →
+///   `ModuleMember` via the file's imports.
+///
+/// `None` for builtins / unbound names and for decorators whose head is
+/// not a module member at all (`@app.route` on an instance — those are
+/// the `handler_decorators` family's business).
+pub(crate) fn classify_decorator_head(
+    db: &dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    expr: &Expr,
+) -> Option<MemberSpec> {
+    let expr = unwrap_subscripted_callee(expr);
+    match expr {
+        Expr::Name(name) => {
+            let symbol = name.id.as_str();
+            local_member_defs(db, file, symbol)
+                .into_iter()
+                .find_map(|def| {
+                    classify_name_def(db, file, parsed, def, symbol, 0, MemberKinds::CALLABLE)
+                })
+        }
+        Expr::Attribute(_) => attribute_to_module_member(db, file, parsed, expr)
+            .map(|(module, name)| MemberSpec::ModuleMember { module, name }),
+        _ => None,
+    }
+}
+
 /// Classify one local definition of a bare-name base (`name`, the symbol
-/// being referenced) into a [`ClassBaseSpec`]: a same-file class, a
+/// being referenced) into a [`MemberSpec`]: a same-file class, a
 /// `from`-import member, a `from X import *` member, or a same-file
 /// assignment alias whose RHS is followed recursively.
 fn classify_name_def<'db>(
@@ -318,17 +349,21 @@ fn classify_name_def<'db>(
     def: Definition<'db>,
     name: &str,
     depth: u32,
-) -> Option<ClassBaseSpec> {
+    kinds: MemberKinds,
+) -> Option<MemberSpec> {
     match def.kind(db) {
-        DefinitionKind::Class(class) => Some(ClassBaseSpec::LocalClass(range_key(
-            class.node(parsed).name.range(),
-        ))),
+        DefinitionKind::Class(class) if kinds.accepts_class() => Some(MemberSpec::Local(
+            range_key(class.node(parsed).name.range()),
+        )),
+        DefinitionKind::Function(func) if kinds.accepts_function() => {
+            Some(MemberSpec::Local(range_key(func.node(parsed).name.range())))
+        }
         DefinitionKind::ImportFrom(import_from) => {
             let module = from_module_string(db, file, import_from.import(parsed));
             if module.is_empty() {
                 return None;
             }
-            Some(ClassBaseSpec::ModuleMember {
+            Some(MemberSpec::ModuleMember {
                 module,
                 name: import_from.alias(parsed).name.as_str().to_compact_string(),
             })
@@ -338,16 +373,28 @@ fn classify_name_def<'db>(
             if module.is_empty() {
                 return None;
             }
-            Some(ClassBaseSpec::ModuleMember {
+            Some(MemberSpec::ModuleMember {
                 module,
                 name: name.to_compact_string(),
             })
         }
+        // An assignment is followed through its value (`Alias = Real`);
+        // when the value leads nowhere and variables are acceptable, the
+        // assignment itself is the definition (`deco = Deco(...)`).
         DefinitionKind::Assignment(assign) => {
-            classify_base(db, file, parsed, assign.value(parsed), depth + 1)
+            classify_base(db, file, parsed, assign.value(parsed), depth + 1, kinds).or_else(|| {
+                kinds
+                    .accepts_variable()
+                    .then(|| MemberSpec::Local(range_key(assign.target(parsed).range())))
+            })
         }
         DefinitionKind::AnnotatedAssignment(assign) => {
-            classify_base(db, file, parsed, assign.value(parsed)?, depth + 1)
+            let value = assign.value(parsed)?;
+            classify_base(db, file, parsed, value, depth + 1, kinds).or_else(|| {
+                kinds
+                    .accepts_variable()
+                    .then(|| MemberSpec::Local(range_key(assign.target(parsed).range())))
+            })
         }
         _ => None,
     }
@@ -598,26 +645,28 @@ fn root_module_prefix(
         })
 }
 
-/// Resolve a [`ClassBaseSpec`] to the canonical `(File, name_range)` of
-/// the definition it names. `LocalClass` lands on `local_file` (the file
+/// Resolve a [`MemberSpec`] to the canonical `(File, name_range)` of
+/// the definition it names. `Local` lands on `local_file` (the file
 /// the spec was produced/followed in); `ModuleMember` resolves through
 /// [`resolve_member_def`] from `anchor`. Both the assemble pass and the
 /// assignment-following path funnel through here.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_base_spec(
     db: &dyn ProjectDb,
-    spec: &ClassBaseSpec,
+    spec: &MemberSpec,
     local_file: File,
     anchor: File,
     depth: u32,
     reloads: &ReloadLog,
     touched: &mut crate::refspec::Touched,
+    kinds: MemberKinds,
 ) -> Option<(File, TextRange)> {
     match spec {
-        ClassBaseSpec::LocalClass((start, end)) => {
+        MemberSpec::Local((start, end)) => {
             Some((local_file, TextRange::new((*start).into(), (*end).into())))
         }
-        ClassBaseSpec::ModuleMember { module, name } => {
-            resolve_member_def(db, module, name, anchor, depth, reloads, touched)
+        MemberSpec::ModuleMember { module, name } => {
+            resolve_member_def(db, module, name, anchor, depth, reloads, touched, kinds)
         }
     }
 }
@@ -626,6 +675,7 @@ pub(crate) fn resolve_base_spec(
 /// `(File, name_range)` of the definition it ultimately names, as seen
 /// from `anchor`. Re-exports are followed by [`resolve_member_in_file`],
 /// which reuses the store-side decomposition. `depth` bounds the chase.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_member_def(
     db: &dyn ProjectDb,
     module: &str,
@@ -634,13 +684,23 @@ pub(crate) fn resolve_member_def(
     depth: u32,
     reloads: &ReloadLog,
     touched: &mut crate::refspec::Touched,
+    kinds: MemberKinds,
 ) -> Option<(File, TextRange)> {
     if depth > MEMBER_RESOLVE_DEPTH_CAP {
         return None;
     }
     let module_name = ModuleName::new(module)?;
     let module_file = resolve_module(db, importing_file(db, anchor), &module_name)?.file(db)?;
-    resolve_member_in_file(db, module_file, name, anchor, depth, reloads, touched)
+    resolve_member_in_file(
+        db,
+        module_file,
+        name,
+        anchor,
+        depth,
+        reloads,
+        touched,
+        kinds,
+    )
 }
 
 /// Resolve `name` in `file`'s global scope to a canonical
@@ -651,6 +711,7 @@ pub(crate) fn resolve_member_def(
 /// an assignment binding (`Alias = Real`) follows its RHS. `depth` bounds
 /// the recursion (cross-file import hops and assignment chains both
 /// increment it), standing in for ty's visited-set cycle guard.
+#[allow(clippy::too_many_arguments)]
 fn resolve_member_in_file(
     db: &dyn ProjectDb,
     file: File,
@@ -659,6 +720,7 @@ fn resolve_member_in_file(
     depth: u32,
     reloads: &ReloadLog,
     touched: &mut crate::refspec::Touched,
+    kinds: MemberKinds,
 ) -> Option<(File, TextRange)> {
     // This load (and `local_member_defs`'s semantic-index load below)
     // repopulates salsa slots the populate-phase eviction emptied —
@@ -673,8 +735,8 @@ fn resolve_member_in_file(
     local_member_defs(db, file, name)
         .into_iter()
         .find_map(|def| {
-            let spec = classify_name_def(db, file, &parsed, def, name, depth)?;
-            resolve_base_spec(db, &spec, file, anchor, depth + 1, reloads, touched)
+            let spec = classify_name_def(db, file, &parsed, def, name, depth, kinds)?;
+            resolve_base_spec(db, &spec, file, anchor, depth + 1, reloads, touched, kinds)
         })
 }
 
@@ -2715,120 +2777,6 @@ mod tests {
         // ``ruff:`` / ``flake8:`` are matched case-sensitively per ruff's docs.
         assert!(!is_file_pin(" Ruff: noqa"));
         assert!(!is_file_pin(" FLAKE8: noqa"));
-    }
-
-    // -- decorators_match_imports -----------------------------------------
-
-    #[test]
-    fn decorators_match_imports_via_local_alias() {
-        let stmts = parse_stmts("@register\ndef f(): pass\n");
-        let decorators = match &stmts[0] {
-            Stmt::FunctionDef(f) => &f.decorator_list,
-            _ => unreachable!(),
-        };
-        let mut imports: LocalImports = FxHashMap::default();
-        imports.insert("register".into(), "register".into());
-        let mut allowed: FxHashSet<&str> = FxHashSet::default();
-        allowed.insert("register");
-        let got = decorators_match_imports(decorators, &imports, &allowed);
-        assert!(got.is_some());
-    }
-
-    #[test]
-    fn decorators_match_imports_via_module_attr() {
-        let stmts = parse_stmts("@flask.route('/x')\ndef f(): pass\n");
-        let decorators = match &stmts[0] {
-            Stmt::FunctionDef(f) => &f.decorator_list,
-            _ => unreachable!(),
-        };
-        let mut imports: LocalImports = FxHashMap::default();
-        imports.insert("flask".into(), MODULE_ALIAS_MARKER.into());
-        let mut allowed: FxHashSet<&str> = FxHashSet::default();
-        allowed.insert("route");
-        let got = decorators_match_imports(decorators, &imports, &allowed);
-        // Has a call form.
-        assert!(matches!(got, Some(Some(_))));
-    }
-
-    #[test]
-    fn decorators_match_imports_peels_builder_chain() {
-        // ``@launchable().cpus(16)`` is classified by its head call
-        // ``launchable()``; the ``.cpus(16)`` suffix is peeled.
-        let stmts = parse_stmts("@launchable(name='x').cpus(16)\ndef f(): pass\n");
-        let decorators = match &stmts[0] {
-            Stmt::FunctionDef(f) => &f.decorator_list,
-            _ => unreachable!(),
-        };
-        let mut imports: LocalImports = FxHashMap::default();
-        imports.insert("launchable".into(), "launchable".into());
-        let mut allowed: FxHashSet<&str> = FxHashSet::default();
-        allowed.insert("launchable");
-        let got = decorators_match_imports(decorators, &imports, &allowed);
-        let call = got.expect("head matched").expect("head is a call");
-        // The returned call is the *head* call, carrying its kwargs.
-        assert_eq!(call.arguments.keywords.len(), 1);
-        assert_eq!(
-            call.arguments.keywords[0].arg.as_ref().map(|a| a.as_str()),
-            Some("name")
-        );
-    }
-
-    #[test]
-    fn decorators_match_imports_peels_builder_chain_on_module_attr() {
-        let stmts = parse_stmts("@mod.launchable().cpus(16)\ndef f(): pass\n");
-        let decorators = match &stmts[0] {
-            Stmt::FunctionDef(f) => &f.decorator_list,
-            _ => unreachable!(),
-        };
-        let mut imports: LocalImports = FxHashMap::default();
-        imports.insert("mod".into(), MODULE_ALIAS_MARKER.into());
-        let mut allowed: FxHashSet<&str> = FxHashSet::default();
-        allowed.insert("launchable");
-        assert!(decorators_match_imports(decorators, &imports, &allowed).is_some());
-    }
-
-    #[test]
-    fn decorators_match_imports_suffix_method_is_not_the_head() {
-        // ``@foo().launchable()``: the head is ``foo``, so ``launchable``
-        // in the suffix does not match.
-        let stmts = parse_stmts("@foo().launchable()\ndef f(): pass\n");
-        let decorators = match &stmts[0] {
-            Stmt::FunctionDef(f) => &f.decorator_list,
-            _ => unreachable!(),
-        };
-        let mut imports: LocalImports = FxHashMap::default();
-        imports.insert("launchable".into(), "launchable".into());
-        let mut allowed: FxHashSet<&str> = FxHashSet::default();
-        allowed.insert("launchable");
-        assert!(decorators_match_imports(decorators, &imports, &allowed).is_none());
-    }
-
-    #[test]
-    fn decorators_match_imports_bare_attribute() {
-        let stmts = parse_stmts("@app.task\ndef f(): pass\n");
-        let decorators = match &stmts[0] {
-            Stmt::FunctionDef(f) => &f.decorator_list,
-            _ => unreachable!(),
-        };
-        let mut imports: LocalImports = FxHashMap::default();
-        imports.insert("app".into(), MODULE_ALIAS_MARKER.into());
-        let mut allowed: FxHashSet<&str> = FxHashSet::default();
-        allowed.insert("task");
-        let got = decorators_match_imports(decorators, &imports, &allowed);
-        // Bare (no call) — outer Some, inner None.
-        assert!(matches!(got, Some(None)));
-    }
-
-    #[test]
-    fn decorators_match_imports_returns_none_when_no_match() {
-        let stmts = parse_stmts("@other\ndef f(): pass\n");
-        let decorators = match &stmts[0] {
-            Stmt::FunctionDef(f) => &f.decorator_list,
-            _ => unreachable!(),
-        };
-        let imports: LocalImports = FxHashMap::default();
-        let allowed: FxHashSet<&str> = FxHashSet::default();
-        assert!(decorators_match_imports(decorators, &imports, &allowed).is_none());
     }
 
     // -- matched_call_target ----------------------------------------------

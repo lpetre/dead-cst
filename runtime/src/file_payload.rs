@@ -35,9 +35,10 @@ use ty_python_core::semantic_index;
 
 use crate::graph::{DeclKey, NodeFlags};
 use crate::helpers::{
-    classify_base, collect_all_imports_local, detect_dead_ranges, file_default_flags,
-    importing_file, iter_top_level_classes, module_fqname_for_file, position, program_file,
-    python_file, range_key, scan_noqa_directives, NODE_FLAGS_NOQA_PIN,
+    classify_base, classify_decorator_head, collect_all_imports_local, detect_dead_ranges,
+    file_default_flags, importing_file, iter_top_level_classes, module_fqname_for_file, position,
+    program_file, python_file, range_key, scan_noqa_directives, CallArgs, MemberKinds,
+    NODE_FLAGS_NOQA_PIN,
 };
 use crate::ingest::{decl_kind_str, file_package_name, from_module_string};
 
@@ -330,7 +331,7 @@ pub(crate) struct ModuleValue {
 ///   statically-describable base, the symbolic base list. Each entry is
 ///   `(name_range_key, specs)` where `name_range_key` matches the
 ///   `(start, end)` `u32` pair the assemble pass stores in
-///   `class_by_selection`, and `specs` is a small-vec of [`ClassBaseSpec`]
+///   `class_by_selection`, and `specs` is a small-vec of [`MemberSpec`]
 ///   first-hop descriptors derived from each base expression via ty's
 ///   use-def chain ([`crate::helpers::classify_base`]). The spec carries
 ///   only this file's view — a same-file class name range, or an
@@ -356,14 +357,32 @@ pub(crate) struct FileNodes {
     pub(crate) exports_by_name: FxHashMap<CompactString, SmallVec<[u32; 2]>>,
     pub(crate) star_reexports: FxHashMap<CompactString, CompactString>,
     pub(crate) class_bases: Vec<ClassBaseEntry>,
+    /// Per top-level decorated `def` / `class`, its decorators described
+    /// symbolically (see [`DecoratorSpec`]); resolved at assemble / query
+    /// time exactly like `class_bases`.
+    pub(crate) decorators: Vec<DecoratedDeclEntry>,
     pub(crate) overload_anchors: Box<[(u32, u32)]>,
+}
+
+/// `(decl_name_range_key, decorator_specs)` pair stored in
+/// [`FileNodes::decorators`]. The range key matches `decl_by_name_range`
+/// on the assemble side.
+pub(crate) type DecoratedDeclEntry = ((u32, u32), SmallVec<[DecoratorSpec; 2]>);
+
+/// One decorator on a top-level decl: where its head resolves
+/// (symbolically — see [`crate::helpers::classify_decorator_head`]) and
+/// the head call's captured kwargs (`@fixture(name="x")`).
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue, get_size2::GetSize)]
+pub(crate) struct DecoratorSpec {
+    pub(crate) target: MemberSpec,
+    pub(crate) kwargs: CallArgs,
 }
 
 /// `(name_range_key, base_specs)` pair stored in
 /// [`FileNodes::class_bases`]. The range key matches what the
 /// assemble pass writes into `class_by_selection`, so the project-wide
-/// fan-in is a hashmap probe once each [`ClassBaseSpec`] is resolved.
-pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ClassBaseSpec; 2]>);
+/// fan-in is a hashmap probe once each [`MemberSpec`] is resolved.
+pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[MemberSpec; 2]>);
 
 /// A symbolic, per-file description of one class base — the first hop
 /// only, with no cross-file resolution, so a file's payload stays
@@ -375,7 +394,7 @@ pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ClassBaseSpec; 2]>);
 /// (direct, aliased, re-exported, sibling-module) lands on the same
 /// `(File, name_range)` key by construction.
 ///
-/// * `LocalClass` — the base name binds a class defined in *this* file;
+/// * `Local` — the base name binds a class defined in *this* file;
 ///   the `(start, end)` is that class's name range, byte-identical to the
 ///   `class_by_selection` key the assemble pass mints for it.
 /// * `ModuleMember` — the base is a member `name` of absolute module
@@ -383,8 +402,8 @@ pub(crate) type ClassBaseEntry = ((u32, u32), SmallVec<[ClassBaseSpec; 2]>);
 ///   module, or a same-file alias of one). Resolution maps it to the
 ///   member's canonical definition range.
 #[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue, get_size2::GetSize)]
-pub(crate) enum ClassBaseSpec {
-    LocalClass((u32, u32)),
+pub(crate) enum MemberSpec {
+    Local((u32, u32)),
     ModuleMember {
         module: CompactString,
         name: CompactString,
@@ -763,13 +782,15 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
     }
 
     // Describe every top-level class base symbolically via ty's use-def
-    // chain: each base expression becomes a first-hop `ClassBaseSpec`
+    // chain: each base expression becomes a first-hop `MemberSpec`
     // (this file's view only — a same-file class range or an
     // `(absolute module, member)` pair), never an eagerly-resolved
     // cross-file target. Classes with no describable base contribute
     // nothing; resolution is deferred to the assemble/query side, which
     // keeps this payload invalidation-local.
     let class_bases = build_class_bases(db, file, &parsed);
+    let own_module = nodes.first().map(|n| n.fqname.as_str()).unwrap_or("");
+    let decorators = build_decorator_specs(db, file, &parsed, own_module);
 
     FileNodes {
         nodes: nodes.into_boxed_slice(),
@@ -778,8 +799,58 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
         exports_by_name,
         star_reexports,
         class_bases,
+        decorators,
         overload_anchors: overload_anchors.into_boxed_slice(),
     }
+}
+
+/// Per-file decorator producer used by [`file_to_nodes`] — the decorator
+/// twin of [`build_class_bases`]. For each top-level decorated `def` /
+/// `class`, key on its name range and describe every decorator's head
+/// (the callee of the first call in a builder chain, per
+/// [`crate::helpers::decorator_head`]) via
+/// [`crate::helpers::classify_decorator_head`], capturing the head
+/// call's kwargs (string-folded against this file's constants). No
+/// cross-file resolution happens here.
+fn build_decorator_specs(
+    db: &dyn ProjectDb,
+    file: File,
+    parsed: &ruff_db::parsed::ParsedModuleRef,
+    own_module: &str,
+) -> Vec<DecoratedDeclEntry> {
+    use crate::helpers::{decorator_head, extract_call_kwargs};
+    use crate::string_fold::{top_level_string_constants, StringFoldCtx};
+
+    let body = &parsed.syntax().body;
+    let constants = top_level_string_constants(body, Some(own_module));
+    let fold = StringFoldCtx {
+        module_name: Some(own_module),
+        constants: Some(&constants),
+        shadowed: None,
+    };
+    let mut out: Vec<DecoratedDeclEntry> = Vec::new();
+    for stmt in body {
+        let (decorators, name_range) = match stmt {
+            Stmt::FunctionDef(f) => (&f.decorator_list, f.name.range()),
+            Stmt::ClassDef(c) => (&c.decorator_list, c.name.range()),
+            _ => continue,
+        };
+        let mut specs: SmallVec<[DecoratorSpec; 2]> = SmallVec::new();
+        for dec in decorators {
+            let (head, call) = decorator_head(&dec.expression);
+            let Some(target) = classify_decorator_head(db, file, parsed, head) else {
+                continue;
+            };
+            let kwargs = call
+                .map(|c| extract_call_kwargs(c, &fold))
+                .unwrap_or_default();
+            specs.push(DecoratorSpec { target, kwargs });
+        }
+        if !specs.is_empty() {
+            out.push((range_key(name_range), specs));
+        }
+    }
+    out
 }
 
 /// Per-file class-hierarchy producer used by [`file_to_nodes`].
@@ -787,9 +858,9 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
 /// For each top-level `ClassDef` with at least one statically-describable
 /// base, key on its name range and describe every base expression
 /// symbolically via [`crate::helpers::classify_base`] — ty's use-def
-/// chain, this file's scope only. Each base becomes a [`ClassBaseSpec`]:
+/// chain, this file's scope only. Each base becomes a [`MemberSpec`]:
 ///
-/// * a same-file class name → `LocalClass(range)` (the
+/// * a same-file class name → `Local(range)` (the
 ///   `class_by_selection` key the assemble pass mints for that class);
 /// * a `from`-import, an attribute access on an imported module
 ///   (`mod.Base`, `a.b.Base`), or a same-file alias chain that bottoms
@@ -812,9 +883,9 @@ fn build_class_bases(
         let Some(args) = &cls.arguments else {
             continue;
         };
-        let mut bases: SmallVec<[ClassBaseSpec; 2]> = SmallVec::new();
+        let mut bases: SmallVec<[MemberSpec; 2]> = SmallVec::new();
         for raw_base in &args.args {
-            if let Some(spec) = classify_base(db, file, parsed, raw_base, 0) {
+            if let Some(spec) = classify_base(db, file, parsed, raw_base, 0, MemberKinds::CLASS) {
                 bases.push(spec);
             }
         }

@@ -414,10 +414,10 @@ def test_click_plugin_multiple_groups_in_one_module(build_plugin_graph, reachabl
     assert "cli.main.from_other" not in reached
 
 
-def test_click_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames):
-    """``from click import *`` doesn't bind ``group`` for the plugin's
-    purposes. The ``import *`` analyzer logic is pessimistic enough on
-    its own; the plugin shouldn't infer Click wiring from the star import."""
+def test_click_plugin_follows_import_star(build_plugin_graph, reachable_fqnames):
+    """``from click import *`` binds ``group`` as a member of ``click``,
+    so ``decorated_decls(["click.group"])`` matches it exactly like a named
+    import and the handler is wired."""
     graph = build_plugin_graph(
         {
             "cli/__init__.py": "",
@@ -436,9 +436,7 @@ def test_click_plugin_ignores_import_star(build_plugin_graph, reachable_fqnames)
         },
         [native.NativePlugin.main_block(), native.NativePlugin.click()],
     )
-    # No instance edge from ``cli`` to ``hello`` because the plugin ignores
-    # star imports.
-    assert "cli.main.hello" not in reachable_fqnames(graph)
+    assert "cli.main.hello" in reachable_fqnames(graph)
 
 
 def test_click_plugin_does_nothing_when_click_not_installed(build_plugin_graph, reachable_fqnames):
@@ -575,3 +573,72 @@ def test_click_plugin_factory_returns_native_plugin():
     plugin = native.NativePlugin.click()
     assert isinstance(plugin, native.NativePlugin)
     assert plugin.name == "click"
+
+
+def test_click_plugin_matches_group_defined_in_the_file_itself(
+    build_plugin_graph, reachable_fqnames
+):
+    """The per-file ``decorated_decls`` matches a same-file definition by
+    its fqname: a project-local ``click.py`` defining ``group`` still gets
+    its ``@group()``-decorated ``cli`` recognised as a group, so
+    ``@cli.command()`` handlers are wired. (``imports_any_module`` counts
+    a file that *is* the module as present.)"""
+    graph = build_plugin_graph(
+        {
+            "click.py": """
+            def group(*a, **k):
+                def deco(f):
+                    return f
+                return deco
+
+            @group()
+            def cli(): pass
+
+            @cli.command()
+            def hello(): pass
+
+            def helper(): pass
+
+            if __name__ == "__main__":
+                cli()
+            """,
+        },
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "click.cli" in reached
+    assert "click.hello" in reached
+    assert "click.helper" not in reached
+
+
+def test_click_plugin_matches_group_through_aliases(build_plugin_graph, reachable_fqnames):
+    """Per-file fqname matching follows this file's own import aliases."""
+    graph = build_plugin_graph(
+        {
+            "cli/__init__.py": "",
+            "cli/main.py": """
+            import click as c
+            from click import group as g
+
+            @c.group()
+            def one(): pass
+
+            @one.command()
+            def one_cmd(): pass
+
+            @g()
+            def two(): pass
+
+            @two.command()
+            def two_cmd(): pass
+
+            if __name__ == "__main__":
+                one()
+                two()
+            """,
+        },
+        [native.NativePlugin.main_block(), native.NativePlugin.click()],
+    )
+    reached = reachable_fqnames(graph)
+    assert "cli.main.one_cmd" in reached
+    assert "cli.main.two_cmd" in reached

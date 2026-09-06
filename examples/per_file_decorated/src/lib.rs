@@ -90,8 +90,9 @@ impl PerFilePlugin for ClickCommandScanner {
             return;
         }
         // File-local indices of decls decorated by `click.command` /
-        // `click.group` (matched through this file's imports + aliases).
-        for local_idx in file.decorated_decls(&["click"], &["command", "group"]) {
+        // `click.group` (matched by fqname through this file's imports +
+        // aliases, or a same-file definition).
+        for local_idx in file.decorated_decls(&["click.command", "click.group"]) {
             // Publish a fact pinned to the decl. The host translates the
             // file-local index to a global node index when it collects the
             // fact (dropping it if the decl didn't survive assembly); the
