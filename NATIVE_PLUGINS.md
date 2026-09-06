@@ -139,14 +139,14 @@ flags }`.
 | `ancestors(decl_idx)` | `Vec<usize>` | reverse reachability closure |
 | `direct_predecessors(idx)` | `Vec<usize>` | one-hop reverse step |
 | `main_blocks()` | `Vec<(usize, Vec<usize>)>` | each `if __name__` block as `(module, [decls])` |
-| `decorated_decls(modules, names)` | `Vec<usize>` | decls decorated by one of `names` imported from one of `modules` |
+| `decorated_decls(modules, names)` | `Vec<usize>` | decls decorated by one of `names` imported from one of `modules`; a decorator is classified by its head call, so a builder suffix (`@launchable().cpus(16)`) matches like `@launchable()` |
 | `constructions(modules, names)` | `Vec<usize>` | `X = Ctor(...)` decls whose `Ctor` is one of `names` imported from one of `modules` |
 | `handler_decorators(attrs)` | `Vec<(String, usize)>` | top-level fns decorated `@<owner>.<attr>(...)` for `attr` in `attrs`; returns `(owner_name, decl_idx)` — the raw textual owner, unresolved |
 | `calls_with_string_arg(modules, name, arg_index)` | `Vec<(usize, String)>` | calls to `name` (imported from one of `modules`) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
 | `calls_on_attr(attr, arg_index)` | `Vec<(usize, String)>` | `<recv>.<attr>(...)` calls (any receiver shape) whose arg at `arg_index` is a string literal; returns `(owning_decl_idx, literal)` |
 | `calls_on_var(owner, attr, arg_index, required_positional)` | `Vec<(usize, String)>` | `<owner>.<attr>(...)` calls where `owner` is a bare variable (`mocker`, `monkeypatch`) and the arg at `arg_index` is a string literal; `required_positional` (if set) restricts to calls with exactly that many positional args |
 | `handler_decorators_via(via_attr, attrs)` | `Vec<(String, usize)>` | two-level twin of `handler_decorators`: `@<owner>.<via_attr>.<attr>(...)` (e.g. `via_attr="tree"` for `@bot.tree.command`) |
-| `decorated_decls_with_args(modules, names)` | `Vec<(usize, CallArgs)>` | args-capturing twin of `decorated_decls`: each match paired with its decorator's captured kwargs (read via `CallArgs`) |
+| `decorated_decls_with_args(modules, names)` | `Vec<(usize, CallArgs)>` | args-capturing twin of `decorated_decls`: each match paired with its decorator's head-call kwargs (read via `CallArgs`) |
 | `factory_decls(modules, ctor_names)` | `Vec<(usize, Vec<String>)>` | fns/classes that *return* an instance of one of `ctor_names` (app-factory shape); `(decl_idx, return_kinds)` |
 | `classes_defining_method(method_name)` | `Vec<usize>` | classes with a top-level `def <method_name>` |
 | `module_surface(module_fqn)` | `Vec<usize>` | the names `from module_fqn import *` would bind |
@@ -176,6 +176,15 @@ scanning the whole graph and the owned `NodeView` for a handful of specific
 indices. `CallArgs` / `ArgValue` (the captured decorator/constructor kwargs
 returned by `decorated_decls_with_args`) are re-exported from `plugin_api`;
 read a keyword via `CallArgs::str_value(name)`.
+
+Every string these queries hand back (positional string args, `CallArgs`
+kwargs, literal-list elements) is **constant-folded** at extraction time: a
+bare literal, implicit concatenation, `"a" + "b"`, an f-string whose
+interpolations fold, the file's own `__name__`, and top-level names bound
+exactly once to a foldable string in the same file all read as the resulting
+string. Anything else (a call, an imported name, `!r`, a format spec, a name
+shadowed in the enclosing `def` / `class`) is unknown, exactly as a non-literal
+always was. The rules live in `runtime/src/string_fold.rs`.
 
 `PluginOps` — emit ops (each maps to one host `PreparedOp`):
 

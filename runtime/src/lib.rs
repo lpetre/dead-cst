@@ -39,6 +39,7 @@ mod progress;
 mod project;
 mod query;
 mod refspec;
+pub(crate) mod string_fold;
 mod topic_registry;
 
 use pyo3::prelude::*;

@@ -9,6 +9,25 @@ two versions.
 
 ## [Unreleased]
 
+### Added
+
+- **Plugin-query string arguments are constant-folded.** Every string a
+  plugin query captures — `mock.patch` / `mocker.patch` / `monkeypatch`
+  targets, `calls_with_string_arg` / `calls_on_attr` / `calls_on_var`
+  literals, decorator and constructor kwargs (`decorated_decls_with_args`,
+  pytest `fixture(name=...)`), and `NAME = [...]` literal lists — now accepts
+  anything that folds to a static string, not just a bare literal: implicit
+  concatenation, `"a" + "b"`, f-strings, the file's own `__name__`
+  (`patch(f"{__name__}.helper")`), and top-level names bound exactly once to
+  a foldable string in the same file (`MODULE = "pkg.lib"` then
+  `patch(f"{MODULE}.helper")`, including constants built from other
+  constants). Folding is conservative: an interpolation with `!r` / `!a`, a
+  non-empty format spec, or `=` debug text is refused; a constant rebound at
+  module level, named in any `global` statement, or shadowed by any binding
+  in the enclosing `def` / `class` (parameters included) is never used; and
+  constants imported from other files are not followed. See
+  `runtime/src/string_fold.rs`.
+
 ### Performance
 
 - **Speculative submodule probes skip single-file parents.** Reference
@@ -43,6 +62,15 @@ two versions.
   before.
 
 ### Fixed
+
+- **Decorator matching peels builder chains.** `decorated_decls`,
+  `decorated_decls_with_args`, `handler_decorators`, and
+  `handler_decorators_via` now classify a decorator by its *head* — the
+  callee of the first call in the chain — so `@launchable().cpus(16)` is
+  matched exactly like `@launchable()` (and `@app.route("/").tag("x")` like
+  `@app.route("/")`). The captured kwargs are the head call's. Previously any
+  decorator whose expression passed through a call was silently dropped from
+  the matcher, so such decls were reported dead.
 
 - **Decorators on classes are matched.** The per-file decorator index only
   read the decorator list of `def` statements, so a decorated `class` was
