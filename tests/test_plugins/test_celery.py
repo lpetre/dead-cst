@@ -149,6 +149,191 @@ def test_celery_plugin_marks_shared_tasks(build_plugin_graph, reachable_fqnames)
     assert "app.tasks.helper" not in reached
 
 
+# `decorated_decls` resolves the decorator *by fqname* (the way
+# `find_subclasses_of_fqn` resolves a base class): every spelling of
+# `celery.shared_task` below must match. Each entry is a set of files; the
+# decl named ``matched`` must be alive and ``unmatched`` dead.
+_SHARED_TASK_SPELLINGS: list[tuple[str, dict[str, str]]] = [
+    (
+        "aliased-from-import",
+        {
+            "app.py": """
+            from celery import shared_task as st
+
+            @st
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
+        "aliased-module-import",
+        {
+            "app.py": """
+            import celery as c
+
+            @c.shared_task()
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
+        "same-file-alias-of-import",
+        {
+            "app.py": """
+            from celery import shared_task
+
+            task = shared_task
+
+            @task
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
+        "star-import",
+        {
+            "app.py": """
+            from celery import *
+
+            @shared_task
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
+        "defined-in-the-decorated-file",
+        {
+            "celery.py": """
+            def shared_task(f):
+                return f
+
+            @shared_task
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+            "other.py": "import celery",
+        },
+    ),
+    (
+        "first-party-reexport-through-package-init",
+        {
+            "celery/__init__.py": "from .tasks import shared_task",
+            "celery/tasks.py": """
+            def shared_task(f):
+                return f
+            """,
+            "app.py": """
+            from celery.tasks import shared_task
+
+            @shared_task
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
+        "first-party-reexport-imported-via-package",
+        {
+            "celery/__init__.py": "from .tasks import shared_task",
+            "celery/tasks.py": """
+            def shared_task(f):
+                return f
+            """,
+            "app.py": """
+            from celery import shared_task
+
+            @shared_task
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
+        "first-party-renamed-reexport",
+        {
+            "celery/__init__.py": "from .tasks import task as shared_task",
+            "celery/tasks.py": """
+            def task(f):
+                return f
+            """,
+            "app.py": """
+            from celery.tasks import task
+
+            @task
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+    (
+        "builder-chain-on-head-call",
+        {
+            "app.py": """
+            from celery import shared_task
+
+            @shared_task(name="x").with_options(retries=3)
+            def matched(): pass
+
+            def unmatched(): pass
+            """,
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "files",
+    [files for _, files in _SHARED_TASK_SPELLINGS],
+    ids=[name for name, _ in _SHARED_TASK_SPELLINGS],
+)
+def test_celery_shared_task_matched_by_resolved_fqname(
+    build_plugin_graph, reachable_fqnames, files
+):
+    graph = build_plugin_graph(files, [native.NativePlugin.celery()])
+    reached = reachable_fqnames(graph)
+    matched = [n.fqname for n in graph.nodes() if n.fqname.endswith(".matched")]
+    unmatched = [n.fqname for n in graph.nodes() if n.fqname.endswith(".unmatched")]
+    assert matched and unmatched
+    assert all(m in reached for m in matched), matched
+    assert not any(u in reached for u in unmatched), unmatched
+
+
+def test_celery_shared_task_not_matched_for_unrelated_decorator_of_same_name(
+    build_plugin_graph, reachable_fqnames
+):
+    """Resolution, not name matching: a first-party ``shared_task`` from an
+    unrelated module is a different definition and must not match."""
+    graph = build_plugin_graph(
+        {
+            "mytasks.py": """
+            def shared_task(f):
+                return f
+            """,
+            "app.py": """
+            import celery
+            from mytasks import shared_task
+
+            @shared_task
+            def not_a_celery_task(): pass
+            """,
+        },
+        [native.NativePlugin.celery()],
+    )
+    assert "app.not_a_celery_task" not in reachable_fqnames(graph)
+
+
 def test_celery_plugin_marks_shared_task_on_class(build_plugin_graph, reachable_fqnames):
     """``@shared_task`` on a *class* must be matched exactly like it is on a
     function: the decorator matcher (``decorated_decls``) has to read the

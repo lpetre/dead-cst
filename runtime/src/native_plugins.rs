@@ -54,13 +54,12 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use ty_project::Db as ProjectDb;
 
 use crate::builder::PreparedOp;
-use crate::file_payload::{file_to_nodes, NodeData, NodeKind};
+use crate::file_payload::{file_to_nodes, MemberSpec, NodeData, NodeKind};
 use crate::flag_registry::FlagRegistry;
 use crate::graph::EdgeFlags;
 use crate::helpers::{
-    collect_modules_imports_local, decorators_match_imports, file_path_string,
-    matched_call_target_any, python_file, top_level_assign_to_name, ArgValue, CallArgs,
-    FactoryCallFinder,
+    collect_modules_imports_local, file_path_string, matched_call_target_any, python_file,
+    top_level_assign_to_name, ArgValue, CallArgs, FactoryCallFinder,
 };
 use crate::ingest::file_package_name;
 use crate::project::FrozenView;
@@ -382,10 +381,20 @@ impl<'db> FileContext<'db> {
         collect_modules_imports_local(parsed, modules, names, self.file_package().as_deref())
     }
 
-    /// True if this file imports any of `modules` — the per-file twin of
-    /// the project-wide ``ProjectContext::has_imports_of``. A presence guard
-    /// a plugin can check before doing heavier per-file work.
+    /// True if this file imports any of `modules` — or *is* one of them
+    /// (or a submodule of one): a file that defines the framework's own
+    /// decorators is one the framework plugin must not skip. The per-file
+    /// twin of the project-wide ``ProjectContext::has_imports_of``. A
+    /// presence guard a plugin can check before doing heavier per-file
+    /// work.
     pub(crate) fn imports_any_module(&self, modules: &[&str]) -> bool {
+        let own = self.module_fqname();
+        if modules
+            .iter()
+            .any(|m| own == *m || own.starts_with(&format!("{m}.")))
+        {
+            return true;
+        }
         let parsed = self.parsed();
         let file_package = self.file_package();
         parsed.syntax().body.iter().any(|stmt| match stmt {
@@ -423,27 +432,45 @@ impl<'db> FileContext<'db> {
     }
 
     /// File-local indices of top-level function / class decls carrying a
-    /// decorator that resolves (through this file's imports) to one of
-    /// `names` imported from one of `modules`. The per-file twin of the
-    /// project-wide ``ProjectContext::find_decorated_decls``.
-    pub(crate) fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
-        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
-        let names_set: FxHashSet<&str> = names.iter().copied().collect();
-        let parsed = self.parsed();
-        let imports = self.matching_imports(&parsed, &modules_owned, &names_set);
-        if imports.is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        for stmt in &parsed.syntax().body {
-            let (decorators, name_range) = match stmt {
-                Stmt::FunctionDef(f) => (&f.decorator_list, f.name.range()),
-                Stmt::ClassDef(c) => (&c.decorator_list, c.name.range()),
-                _ => continue,
+    /// decorator whose head names one of `fqnames`. The per-file twin of
+    /// the project-wide ``ProjectContext::find_decorated_decls`` — but
+    /// *file-local by construction*: this runs inside the build fan-out,
+    /// before any cross-file resolution exists, so a decorator matches by
+    /// its symbolic spelling (`module.name` after this file's import /
+    /// alias / same-file-alias following, or a same-file decl's fqname).
+    /// Re-exports through *other* files are not followed here; the
+    /// project-wide query does that.
+    pub(crate) fn decorated_decls(&self, fqnames: &[&str]) -> Vec<u32> {
+        self.decorated_decls_with_args(fqnames)
+            .into_iter()
+            .map(|(local, _)| local)
+            .collect()
+    }
+
+    /// Args-capturing twin of [`Self::decorated_decls`]: each match paired
+    /// with the matching decorator's head-call kwargs (first matching
+    /// decorator wins).
+    pub(crate) fn decorated_decls_with_args(&self, fqnames: &[&str]) -> Vec<(u32, CallArgs)> {
+        let payload = file_to_nodes(self.db, self.file);
+        let by_range = self.name_range_to_local();
+        let mut out: Vec<(u32, CallArgs)> = Vec::new();
+        for (decl_rk, specs) in &payload.decorators {
+            let Some(&local) = by_range.get(decl_rk) else {
+                continue;
             };
-            if decorators_match_imports(decorators, &imports, &names_set).is_some() {
-                if let Some(idx) = self.local_idx_for_name_range(name_range) {
-                    out.push(idx);
+            for spec in specs.iter() {
+                let text: compact_str::CompactString = match &spec.target {
+                    MemberSpec::Local(rk) => match by_range.get(rk) {
+                        Some(&target_local) => payload.nodes[target_local as usize].fqname.clone(),
+                        None => continue,
+                    },
+                    MemberSpec::ModuleMember { module, name } => {
+                        compact_str::format_compact!("{module}.{name}")
+                    }
+                };
+                if fqnames.iter().any(|f| *f == text.as_str()) {
+                    out.push((local, spec.kwargs.clone()));
+                    break;
                 }
             }
         }
@@ -556,51 +583,6 @@ impl<'db> FileContext<'db> {
     /// one computation per file rather than each rebuilding the map.
     fn name_range_to_local(&self) -> &'db rustc_hash::FxHashMap<(u32, u32), u32> {
         decl_name_range_to_local(self.db, self.file)
-    }
-
-    /// Per-file twin of `find_decorated_decls(extract_args = true)`: file-local
-    /// indices of decls decorated by one of `names` from one of `modules`,
-    /// paired with the decorator's captured kwargs. Mirrors
-    /// `find_decorated_decls_core`'s inner loop (first matching decorator wins).
-    fn decorated_decls_with_args(&self, modules: &[&str], names: &[&str]) -> Vec<(u32, CallArgs)> {
-        let facts = crate::file_extraction::file_extraction(self.db, self.file);
-        let names_set: FxHashSet<&str> = names.iter().copied().collect();
-        let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
-        let imports = crate::file_extraction::imports_local_from_facts(
-            &facts.import_facts,
-            &modules_owned,
-            &names_set,
-        );
-        if imports.is_empty() {
-            return Vec::new();
-        }
-        let by_range = self.name_range_to_local();
-        let mut out: Vec<(u32, CallArgs)> = Vec::new();
-        for (rk, descriptors) in &facts.decorator_rows {
-            let Some(&local) = by_range.get(rk) else {
-                continue;
-            };
-            for desc in descriptors {
-                let matched = match desc.attrs.as_slice() {
-                    [] => imports
-                        .get(&desc.root_name)
-                        .is_some_and(|target| names_set.contains(target.as_str())),
-                    [attr] => {
-                        imports
-                            .get(&desc.root_name)
-                            .map(compact_str::CompactString::as_str)
-                            == Some(crate::helpers::MODULE_ALIAS_MARKER)
-                            && names_set.contains(attr.as_str())
-                    }
-                    _ => false,
-                };
-                if matched {
-                    out.push((local, desc.kwargs.clone()));
-                    break;
-                }
-            }
-        }
-        out
     }
 
     /// `file-local idx → parameter names` for this file's top-level functions,
@@ -2099,15 +2081,23 @@ pub mod plugin_api {
             self.inner.decls_matching_name_indices(pattern)
         }
 
-        /// Project-wide twin of [`PluginFileCtx::decorated_decls`]:
-        /// function / class decls anywhere in the project carrying a
-        /// decorator that resolves to one of `names` imported from one of
-        /// `modules`.
-        pub fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<usize> {
-            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
-            let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        /// Function / class decls anywhere in the project decorated by one
+        /// of the decorators named by dotted `fqnames` (`"pytest.fixture"`,
+        /// `"myfw.launchable"`), resolved through ty's module resolver the
+        /// same way [`Self::find_subclasses_of_fqn`] resolves a base class —
+        /// so every spelling of the decorator matches: a direct import, an
+        /// alias, a re-export through a package `__init__`, a sibling
+        /// module, `from X import *`, or a definition in the decorated
+        /// decl's own file. A builder chain on the decorator
+        /// (`@launchable().cpus(16)`) is classified by its head call. A
+        /// decorator whose target can't be resolved (dependency not
+        /// installed, or not a module member such as
+        /// `pytest.mark.parametrize`) still matches by its textual
+        /// `module.name`.
+        pub fn decorated_decls(&self, fqnames: &[&str]) -> Vec<usize> {
+            let owned: Vec<String> = fqnames.iter().map(|f| f.to_string()).collect();
             self.inner
-                .find_decorated_decls(&modules_owned, &names_owned, false)
+                .find_decorated_decls(&owned, false)
                 .into_iter()
                 .map(|(idx, _)| idx)
                 .collect()
@@ -2225,15 +2215,9 @@ pub mod plugin_api {
         /// with its decorator's captured keyword arguments
         /// ([`CallArgs`]). Read values via [`CallArgs::str_value`] — e.g.
         /// the `name=` alias on `@pytest.fixture(name="…")`.
-        pub fn decorated_decls_with_args(
-            &self,
-            modules: &[&str],
-            names: &[&str],
-        ) -> Vec<(usize, CallArgs)> {
-            let modules_owned: Vec<String> = modules.iter().map(|m| m.to_string()).collect();
-            let names_owned: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-            self.inner
-                .find_decorated_decls(&modules_owned, &names_owned, true)
+        pub fn decorated_decls_with_args(&self, fqnames: &[&str]) -> Vec<(usize, CallArgs)> {
+            let owned: Vec<String> = fqnames.iter().map(|f| f.to_string()).collect();
+            self.inner.find_decorated_decls(&owned, true)
         }
 
         /// Functions / classes that *return* an instance of one of `names`
@@ -2641,13 +2625,17 @@ pub mod plugin_api {
         }
 
         /// File-local indices of top-level function / class decls decorated
-        /// by one of `names` imported from one of `modules`
-        /// (e.g. `modules=["flask"], names=["route"]` for `@app.route` via
-        /// a `Flask` instance is *not* this — this matches decorators bound
-        /// directly to an imported name; instance-method decorators need the
-        /// project-wide query).
-        pub fn decorated_decls(&self, modules: &[&str], names: &[&str]) -> Vec<u32> {
-            self.inner.decorated_decls(modules, names)
+        /// by one of the decorators named by dotted `fqnames`
+        /// (`"click.group"`). File-local twin of
+        /// [`PluginCtx::decorated_decls`]: a decorator matches by its
+        /// symbolic spelling after *this file's* import / alias /
+        /// same-file-alias following (`from click import group as g` +
+        /// `@g`, `import click as c` + `@c.group`, a same-file `def group`
+        /// in module `click`, …); re-exports through other files are not
+        /// followed here. `@app.route` on an instance is *not* this — see
+        /// `handler_decorators_local`.
+        pub fn decorated_decls(&self, fqnames: &[&str]) -> Vec<u32> {
+            self.inner.decorated_decls(fqnames)
         }
 
         /// File-local indices of top-level ``X = Ctor(...)`` decls whose
@@ -2678,12 +2666,8 @@ pub mod plugin_api {
         /// File-local decls decorated by one of `names` from one of `modules`,
         /// paired with the decorator's captured kwargs. See
         /// [`FileContext::decorated_decls_with_args`].
-        pub(crate) fn decorated_decls_with_args(
-            &self,
-            modules: &[&str],
-            names: &[&str],
-        ) -> Vec<(u32, CallArgs)> {
-            self.inner.decorated_decls_with_args(modules, names)
+        pub(crate) fn decorated_decls_with_args(&self, fqnames: &[&str]) -> Vec<(u32, CallArgs)> {
+            self.inner.decorated_decls_with_args(fqnames)
         }
 
         /// `file-local idx → function parameter names`.
@@ -3233,8 +3217,8 @@ impl plugin_api::ExternalPlugin for UnittestPluginImpl {
 /// (imported from `module`) is kept alive directly. `None` for non-celery
 /// configs.
 struct SharedTaskFanout {
-    module: String,
-    names: Vec<String>,
+    /// Dotted fqnames of the appless task decorators (`celery.shared_task`).
+    decorators: Vec<String>,
 }
 
 /// Pure-data description of a dispatch-app framework — the Rust twin of the
@@ -3449,8 +3433,8 @@ impl plugin_api::ExternalPlugin for DispatchAppPluginImpl {
         // shared_task (celery): `@shared_task`-decorated decls.
         let shared_idxs: Vec<usize> = match &cfg.shared_task {
             Some(st) => {
-                let names_ref: Vec<&str> = st.names.iter().map(String::as_str).collect();
-                ctx.decorated_decls(&[st.module.as_str()], &names_ref)
+                let fqnames: Vec<&str> = st.decorators.iter().map(String::as_str).collect();
+                ctx.decorated_decls(&fqnames)
             }
             None => Vec::new(),
         };
@@ -3661,8 +3645,7 @@ fn celery_config() -> DispatchAppConfig {
         registration_decorators: owned(&["task"]),
         seed_as_entrypoint: true,
         shared_task: Some(SharedTaskFanout {
-            module: "celery".to_string(),
-            names: owned(&["shared_task"]),
+            decorators: owned(&["celery.shared_task"]),
         }),
     }
 }
@@ -3681,7 +3664,7 @@ fn celery_config() -> DispatchAppConfig {
 // registered on it in another), hence project-wide.
 // ---------------------------------------------------------------------------
 
-const CLICK_GROUP_DECORATORS: [&str; 2] = ["group", "Group"];
+const CLICK_GROUP_DECORATORS: [&str; 2] = ["click.group", "click.Group"];
 const CLICK_REGISTRATION_DECORATORS: [&str; 3] = ["command", "group", "result_callback"];
 const CLICK_SUBGROUP_DECORATOR: &str = "group";
 
@@ -3697,7 +3680,7 @@ impl plugin_api::PerFilePlugin for ClickPluginImpl {
         // --- Phase 1: gather file-local indices. ---
 
         // Groups via `@click.group` / `@click.Group`-decorated decls.
-        let group_decls = file.decorated_decls(&["click"], &CLICK_GROUP_DECORATORS);
+        let group_decls = file.decorated_decls(&CLICK_GROUP_DECORATORS);
         // Groups via `X = click.Group(...)` constructions.
         let group_ctors = file.constructions(&["click"], &["Group"]);
         // No groups => no wiring to do (the fixpoint would no-op anyway).
@@ -4688,7 +4671,7 @@ impl plugin_api::PerFilePlugin for PytestPluginImpl {
 
         // `@pytest.fixture`-decorated decls (in any file): flagged a fixture,
         // and their binding name published for the cross-file param match.
-        for (local, args) in file.decorated_decls_with_args(&["pytest"], &["fixture"]) {
+        for (local, args) in file.decorated_decls_with_args(&["pytest.fixture"]) {
             ops.emit_fact(PYTEST_TOPIC_FIXTURE_FLAG, Some(local), "");
             let binding: compact_str::CompactString = match args.kwargs.get("name") {
                 Some(ArgValue::Str(alias)) => alias.clone(),

@@ -43,6 +43,28 @@ two versions.
 
 ### Changed
 
+- **`decorated_decls` takes decorator fqnames and resolves them.** Both the
+  project-wide `PluginCtx::decorated_decls` / `decorated_decls_with_args` and
+  the per-file `PluginFileCtx` twins now take a list of dotted fqnames
+  (`["pytest.fixture"]`, `["click.group", "click.Group"]`) instead of a
+  `(modules, names)` pair. The project-wide query resolves each fqname through
+  the same `resolve_member_def` machinery `find_subclasses_of_fqn` uses for a
+  base class, and each decorator's head is recorded per file as a symbolic
+  `MemberSpec` (like class bases) and resolved at assembly, so every spelling
+  of one decorator matches: a direct import, an alias, a re-export through a
+  package `__init__`, a sibling-module spelling, `from X import *`, and a
+  definition in the decorated decl's own file. A target that does not resolve
+  (dependency not installed, or not a module member such as
+  `pytest.mark.parametrize`) still matches by its textual `module.name`, so
+  nothing the old import-syntax matcher found is lost. The per-file twin runs
+  inside the build fan-out before cross-file resolution exists, so it matches
+  by spelling after *its own* file's import / alias following (and same-file
+  definitions); re-exports through other files need the project-wide query.
+  `imports_any_module` also reports true for a file that *is* (or is under)
+  one of the modules, so a framework plugin's presence guard no longer skips
+  the file that defines the decorators. Breaking for external plugins calling
+  either query — pass `"module.name"` strings instead.
+
 - **Vendored `ruff` (ty) submodule bumped to upstream `astral-sh/ruff@0451200c`**
   (2026-09-05, ~1740 commits past the previous `lpetre/ruff@ca70e77` pin). The
   fork-only "search-path cache by top-level component" patch is dropped:
