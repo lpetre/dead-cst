@@ -7,7 +7,7 @@ name = "dead-cst-plugin-host"
 # Must match the `dead-cst` version exactly — the runtime ABI fingerprint
 # (rustc commit + version) is checked when a plugin loads. The publish
 # workflow keeps these in lockstep.
-version = "0.14.1"
+version = "0.15.0"
 description = "Prebuilt dead-cst dependency closure for compiling native plugins."
 readme = "README.md"
 license = "MIT"

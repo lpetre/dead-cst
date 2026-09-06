@@ -9,6 +9,8 @@ two versions.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-06
+
 ### Added
 
 - **Plugin-query string arguments are constant-folded.** Every string a
@@ -58,8 +60,7 @@ two versions.
   resolution only: each fqname must name a module member resolvable from the
   analysis environment, so a decorator from a dependency that is not
   installed, or a non-module attribute such as `pytest.mark.parametrize`,
-  matches nothing. The per-file twin runs
-  inside the build fan-out before cross-file resolution exists, so it matches
+  matches nothing. The per-file twin runs inside the build fan-out before cross-file resolution exists, so it matches
   by spelling after *its own* file's import / alias following (and same-file
   definitions); re-exports through other files need the project-wide query.
   `imports_any_module` also reports true for a file that *is* (or is under)
@@ -2846,7 +2847,11 @@ versions until the first stable release.
 - `README.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, and `ROADMAP.md` with a
   stack-ranked plan from alpha to 1.0.
 
-[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/lpetre/dead-cst/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/lpetre/dead-cst/compare/v0.14.1...v0.15.0
+[0.14.1]: https://github.com/lpetre/dead-cst/compare/v0.14.0...v0.14.1
+[0.14.0]: https://github.com/lpetre/dead-cst/compare/v0.13.0...v0.14.0
+[0.13.0]: https://github.com/lpetre/dead-cst/compare/v0.12.2...v0.13.0
 [0.12.2]: https://github.com/lpetre/dead-cst/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/lpetre/dead-cst/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/lpetre/dead-cst/compare/v0.11.0...v0.12.0

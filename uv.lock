@@ -722,7 +722,7 @@ dev = [
 
 [[package]]
 name = "dead-cst-plugin-host"
-version = "0.14.1"
+version = "0.15.0"
 source = { editable = "plugin-host" }
 
 [[package]]
