@@ -37,6 +37,25 @@ retains their results across builds, gated by recorded read sets plus
 the salsa-tracked `resolution_surface_fp`. Anything salsa *can* track
 must stay a tracked query, not a cache entry.
 
+**Speculative module probes don't go to ty's resolver unfiltered.**
+The reference walk asks "is `pkg.attr` a submodule?" for every
+attribute chain rooted at a package alias — millions of distinct names
+on a monorepo, nearly all misses. Each name ty resolves leaves a
+`resolve_module_query` memo whose dependency list covers every search
+path scanned (~9 bytes per search path per name), so with a thousand
+editable members every probe retains ~10 KB for the life of the db;
+that was the 0.15.0 memory regression. `ingest::resolve_dotted_module`
+therefore resolves the parent (memoized, a real module) and answers
+the probe from that package's own `directory_listing` — exact for a
+regular `__init__.py` package — and only lets real submodules, or
+parents whose listing isn't authoritative (namespace and legacy
+`extend_path` / `declare_namespace` packages, stub packages, vendored
+typeshed), through to `resolve_module`. Route every new speculative
+lookup through `resolve_dotted_module`; never call `resolve_module`
+directly with a name you're merely testing for existence.
+`DEAD_CST_MEMORY_REPORT=1` prints ty's salsa memory dump after a build
+to check the memo tables.
+
 ### 2. Every import binds a local declaration
 
 Every import materializes a `kind="import"` node in the *importing*

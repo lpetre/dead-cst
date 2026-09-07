@@ -3494,6 +3494,19 @@ impl ProjectContext {
         Ok(self.materialized("_last_resolve_counts")?.resolve_stats)
     }
 
+    /// ty's salsa memory dump (`ProjectDatabase::salsa_memory_dump`):
+    /// per-ingredient and per-query memo counts and sizes. ``full``
+    /// lists every table; otherwise the short summary. Diagnostic only
+    /// — not part of the supported surface.
+    pub(crate) fn _salsa_memory_report(&self, full: bool) -> String {
+        let dump = self.db.salsa_memory_dump();
+        if full {
+            dump.display_full().to_string()
+        } else {
+            dump.display_short().to_string()
+        }
+    }
+
     /// Sorted dense node indices tombstoned by incremental re-mints:
     /// slots whose file block was replaced by a later
     /// ``re_materialize``. The slots stay in place (live indices never
@@ -3785,6 +3798,17 @@ impl ProjectContext {
                     parsed_module(&this.db, python_file(&this.db, file)).clear();
                 }
             }
+        }
+
+        // `DEAD_CST_MEMORY_REPORT=1` (or `=full`) prints ty's salsa memory
+        // dump — per-ingredient / per-query memo counts and sizes — to
+        // stderr once the build has settled, the same way `DEAD_CST_TIMING`
+        // prints the per-phase line. This is what locates a memory
+        // regression: a memo table whose *metadata* dwarfs its fields is
+        // retaining dependency edges, one per salsa query its result read.
+        if let Some(mode) = std::env::var_os("DEAD_CST_MEMORY_REPORT") {
+            let this = slf.borrow(py);
+            eprintln!("{}", this._salsa_memory_report(mode == "full"));
         }
 
         // No snapshot: the live graph is queried through the context

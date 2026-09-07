@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 
 use compact_str::{CompactString, ToCompactString};
 use pyo3::prelude::*;
-use ruff_db::files::{File, FilePath};
+use ruff_db::files::{directory_listing, File, FilePath};
+use ruff_db::source::source_text;
 use ruff_python_ast::{Expr, ExprCall, ExprName, Stmt};
 use ruff_text_size::Ranged;
 use ty_module_resolver::{resolve_module, search_paths, Module, ModuleName, ModuleResolveMode};
@@ -696,12 +697,75 @@ fn resolve_module_name<'db>(
     name: &ModuleName,
 ) -> Option<Module<'db>> {
     if let Some(parent) = name.parent() {
-        if resolve_module_name(db, anchor, &parent)?
-            .kind(db)
-            .is_module()
-        {
+        let parent_module = resolve_module_name(db, anchor, &parent)?;
+        if parent_module.kind(db).is_module() {
+            return None;
+        }
+        let child = name.components().next_back()?;
+        if !package_may_have_submodule(db, parent_module, child) {
             return None;
         }
     }
     resolve_module(db, crate::helpers::importing_file(db, anchor), name)
+}
+
+/// Whether the resolved package `parent` can have a submodule named
+/// `child`, answered from the package's own directory listing whenever
+/// that listing is exact.
+///
+/// Asking ty's resolver is not free even when the answer is memoized:
+/// `resolve_module_query` records a dependency on every search path it
+/// scanned for the name, so each *distinct* probe retains
+/// `O(search paths)` of memo metadata for the life of the db — with a
+/// thousand editable workspace members that is ~10 KB per probe, and the
+/// speculative probes number in the millions on a monorepo (one per
+/// distinct `alias.attr` chain), which is how upstream ty's resolver
+/// (whose directory-listing candidate rejection replaced the fork-side
+/// per-root search-path cache) turned assemble into a memory blow-up. A
+/// regular package (`__init__.py`) keeps its submodules beside that
+/// file, so one memoized `directory_listing` of that directory decides
+/// the probe; the resolver is only consulted when it says yes (the hit
+/// is then a real module, bounded by the project) or when the listing
+/// cannot be trusted:
+///
+/// * a namespace package (no `__init__`) or a legacy
+///   `pkg_resources.declare_namespace` / `pkgutil.extend_path` package
+///   spreads its submodules over several search paths;
+/// * a stub package (`__init__.pyi`) may be partial and sit beside the
+///   runtime package that carries the submodule; ty's precedence rules
+///   decide;
+/// * a vendored (typeshed) or virtual parent has no system directory.
+fn package_may_have_submodule(db: &dyn ProjectDb, parent: Module<'_>, child: &str) -> bool {
+    let Some(init) = parent.file(db) else {
+        return true;
+    };
+    let FilePath::System(init_path) = init.path(db) else {
+        return true;
+    };
+    if init_path.extension() != Some("py") {
+        return true;
+    }
+    let Some(dir) = init_path.parent() else {
+        return true;
+    };
+    let Ok(listing) = directory_listing(db, dir) else {
+        return true;
+    };
+    listing.entry_is_directory(db, dir, child)
+        || listing.entry_is_file(db, dir, &format!("{child}.py"))
+        || listing.entry_is_file(db, dir, &format!("{child}.pyi"))
+        || is_legacy_namespace_init(db, init)
+}
+
+/// Whether a package's `__init__.py` declares a legacy namespace package
+/// (`pkg_resources.declare_namespace(__name__)` or
+/// `__path__ = pkgutil.extend_path(__path__, __name__)`), whose
+/// submodules may live on any search path. A substring check mirrors
+/// ty's own syntax-only detection conservatively: any mention of either
+/// idiom defers to the resolver. Memoized per file — the same package is
+/// probed once per distinct attribute chain rooted at it.
+#[salsa::tracked(returns(copy), heap_size = ruff_memory_usage::heap_size)]
+fn is_legacy_namespace_init(db: &dyn ProjectDb, init: File) -> bool {
+    let source = source_text(db, init);
+    source.contains("declare_namespace") || source.contains("extend_path")
 }

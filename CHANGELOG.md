@@ -9,6 +9,36 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Memory blow-up in `assemble` on workspaces with many members (0.15.0
+  regression).** The 0.15.0 sync onto upstream ty dropped the fork-side
+  per-root search-path cache in favour of upstream's directory-listing
+  candidate rejection. That keeps resolver *misses* cheap in time, but
+  every `resolve_module_query` memo now records a dependency on each
+  search path it scanned, so each distinct module name ever resolved
+  retains `O(search paths)` of salsa memo metadata (~9 bytes per search
+  path per name -- ~10 KB per name with a thousand editable members). The
+  reference walk's speculative `alias.attr` submodule probes are exactly
+  such distinct names, one per attribute chain rooted at a package alias,
+  which on a large monorepo runs to millions; 0.15.x grew without bound
+  where 0.14.1 plateaued. Probes are now answered from the resolved
+  parent package's own directory listing (one memoized listing per
+  package: a regular `__init__.py` package keeps its submodules beside
+  it), and only real submodules -- or parents whose listing is not
+  authoritative: namespace packages, legacy `pkg_resources` /
+  `pkgutil.extend_path` packages, stub packages, vendored typeshed -- reach
+  ty's resolver. On the synthetic 18k-module workspace corpus the
+  `resolve_module_query` table drops from 2.5 GB (1200 members) to the
+  same handful of MB regardless of member count.
+
+### Added
+
+- **`DEAD_CST_MEMORY_REPORT=1` (or `=full`)** prints ty's salsa memory
+  dump -- per-ingredient and per-query memo counts and sizes -- to stderr
+  after `materialize`, alongside the existing `DEAD_CST_TIMING` phase line.
+  `ProjectContext._salsa_memory_report(full)` returns the same text.
+
 ## [0.15.1] - 2026-09-07
 
 ### Added
