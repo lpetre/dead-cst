@@ -34,7 +34,7 @@ import typer
 
 from dead_cst import _native as native
 
-from .analyze import Analysis
+from .analyze import Analysis, _dead_test_indices
 from .codemod import generate_patch
 from .graph import (
     GraphMetadata,
@@ -91,6 +91,10 @@ class OutputFormat(str, Enum):
 class Query(str, Enum):
     dead = "dead"
     test_only = "test-only"
+    dead_tests = "dead-tests"
+
+
+_QUERY_HELP = "Reachability question: 'dead', 'test-only', or 'dead-tests'."
 
 
 def setup_logging(verbose: bool) -> None:
@@ -224,6 +228,25 @@ def _select_dead(view: GraphView, query: Query) -> list[SymbolNode]:
         full = set(view.reachable(seed_flags=seed_mask))
         without_tests = set(view.reachable(seed_flags=seed_mask & ~(testcase | fixture)))
         return list(full - without_tests)
+    if query is Query.dead_tests:
+        testcase = view.node_flag("test/testcase")
+        if testcase is None:
+            typer.echo(
+                "--query dead-tests: no test plugin registered (pass --plugin pytest "
+                "or --plugin unittest), so no node carries the test/testcase flag.",
+                err=True,
+            )
+            return []
+        fixture = view.node_flag("test/fixture") or 0
+        nodes = view.nodes()
+        dead = _dead_test_indices(
+            nodes,
+            view.edges(),
+            seed_flags=seed_mask,
+            testcase_flag=testcase,
+            test_seed_flags=testcase | fixture,
+        )
+        return [nodes[idx] for idx in sorted(dead)]
     raise typer.BadParameter(f"unknown --query value: {query!r}")
 
 
@@ -321,7 +344,7 @@ def analyze(
     ] = None,
     query: Annotated[
         Query,
-        typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
+        typer.Option("--query", help=_QUERY_HELP),
     ] = Query.dead,
     venv: Annotated[
         Path | None,
@@ -435,7 +458,7 @@ def remove(
     ] = None,
     query: Annotated[
         Query,
-        typer.Option("--query", help="Reachability question: 'dead' or 'test-only'."),
+        typer.Option("--query", help=_QUERY_HELP),
     ] = Query.dead,
     venv: Annotated[
         Path | None,
