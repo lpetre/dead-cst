@@ -10,6 +10,7 @@ import logging
 
 import pytest
 
+from dead_cst import _native as native
 from dead_cst.graph import NodeFlags
 from dead_cst.plugins._core import EXTERNAL_PREFIXES
 
@@ -1365,6 +1366,42 @@ def test_from_import_prefers_namespace_binding_over_submodule(build_decl_graph):
     # order would wrongly add ("p.q", "module"); the namespace-first
     # order matches CPython and skips it.
     assert ("p.q", "module") not in targets, targets
+
+
+def test_script_local_module_beats_root_namespace_package(
+    write_files, make_analysis, successors_of
+):
+    """``import foo`` from ``scripts/main.py`` when the project root holds
+    a bare ``foo/`` directory (a namespace package) and ``scripts/`` holds
+    its own ``foo.py``.
+
+    CPython only builds a namespace package when *no* ``sys.path`` entry
+    has a regular ``foo``, and running ``scripts/main.py`` puts
+    ``scripts/`` on ``sys.path``, so ``foo.helper()`` calls into
+    ``scripts/foo.py``. ty's resolver mirrors that: a regular module
+    found through the importing file's ancestor directories wins over a
+    namespace package found on the configured search paths, so the
+    alias resolves to the ``scripts.foo`` module and ``helper`` is live.
+    """
+    write_files(
+        {
+            "foo/bar.py": "def unrelated(): pass\n",
+            "scripts/foo.py": "def helper(): pass\n",
+            "scripts/main.py": "import foo\nfoo.helper()\n",
+        }
+    )
+    analysis = make_analysis(plugins=[native.NativePlugin.explicit([], ["scripts.main"], [])])
+    graph = analysis.materialize_all()
+
+    alias = next(n for n in graph.nodes() if n.fqname == "scripts.main.foo" and n.kind == "import")
+    targets = {(s.fqname, s.kind) for s in successors_of(graph, alias)}
+    assert ("scripts.foo", "module") in targets, targets
+
+    reachable = set(graph.reachable(seed_flags=graph.default_seed_mask()))
+    helper = next(n for n in graph.nodes() if n.fqname == "scripts.foo.helper")
+    assert helper in reachable
+    unrelated = next(n for n in graph.nodes() if n.fqname == "foo.bar.unrelated")
+    assert unrelated not in reachable
 
 
 def test_star_reexport_mints_per_name_and_statement_nodes(build_decl_graph):

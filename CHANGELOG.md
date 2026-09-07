@@ -9,6 +9,20 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A script-local module now beats a same-named namespace package.** With a
+  bare `foo/` directory (no `__init__.py`) at the project root and a
+  `scripts/foo.py` next to `scripts/main.py`, `import foo` in `main.py`
+  resolved to the namespace package, so the alias pointed nowhere and every
+  decl in `scripts/foo.py` it used was reported dead. CPython only builds a
+  namespace package when *no* `sys.path` entry holds a regular `foo`, and
+  running `scripts/main.py` puts `scripts/` on `sys.path`, so `scripts/foo.py`
+  is what actually loads. The vendored ty now consults the importing file's
+  ancestor directories whenever the configured search paths yield nothing
+  better than a namespace package, and prefers a file-backed module found
+  there; the alias resolves to `scripts.foo` and its decls stay live.
+
 ## [0.15.1] - 2026-09-07
 
 ### Added
