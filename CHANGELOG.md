@@ -38,9 +38,28 @@ two versions.
   it), and only real submodules -- or parents whose listing is not
   authoritative: namespace packages, legacy `pkg_resources` /
   `pkgutil.extend_path` packages, stub packages, vendored typeshed -- reach
-  ty's resolver. On the synthetic 18k-module workspace corpus the
-  `resolve_module_query` table drops from 2.5 GB (1200 members) to the
-  same handful of MB regardless of member count.
+  ty's resolver. On the synthetic 18k-module, 1200-member workspace
+  corpus this cuts the names ty resolves from 240k to 42k and peak RSS
+  from 4.5 GB to 2.2 GB; the vendored ty fix below takes the remaining
+  per-name cost out of the resolver itself (1.7 GB peak, and the
+  `resolve_module_query` table at a handful of MB regardless of member
+  count).
+
+### Changed
+
+- **Vendored `ruff` (ty) submodule bumped to `lpetre/ruff@56f315a3`**, one
+  fork patch on top of the 0.15.0 pin: search-path root discovery is
+  memoized per top-level module-name component (a new `root_candidates`
+  salsa query keyed on the first component, mode, scope, and
+  shadowability) instead of being redone, and re-recorded as `O(search
+  paths)` dependency edges, inside every `resolve_module_query` memo.
+  Every module name sharing a root now depends on one memo, so the
+  resolver's per-name memory no longer scales with the number of editable
+  members: on the 1200-member corpus the `resolve_module_query` table
+  drops from 580 MB to 5.5 MB (plus 23 MB of `root_candidates`) with the
+  same graph. Invalidation stays as fine-grained as before -- a changed
+  search path re-runs only its root discovery, and salsa backdates an
+  equal candidate list. The patch is being proposed upstream.
 
 ### Added
 
