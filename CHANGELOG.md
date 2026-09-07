@@ -11,6 +11,16 @@ two versions.
 
 ### Fixed
 
+- **Recursive functions no longer hang the build (0.15.0 regression).** The
+  per-file module-value extraction follows a function's `return` expressions
+  so `get_config().NAME` can land on the module `get_config` returns. A
+  `return f(...)` inside `f` walked back into `f`, and with two such returns
+  the walk fanned out `2^depth` before the depth cap ended it -- `materialize`
+  never returned on a three-line function like `def f(x, k=0): if k == 0:
+  return f(x, k=1) ...`. The walk now treats a definition already on its path
+  as a cycle and computes each `(definition, trailing steps)` pair once;
+  `local_member_defs` also reports a `def` once instead of twice (as both a
+  binding and a declaration), which had squared the fan-out.
 - **Memory blow-up in `assemble` on workspaces with many members (0.15.0
   regression).** The 0.15.0 sync onto upstream ty dropped the fork-side
   per-root search-path cache in favour of upstream's directory-listing
