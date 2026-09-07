@@ -100,15 +100,23 @@ Concrete contract:
   segment that resolves as neither (or at the chain's end).
 * **Attribute chains on module-denoting bindings.** The same walk
   applies when the chain's root is not an import statement but still
-  denotes a module: a top-level variable holding one (`m = config`,
+  denotes a module: a variable holding one (`m = config`,
   `m = importlib.import_module('pkg.config')`, `m = pkg.sub`), a
-  top-level function whose `return` expressions denote one (`def f():
+  function whose `return` expressions denote one (`def f():
   return config`, so `f().NAME`), or a re-exporting import alias in
   the upstream file. Such bindings carry a `ModuleValue` — an
   `ImportPayload` plus the steps already applied — computed per file
   by `helpers::module_values_for_def` from the file's own use-def
   chain (same-file hops folded in, mirroring `classify_base`; no type
-  inference, no cross-file reads). The walk emits the usual `Use`
+  inference, no cross-file reads). Names in the value are looked up
+  lexically from the binding's own scope (a function's returns from
+  its body scope), so a local shadowing a module alias denotes
+  nothing and `def f(): m = importlib.import_module(…); return m`
+  still denotes the module. Top-level bindings carry their
+  `ModuleValue`s on the node; a binding inside a `def` / `class` body
+  has no node, so `find_local_bindings` classifies it on demand
+  (`Resolution::NestedModuleValue`, the sibling of `NestedImport`)
+  and the use's edges flow from the enclosing top-level owner. The walk emits the usual `Use`
   member spec from it, and `resolve_use` splices a landed decl's
   `ModuleValue`s into the chain walk at assembly, which is where
   cross-file hops happen (`from helpers import get_config` then

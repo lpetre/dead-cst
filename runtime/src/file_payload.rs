@@ -595,9 +595,13 @@ pub(crate) fn file_to_nodes(db: &dyn ProjectDb, file: File) -> FileNodes {
             None
         };
         let module_values = match node_kind {
-            NodeKind::Variable | NodeKind::Function => {
-                crate::helpers::module_values_for_def(db, file, &parsed, kind)
-            }
+            NodeKind::Variable | NodeKind::Function => crate::helpers::module_values_for_def(
+                db,
+                file,
+                &parsed,
+                FileScopeId::global(),
+                kind,
+            ),
             _ => Vec::new(),
         };
 

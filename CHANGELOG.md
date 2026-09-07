@@ -44,6 +44,20 @@ two versions.
   per-name cost out of the resolver itself (1.7 GB peak, and the
   `resolve_module_query` table at a handful of MB regardless of member
   count).
+- **Attribute access on a module held in a function- or class-local
+  variable resolves.** 0.15.0 taught `m = importlib.import_module('pkg.config');
+  m.NAME` to edge to `pkg.config.NAME`, but only for a module-level `m`: the
+  module-value descriptor was computed for top-level nodes alone, and a name
+  bound inside a `def` / `class` body has no node, so the same two lines
+  inside a function emitted nothing past the `DYNAMIC_IMPORT` edge and
+  `pkg.config.NAME` was reported dead. Bindings in nested scopes are now
+  classified on demand from their own scope — `m = importlib.import_module(…)`,
+  `m = config` (including via a nested `from pkg import config`), and an
+  inner `def get(): return config` used as `get().NAME` — and the use's
+  edges flow from the enclosing top-level owner, exactly like a nested
+  `import`. Names in a value are looked up lexically (innermost binding
+  scope first), so a top-level `def get(): m = importlib.import_module(…);
+  return m` followed by `get().NAME` now follows the local too.
 
 ### Changed
 

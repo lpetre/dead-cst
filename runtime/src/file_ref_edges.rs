@@ -39,7 +39,7 @@ use ty_python_semantic::SemanticModel;
 
 use crate::file_payload::{
     def_key, file_to_nodes, import_payload_for_pure as import_payload_for, ChainStep, FileNodes,
-    ImportPayload, NodeData, NodeKind, NodeRef,
+    ImportPayload, ModuleValue, NodeData, NodeKind, NodeRef,
 };
 use crate::refspec::{DynamicRef, MemberRef, MemberRole, RefSpec, Target};
 
@@ -47,20 +47,36 @@ use crate::refspec::{DynamicRef, MemberRef, MemberRole, RefSpec, Target};
 ///
 /// `Alias` is the module-scope path: the use has a local graph node
 /// (an import alias or a top-level decl) that takes the in-edge.
-/// `NestedImport` is the function-/class-scope path: ty saw an
-/// import binding in a non-global scope, so no graph node was
-/// minted, and the use's parallel upstream edges flow from the
-/// enclosing top-level owner instead.
+/// The other two are the function-/class-scope paths, where ty saw
+/// the binding in a non-global scope, so no graph node was minted,
+/// and the use's parallel upstream edges flow from the enclosing
+/// top-level owner instead: `NestedImport` for an import binding,
+/// `NestedModuleValue` for a variable holding a module or a function
+/// returning one —
+///
+/// ```python
+/// def who():
+///     m = importlib.import_module("pkg.config")
+///     return m.NAME
+/// ```
+///
+/// where `m.NAME` is a use of `pkg.config.NAME` owned by `who`.
 enum Resolution {
     Alias(u32),
     NestedImport {
         spec: ImportPayload,
         bound_name: CompactString,
     },
+    NestedModuleValue {
+        /// The binding is a `def`, so its values describe the result
+        /// of *calling* it and apply only under a leading `Call` step.
+        callable: bool,
+        values: Vec<ModuleValue>,
+    },
 }
 use crate::helpers::{
-    detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, program_file, python_file,
-    range_key, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
+    detect_dead_ranges, detect_type_checking_ranges, is_dunder_name, module_values_for_def,
+    program_file, python_file, range_key, EDGE_FLAG_DEAD_BRANCH, EDGE_FLAG_DYNAMIC_IMPORT,
 };
 use crate::ingest::{
     detect_dynamic_call, dynamic_call_module, file_package_name, from_module_string,
@@ -405,10 +421,18 @@ impl<'db> RefWalker<'_, 'db> {
 
     /// Resolve a `Name` use to the reaching local Definition(s) via
     /// ty's flow-sensitive use-def chain. Returns the local index for
-    /// each reaching def whose graph node lives in this file, or a
-    /// `NestedImport` descriptor for import bindings in non-global
-    /// scopes (which have no node of their own).
-    fn find_local_bindings(&self, name: &ExprName, extra_chain: &[&str]) -> Vec<Resolution> {
+    /// each reaching def whose graph node lives in this file, or, for
+    /// bindings in non-global scopes (which have no node of their
+    /// own), a `NestedImport` descriptor for an import and — when the
+    /// use carries an attribute / call chain (`has_steps`) — a
+    /// `NestedModuleValue` descriptor for a variable / function that
+    /// denotes a module.
+    fn find_local_bindings(
+        &self,
+        name: &ExprName,
+        extra_chain: &[&str],
+        has_steps: bool,
+    ) -> Vec<Resolution> {
         let db = self.model.db();
         // For names from a string-annotation sub-AST, ty doesn't know
         // their scope (we parsed them ourselves rather than going
@@ -487,6 +511,28 @@ impl<'db> RefWalker<'_, 'db> {
                     let bound_name = sym.name().as_str().to_compact_string();
                     let spec = import_payload_for(kind, self.db, self.file, self.parsed);
                     results.push(Resolution::NestedImport { spec, bound_name });
+                    continue;
+                }
+                // Nested-context variable or function: the same
+                // module-value classification a top-level node gets at
+                // build time (`m = importlib.import_module(…)`,
+                // `m = config`, `def get(): return config`), computed
+                // on demand from the binding's own scope since no node
+                // carries it. A bare read of the name (`return m`,
+                // `f(m)`) has nothing to resolve past the binding, so
+                // only a use with an attribute / call chain pays for
+                // the classification.
+                if !has_steps {
+                    continue;
+                }
+                let callable = match kind {
+                    DefinitionKind::Assignment(_) | DefinitionKind::AnnotatedAssignment(_) => false,
+                    DefinitionKind::Function(_) => true,
+                    _ => continue,
+                };
+                let values = module_values_for_def(self.db, self.file, self.parsed, scope_id, kind);
+                if !values.is_empty() {
+                    results.push(Resolution::NestedModuleValue { callable, values });
                 }
             }
             if saw_binding {
@@ -592,7 +638,7 @@ impl<'db> RefWalker<'_, 'db> {
             })
             .collect();
         self.current_flags = self.flags_for_range(name.range());
-        for resolution in self.find_local_bindings(name, &leading_attrs) {
+        for resolution in self.find_local_bindings(name, &leading_attrs, !steps.is_empty()) {
             match resolution {
                 Resolution::Alias(dst_local) => {
                     self.emit_local(dst_local);
@@ -620,6 +666,15 @@ impl<'db> RefWalker<'_, 'db> {
                 }
                 Resolution::NestedImport { spec, bound_name } => {
                     self.emit_member_use(&spec, &bound_name, steps);
+                }
+                Resolution::NestedModuleValue { callable, values } => {
+                    if callable {
+                        if let Some((ChainStep::Call, rest)) = steps.split_first() {
+                            self.emit_module_values(&values, rest);
+                        }
+                    } else if !steps.is_empty() {
+                        self.emit_module_values(&values, steps);
+                    }
                 }
             }
         }
