@@ -1,10 +1,11 @@
 """End-to-end tests for :meth:`Analysis.dead_tests`.
 
-A test is *dead* when nothing it references is reachable from a
-non-test seed: it only exercises code that is itself dead in production.
-The query returns the blast radius of dropping those tests — the tests
-plus every decl only they keep alive — mirroring the shape of the
-``test-only`` query, but scoped to tests that back nothing live.
+A test is *dead* when it exercises nothing a production entrypoint or a
+live test exercises (liveness is a fixpoint, so tests of test-support
+code used by live tests are live too). The query returns the blast
+radius of dropping those tests — the tests plus every decl only they
+keep alive — mirroring the shape of the ``test-only`` query, but scoped
+to tests that back nothing live.
 """
 
 from __future__ import annotations
@@ -164,9 +165,10 @@ def test_test_touching_no_project_code_is_dead(make_analysis, write_files):
     assert "tests.test_misc.test_nothing" in _fqnames(ctx, analysis.dead_tests())
 
 
-def test_decl_shared_with_live_test_survives(make_analysis, write_files):
-    """A dead helper a *live* test also reaches is kept by that test, so
-    it stays out of the blast radius even though a dead test uses it."""
+def test_code_a_live_test_exercises_is_live(make_analysis, write_files):
+    """Liveness is a fixpoint: a mixed test that touches ``used`` is live,
+    so the production-dead ``dead_helper`` it also calls is live code,
+    and the test that only pins ``dead_helper`` stays with it."""
     write_files(
         {
             **_PROJECT,
@@ -174,7 +176,7 @@ def test_decl_shared_with_live_test_survives(make_analysis, write_files):
             "tests/test_lib.py": """
             from pkg.lib import dead_helper, used
 
-            def test_dead():
+            def test_dead_helper_only():
                 assert dead_helper() == 1
 
             def test_both():
@@ -184,12 +186,85 @@ def test_decl_shared_with_live_test_survives(make_analysis, write_files):
         }
     )
     analysis = _pytest_analysis(make_analysis)
+    assert analysis.dead_tests() == set()
+
+
+def test_test_of_test_support_helper_survives(make_analysis, write_files):
+    """A helper that references no production code but is used by live
+    tests (a custom assertion, a fake) is live, and so is the test that
+    pins it. A helper only dead tests use goes with them."""
+    write_files(
+        {
+            **_PROJECT,
+            "tests/__init__.py": "",
+            "tests/helpers.py": """
+            def assert_one(value):
+                assert value == 1
+
+            def unused_by_live_tests(value):
+                assert value == 2
+            """,
+            "tests/test_helpers.py": """
+            from tests.helpers import assert_one, unused_by_live_tests
+
+            def test_assert_one():
+                assert_one(1)
+
+            def test_unused_by_live_tests():
+                unused_by_live_tests(2)
+            """,
+            "tests/test_lib.py": """
+            from pkg.lib import used, dead_helper
+            from tests.helpers import assert_one, unused_by_live_tests
+
+            def test_used():
+                assert_one(used())
+
+            def test_dead():
+                unused_by_live_tests(dead_helper())
+            """,
+        }
+    )
+    analysis = _pytest_analysis(make_analysis)
     ctx = analysis.materialize_all()
     dead = _fqnames(ctx, analysis.dead_tests())
-    assert "tests.test_lib.test_dead" in dead
-    assert "tests.test_lib.test_both" not in dead
-    assert "pkg.lib.dead_helper" not in dead
-    assert "pkg.util.shared" not in dead
+    assert "tests.test_helpers.test_assert_one" not in dead
+    assert "tests.helpers.assert_one" not in dead
+    assert "tests.test_lib.test_used" not in dead
+    assert dead >= {
+        "tests.test_lib.test_dead",
+        "tests.test_helpers.test_unused_by_live_tests",
+        "tests.helpers.unused_by_live_tests",
+        "pkg.lib.dead_helper",
+    }
+
+
+def test_dead_test_chain_stays_dead(make_analysis, write_files):
+    """Two dead tests sharing a production-dead helper do not make each
+    other live: nothing in their closure connects to a live seed."""
+    write_files(
+        {
+            **_PROJECT,
+            "tests/__init__.py": "",
+            "tests/test_lib.py": """
+            from pkg.lib import dead_helper
+
+            def test_dead_a():
+                assert dead_helper() == 1
+
+            def test_dead_b():
+                assert dead_helper() == 1
+            """,
+        }
+    )
+    analysis = _pytest_analysis(make_analysis)
+    ctx = analysis.materialize_all()
+    dead = _fqnames(ctx, analysis.dead_tests())
+    assert dead >= {
+        "tests.test_lib.test_dead_a",
+        "tests.test_lib.test_dead_b",
+        "pkg.lib.dead_helper",
+    }
 
 
 def test_fixture_chain_to_live_code_keeps_test_alive(make_analysis, write_files):

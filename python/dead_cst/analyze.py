@@ -130,13 +130,18 @@ def _dead_test_indices(
     """Positional indices of every dead test plus whatever only those
     tests keep alive.
 
-    A test (a node carrying ``testcase_flag``) is *dead* when nothing it
-    references — transitively, through import aliases, fixtures, and
-    the code they in turn reference — is reachable from a non-test seed
-    (``seed_flags & ~test_seed_flags``). Such a test only exercises code
-    that is itself dead in production, so removing the test (and the
-    code it was propping up) loses nothing a production entrypoint can
-    observe.
+    A test (a node carrying ``testcase_flag``) is *dead* when it
+    exercises nothing that a production entrypoint or a live test
+    exercises. "Live code" is the fixpoint of: everything reachable from
+    a non-test seed (``seed_flags & ~test_seed_flags``), plus everything
+    a live test references — transitively, through import aliases,
+    fixtures, and the code they in turn reference; a test is live when
+    it references live code. The second clause is what keeps a test of
+    pure test-support code (a custom assertion, a fake, a request
+    builder in ``tests/helpers.py``) alive: the helper is used by live
+    tests, so the test that pins the helper is live too. Removing a dead
+    test (and the code it was propping up) loses nothing a production
+    entrypoint or a surviving test can observe.
 
     The per-test walk deliberately does not expand ``module`` nodes: a
     test *importing from* a production module executes that module's
@@ -162,11 +167,17 @@ def _dead_test_indices(
     production = _forward_closure(out, production_seeds, expand=lambda _idx: True)
     production_code = [idx for idx in production if nodes[idx].kind in _CODE_KINDS]
 
-    # A test is live iff its module-stopping forward closure meets
-    # ``production_code``. Walking backwards from every production decl
-    # instead answers that for all tests in one pass: forward, a module
-    # never expands, so backwards we never step onto a module predecessor.
+    # A test is live iff its module-stopping forward closure meets live
+    # code. Walking *backwards* from every live decl answers that for all
+    # tests in one pass: forward, a module never expands, so backwards we
+    # never step onto a module predecessor. The fixpoint clause folds in
+    # as we go: each time the reverse walk lands on a test, the code in
+    # that test's forward closure becomes live and joins the reverse
+    # seeds. ``exercised`` is the shared visited set of those forward
+    # walks — a node's closure is pushed once no matter how many live
+    # tests reach it — so the whole thing stays linear in the graph.
     live: set[int] = set()
+    exercised: set[int] = set()
     stack = list(production_code)
     while stack:
         idx = stack.pop()
@@ -174,6 +185,19 @@ def _dead_test_indices(
             continue
         live.add(idx)
         stack.extend(pred for pred in incoming[idx] if nodes[pred].kind != "module")
+        if not nodes[idx].flags & testcase_flag:
+            continue
+        forward = [idx]
+        while forward:
+            cur = forward.pop()
+            if cur in exercised:
+                continue
+            exercised.add(cur)
+            if nodes[cur].kind == "module":
+                continue
+            if cur not in live and nodes[cur].kind in _CODE_KINDS:
+                stack.append(cur)
+            forward.extend(out[cur])
 
     dead_tests = {
         idx for idx, node in enumerate(nodes) if node.flags & testcase_flag and idx not in live
