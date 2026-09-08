@@ -58,7 +58,7 @@ two versions.
 
 ### Changed
 
-- **Vendored `ruff` (ty) submodule bumped to `lpetre/ruff@1dd21164`**, two
+- **Vendored `ruff` (ty) submodule bumped to `lpetre/ruff@42f429eb`**, two
   fork patches on top of the 0.15.0 pin. The first is the namespace-package
   fallback described under *Fixed* above. The second: search-path root
   discovery is memoized per top-level module-name component (a new `root_candidates`
