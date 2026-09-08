@@ -513,10 +513,35 @@ pub(crate) fn module_values_for_def(
 /// and the values of each `(definition, trailing steps)` pair are
 /// computed once and replayed, which also bounds the acyclic shapes
 /// (`return g()` / `return h()` at every level of a call chain).
+///
+/// The cycle check is on the definition alone, not the `(definition,
+/// trailing steps)` pair the memo is keyed on. A rebind of a name to a
+/// call on itself lengthens the steps at every hop, so the pair never
+/// repeats while the definition does:
+///
+/// ```python
+/// cursor = collection.find(query)
+/// if sort:
+///     cursor = cursor.sort(sort)
+/// if offset:
+///     cursor = cursor.skip(offset)
+/// if limit:
+///     cursor = cursor.limit(limit)
+/// return cursor.to_list()
+/// ```
+///
+/// Every `cursor` read has four reachable definitions, three of which
+/// lead straight back to `cursor` with one more `.sort(…)` / `.skip(…)`
+/// / `.limit(…)` step, so a pair-keyed check fans out `4^depth` paths
+/// (and stores each as a memo key) before the depth cap ends them —
+/// gigabytes on a ten-line method. A value that reaches its own
+/// definition again cannot denote a module through that path anyway:
+/// whatever `cursor` is, it is not a module obtained by re-reading
+/// `cursor`.
 #[derive(Default)]
 struct ModuleValueWalk<'db> {
-    /// `(definition, trailing steps)` pairs on the current path.
-    active: FxHashSet<(Definition<'db>, Vec<ChainStep>)>,
+    /// Definitions on the current path.
+    active: FxHashSet<Definition<'db>>,
     /// Values already computed for a `(definition, trailing steps)` pair.
     memo: FxHashMap<(Definition<'db>, Vec<ChainStep>), Vec<ModuleValue>>,
 }
@@ -622,7 +647,7 @@ fn classify_module_value_def<'db>(
         return;
     }
     // Already being computed further up the path: a cycle denotes nothing.
-    if !walk.active.insert(key.clone()) {
+    if !walk.active.insert(def) {
         return;
     }
     let mut values: Vec<ModuleValue> = Vec::new();
@@ -687,7 +712,7 @@ fn classify_module_value_def<'db>(
         }
         _ => {}
     }
-    walk.active.remove(&key);
+    walk.active.remove(&def);
     out.extend(values.iter().cloned());
     walk.memo.insert(key, values);
 }

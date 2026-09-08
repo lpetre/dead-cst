@@ -58,6 +58,17 @@ two versions.
   `import`. Names in a value are looked up lexically (innermost binding
   scope first), so a top-level `def get(): m = importlib.import_module(…);
   return m` followed by `get().NAME` now follows the local too.
+- **A variable rebound to a call on itself no longer blows up the build.**
+  `cursor = cursor.sort(…)` / `cursor = cursor.skip(…)` / `cursor =
+  cursor.limit(…)` in three `if` branches give every `cursor` read four
+  reachable definitions, three of which lead back to `cursor` with one more
+  step. The recursive-return cycle guard above was keyed on `(definition,
+  steps)`, so the lengthening steps never repeated and the walk fanned out
+  `4^depth` paths, storing each as a memo key -- gigabytes on a ten-line
+  method. The guard is now keyed on the definition alone: a value that
+  reaches its own definition again denotes no module through that path,
+  while the name's other definitions are still followed (`m = pkg; if
+  deep: m = m.sub` still reaches `pkg.sub.NAME`).
 
 ### Changed
 
