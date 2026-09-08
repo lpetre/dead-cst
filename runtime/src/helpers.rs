@@ -260,7 +260,12 @@ fn local_member_defs<'db>(db: &'db dyn ProjectDb, file: File, name: &str) -> Vec
     }
     for declaration in use_def.reachable_symbol_declarations(symbol_id) {
         if let Some(def) = declaration.declaration.definition() {
-            defs.push(def);
+            // A `def` / `class` is both a binding and a declaration of
+            // its name — the same `Definition` reported by both loops.
+            // Callers fan out per definition, so report it once.
+            if !defs.contains(&def) {
+                defs.push(def);
+            }
         }
     }
     defs
@@ -416,25 +421,47 @@ pub(crate) fn module_values_for_def(
     kind: &DefinitionKind<'_>,
 ) -> Vec<ModuleValue> {
     let mut out: Vec<ModuleValue> = Vec::new();
+    let mut walk = ModuleValueWalk::default();
     match kind {
         DefinitionKind::Assignment(assign) => {
-            classify_module_value(db, file, parsed, assign.value(parsed), &[], 0, &mut out);
+            let value = assign.value(parsed);
+            classify_module_value(db, file, parsed, value, &[], 0, &mut walk, &mut out);
         }
         DefinitionKind::AnnotatedAssignment(assign) => {
             if let Some(value) = assign.value(parsed) {
-                classify_module_value(db, file, parsed, value, &[], 0, &mut out);
+                classify_module_value(db, file, parsed, value, &[], 0, &mut walk, &mut out);
             }
         }
         DefinitionKind::Function(func) => {
             let mut returns: Vec<&Expr> = Vec::new();
             collect_return_values(&func.node(parsed).body, &mut returns);
             for value in returns {
-                classify_module_value(db, file, parsed, value, &[], 0, &mut out);
+                classify_module_value(db, file, parsed, value, &[], 0, &mut walk, &mut out);
             }
         }
         _ => {}
     }
     out
+}
+
+/// Per-call state of the [`classify_module_value`] walk.
+///
+/// The walk follows a name to each of its definitions and a call of a
+/// function to each of its `return` values, so it is a tree whose width
+/// multiplies at every hop. Nothing stops that tree from re-entering a
+/// definition already on the path: `return f(x, k=1)` inside `f` itself
+/// walks back into `f`, and two such returns make `2^depth` paths before
+/// the depth cap ends them — a hang on a three-line function. A
+/// definition on the current path therefore denotes nothing (a cycle),
+/// and the values of each `(definition, trailing steps)` pair are
+/// computed once and replayed, which also bounds the acyclic shapes
+/// (`return g()` / `return h()` at every level of a call chain).
+#[derive(Default)]
+struct ModuleValueWalk<'db> {
+    /// `(definition, trailing steps)` pairs on the current path.
+    active: FxHashSet<(Definition<'db>, Vec<ChainStep>)>,
+    /// Values already computed for a `(definition, trailing steps)` pair.
+    memo: FxHashMap<(Definition<'db>, Vec<ChainStep>), Vec<ModuleValue>>,
 }
 
 /// Describe the module(s) `expr` denotes, with `trailing` steps applied
@@ -445,13 +472,15 @@ pub(crate) fn module_values_for_def(
 /// * a dynamic-import call with a literal target is that module
 ///   ([`dynamic_call_module`]);
 /// * anything else denotes nothing.
-fn classify_module_value(
-    db: &dyn ProjectDb,
+#[allow(clippy::too_many_arguments)]
+fn classify_module_value<'db>(
+    db: &'db dyn ProjectDb,
     file: File,
     parsed: &ParsedModuleRef,
     expr: &Expr,
     trailing: &[ChainStep],
     depth: u32,
+    walk: &mut ModuleValueWalk<'db>,
     out: &mut Vec<ModuleValue>,
 ) {
     if depth > MEMBER_RESOLVE_DEPTH_CAP {
@@ -463,7 +492,7 @@ fn classify_module_value(
         Expr::Name(name) => {
             let symbol = name.id.as_str();
             for def in local_member_defs(db, file, symbol) {
-                classify_module_value_def(db, file, parsed, def, symbol, &steps, depth, out);
+                classify_module_value_def(db, file, parsed, def, symbol, &steps, depth, walk, out);
             }
         }
         Expr::Call(call) => {
@@ -497,8 +526,19 @@ fn classify_module_value_def<'db>(
     name: &str,
     steps: &[ChainStep],
     depth: u32,
+    walk: &mut ModuleValueWalk<'db>,
     out: &mut Vec<ModuleValue>,
 ) {
+    let key = (def, steps.to_vec());
+    if let Some(known) = walk.memo.get(&key) {
+        out.extend(known.iter().cloned());
+        return;
+    }
+    // Already being computed further up the path: a cycle denotes nothing.
+    if !walk.active.insert(key.clone()) {
+        return;
+    }
+    let mut values: Vec<ModuleValue> = Vec::new();
     let kind = def.kind(db);
     match kind {
         DefinitionKind::Import(_)
@@ -507,7 +547,7 @@ fn classify_module_value_def<'db>(
         | DefinitionKind::StarImport(_) => {
             let spec = import_payload_for_pure(kind, db, file, parsed);
             if !spec.module.is_empty() {
-                out.push(ModuleValue {
+                values.push(ModuleValue {
                     spec,
                     bound_name: name.to_compact_string(),
                     steps: steps.to_vec(),
@@ -515,33 +555,37 @@ fn classify_module_value_def<'db>(
             }
         }
         DefinitionKind::Assignment(assign) => {
-            classify_module_value(
-                db,
-                file,
-                parsed,
-                assign.value(parsed),
-                steps,
-                depth + 1,
-                out,
-            );
+            let value = assign.value(parsed);
+            classify_module_value(db, file, parsed, value, steps, depth + 1, walk, &mut values);
         }
         DefinitionKind::AnnotatedAssignment(assign) => {
             if let Some(value) = assign.value(parsed) {
-                classify_module_value(db, file, parsed, value, steps, depth + 1, out);
+                classify_module_value(db, file, parsed, value, steps, depth + 1, walk, &mut values);
             }
         }
         DefinitionKind::Function(func) => {
-            let Some((ChainStep::Call, rest)) = steps.split_first() else {
-                return;
-            };
-            let mut returns: Vec<&Expr> = Vec::new();
-            collect_return_values(&func.node(parsed).body, &mut returns);
-            for value in returns {
-                classify_module_value(db, file, parsed, value, rest, depth + 1, out);
+            if let Some((ChainStep::Call, rest)) = steps.split_first() {
+                let mut returns: Vec<&Expr> = Vec::new();
+                collect_return_values(&func.node(parsed).body, &mut returns);
+                for value in returns {
+                    classify_module_value(
+                        db,
+                        file,
+                        parsed,
+                        value,
+                        rest,
+                        depth + 1,
+                        walk,
+                        &mut values,
+                    );
+                }
             }
         }
         _ => {}
     }
+    walk.active.remove(&key);
+    out.extend(values.iter().cloned());
+    walk.memo.insert(key, values);
 }
 
 /// Every `return <expr>` value in a function body, entering compound

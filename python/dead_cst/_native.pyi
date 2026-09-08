@@ -624,6 +624,12 @@ class ProjectContext:
         """
         ...
 
+    def _salsa_memory_report(self, full: bool) -> str:
+        """ty's salsa memory dump: per-ingredient and per-query memo counts
+        and sizes (``full`` lists every table). Diagnostic only; the same
+        report prints to stderr when ``DEAD_CST_MEMORY_REPORT`` is set."""
+        ...
+
     def tombstoned_indices(self) -> list[int]:
         """Sorted dense node indices tombstoned by incremental
         re-mints — slots whose file block was replaced by a later
