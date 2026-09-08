@@ -11,6 +11,17 @@ two versions.
 
 ### Fixed
 
+- **A script-local module now beats a same-named namespace package.** With a
+  bare `foo/` directory (no `__init__.py`) at the project root and a
+  `scripts/foo.py` next to `scripts/main.py`, `import foo` in `main.py`
+  resolved to the namespace package, so the alias pointed nowhere and every
+  decl in `scripts/foo.py` it used was reported dead. CPython only builds a
+  namespace package when *no* `sys.path` entry holds a regular `foo`, and
+  running `scripts/main.py` puts `scripts/` on `sys.path`, so `scripts/foo.py`
+  is what actually loads. The vendored ty now consults the importing file's
+  ancestor directories whenever the configured search paths yield nothing
+  better than a namespace package, and prefers a file-backed module found
+  there; the alias resolves to `scripts.foo` and its decls stay live.
 - **Recursive functions no longer hang the build (0.15.0 regression).** The
   per-file module-value extraction follows a function's `return` expressions
   so `get_config().NAME` can land on the module `get_config` returns. A
@@ -72,9 +83,10 @@ two versions.
 
 ### Changed
 
-- **Vendored `ruff` (ty) submodule bumped to `lpetre/ruff@56f315a3`**, one
-  fork patch on top of the 0.15.0 pin: search-path root discovery is
-  memoized per top-level module-name component (a new `root_candidates`
+- **Vendored `ruff` (ty) submodule bumped to `lpetre/ruff@42f429eb`**, two
+  fork patches on top of the 0.15.0 pin. The first is the namespace-package
+  fallback described under *Fixed* above. The second: search-path root
+  discovery is memoized per top-level module-name component (a new `root_candidates`
   salsa query keyed on the first component, mode, scope, and
   shadowability) instead of being redone, and re-recorded as `O(search
   paths)` dependency edges, inside every `resolve_module_query` memo.
