@@ -9,6 +9,65 @@ two versions.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Recursive functions no longer hang the build (0.15.0 regression).** The
+  per-file module-value extraction follows a function's `return` expressions
+  so `get_config().NAME` can land on the module `get_config` returns. A
+  `return f(...)` inside `f` walked back into `f`, and with two such returns
+  the walk fanned out `2^depth` before the depth cap ended it -- `materialize`
+  never returned on a three-line function like `def f(x, k=0): if k == 0:
+  return f(x, k=1) ...`. The walk now treats a definition already on its path
+  as a cycle and computes each `(definition, trailing steps)` pair once;
+  `local_member_defs` also reports a `def` once instead of twice (as both a
+  binding and a declaration), which had squared the fan-out.
+- **Memory blow-up in `assemble` on workspaces with many members (0.15.0
+  regression).** The 0.15.0 sync onto upstream ty dropped the fork-side
+  per-root search-path cache in favour of upstream's directory-listing
+  candidate rejection. That keeps resolver *misses* cheap in time, but
+  every `resolve_module_query` memo now records a dependency on each
+  search path it scanned, so each distinct module name ever resolved
+  retains `O(search paths)` of salsa memo metadata (~9 bytes per search
+  path per name -- ~10 KB per name with a thousand editable members). The
+  reference walk's speculative `alias.attr` submodule probes are exactly
+  such distinct names, one per attribute chain rooted at a package alias,
+  which on a large monorepo runs to millions; 0.15.x grew without bound
+  where 0.14.1 plateaued. Probes are now answered from the resolved
+  parent package's own directory listing (one memoized listing per
+  package: a regular `__init__.py` package keeps its submodules beside
+  it), and only real submodules -- or parents whose listing is not
+  authoritative: namespace packages, legacy `pkg_resources` /
+  `pkgutil.extend_path` packages, stub packages, vendored typeshed -- reach
+  ty's resolver. On the synthetic 18k-module, 1200-member workspace
+  corpus this cuts the names ty resolves from 240k to 42k and peak RSS
+  from 4.5 GB to 2.2 GB; the vendored ty fix below takes the remaining
+  per-name cost out of the resolver itself (1.7 GB peak, and the
+  `resolve_module_query` table at a handful of MB regardless of member
+  count).
+
+### Changed
+
+- **Vendored `ruff` (ty) submodule bumped to `lpetre/ruff@56f315a3`**, one
+  fork patch on top of the 0.15.0 pin: search-path root discovery is
+  memoized per top-level module-name component (a new `root_candidates`
+  salsa query keyed on the first component, mode, scope, and
+  shadowability) instead of being redone, and re-recorded as `O(search
+  paths)` dependency edges, inside every `resolve_module_query` memo.
+  Every module name sharing a root now depends on one memo, so the
+  resolver's per-name memory no longer scales with the number of editable
+  members: on the 1200-member corpus the `resolve_module_query` table
+  drops from 580 MB to 5.5 MB (plus 23 MB of `root_candidates`) with the
+  same graph. Invalidation stays as fine-grained as before -- a changed
+  search path re-runs only its root discovery, and salsa backdates an
+  equal candidate list. The patch is being proposed upstream.
+
+### Added
+
+- **`DEAD_CST_MEMORY_REPORT=1` (or `=full`)** prints ty's salsa memory
+  dump -- per-ingredient and per-query memo counts and sizes -- to stderr
+  after `materialize`, alongside the existing `DEAD_CST_TIMING` phase line.
+  `ProjectContext._salsa_memory_report(full)` returns the same text.
+
 ## [0.15.1] - 2026-09-07
 
 ### Added
