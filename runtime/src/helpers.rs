@@ -11,7 +11,7 @@ use ruff_db::system::SystemPath;
 use ruff_db::PythonFile;
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::{walk_expr, Visitor};
-use ruff_python_ast::{Expr, ExprName, Stmt, StmtClassDef};
+use ruff_python_ast::{Expr, ExprName, Stmt, StmtClassDef, StmtFunctionDef};
 use ruff_source_file::LineIndex;
 use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -24,7 +24,8 @@ use ty_project::metadata::value::RelativePathBuf;
 use ty_project::{Db as ProjectDb, ProjectDatabase};
 use ty_python_core::definition::{Definition, DefinitionKind};
 use ty_python_core::program_file::ProgramFile;
-use ty_python_core::{global_scope, place_table, use_def_map};
+use ty_python_core::scope::{FileScopeId, NodeWithScopeRef, ScopeId};
+use ty_python_core::{global_scope, place_table, semantic_index, use_def_map};
 
 use crate::file_payload::{
     import_payload_for_pure, ChainStep, ImportPayload, MemberSpec, ModuleValue,
@@ -247,6 +248,16 @@ const MEMBER_RESOLVE_DEPTH_CAP: u32 = 16;
 /// classification.
 fn local_member_defs<'db>(db: &'db dyn ProjectDb, file: File, name: &str) -> Vec<Definition<'db>> {
     let scope = global_scope(db, program_file(db, file));
+    scope_member_defs(db, scope, name)
+}
+
+/// Every reachable binding and declaration of `name` in exactly one
+/// scope of a file — no ancestor walk.
+fn scope_member_defs<'db>(
+    db: &'db dyn ProjectDb,
+    scope: ScopeId<'db>,
+    name: &str,
+) -> Vec<Definition<'db>> {
     let table = place_table(db, scope);
     let Some(symbol_id) = table.symbol_id(name) else {
         return Vec::new();
@@ -269,6 +280,30 @@ fn local_member_defs<'db>(db: &'db dyn ProjectDb, file: File, name: &str) -> Vec
         }
     }
     defs
+}
+
+/// The definitions `name` refers to when read from `scope`: Python's
+/// lexical lookup, so the innermost visible ancestor scope that binds
+/// the name wins (a function body reads its own locals first, then the
+/// enclosing function, then the module; class bodies are skipped from
+/// inside their methods). A scope that only *uses* the name without
+/// binding it is passed over. For the global scope this is exactly
+/// [`local_member_defs`].
+fn visible_member_defs<'db>(
+    db: &'db dyn ProjectDb,
+    file: File,
+    scope: FileScopeId,
+    name: &str,
+) -> Vec<Definition<'db>> {
+    let program_file = program_file(db, file);
+    let index = semantic_index(db, program_file);
+    for (ancestor, _) in index.visible_ancestor_scopes(scope) {
+        let defs = scope_member_defs(db, ancestor.to_scope_id(db, program_file), name);
+        if !defs.is_empty() {
+            return defs;
+        }
+    }
+    Vec::new()
 }
 
 /// Describe one class-base expression as a [`MemberSpec`] using only
@@ -405,19 +440,36 @@ fn classify_name_def<'db>(
     }
 }
 
-/// The [`ModuleValue`]s a global-scope definition denotes, for
-/// [`crate::file_payload::file_to_nodes`]: a variable's assigned value
-/// (`m = config`, `m = importlib.import_module('pkg.config')`,
+/// The [`ModuleValue`]s a definition denotes: a variable's assigned
+/// value (`m = config`, `m = importlib.import_module('pkg.config')`,
 /// `m = pkg.sub`) or, for a function, the value of *calling* it — every
 /// `return` expression in its body that denotes a module. Same-file
 /// hops (a variable bound to another variable, a call to a same-file
 /// function) are folded in here via this file's use-def chain, mirroring
 /// [`classify_base`]; nothing cross-file is read. Empty for anything
 /// that cannot syntactically denote a module.
+///
+/// `scope` is the scope the definition is bound in, and is where the
+/// names in its value are looked up (lexically, through the visible
+/// ancestors). [`crate::file_payload::file_to_nodes`] calls this with
+/// the global scope for every top-level variable / function node; the
+/// ref-edge walk calls it for bindings in function and class bodies,
+/// which have no node of their own:
+///
+/// ```python
+/// def who():
+///     m = importlib.import_module("pkg.config")
+///     return m.NAME          # `m` denotes `pkg.config`
+/// ```
+///
+/// A function's `return` expressions are read from the function's own
+/// body scope, so a module held in one of its locals is followed too
+/// (`def get(): m = importlib.import_module("pkg.config"); return m`).
 pub(crate) fn module_values_for_def(
     db: &dyn ProjectDb,
     file: File,
     parsed: &ParsedModuleRef,
+    scope: FileScopeId,
     kind: &DefinitionKind<'_>,
 ) -> Vec<ModuleValue> {
     let mut out: Vec<ModuleValue> = Vec::new();
@@ -425,19 +477,24 @@ pub(crate) fn module_values_for_def(
     match kind {
         DefinitionKind::Assignment(assign) => {
             let value = assign.value(parsed);
-            classify_module_value(db, file, parsed, value, &[], 0, &mut walk, &mut out);
+            classify_module_value(db, file, parsed, scope, value, &[], 0, &mut walk, &mut out);
         }
         DefinitionKind::AnnotatedAssignment(assign) => {
             if let Some(value) = assign.value(parsed) {
-                classify_module_value(db, file, parsed, value, &[], 0, &mut walk, &mut out);
+                classify_module_value(db, file, parsed, scope, value, &[], 0, &mut walk, &mut out);
             }
         }
         DefinitionKind::Function(func) => {
-            let mut returns: Vec<&Expr> = Vec::new();
-            collect_return_values(&func.node(parsed).body, &mut returns);
-            for value in returns {
-                classify_module_value(db, file, parsed, value, &[], 0, &mut walk, &mut out);
-            }
+            classify_function_returns(
+                db,
+                file,
+                parsed,
+                func.node(parsed),
+                &[],
+                0,
+                &mut walk,
+                &mut out,
+            );
         }
         _ => {}
     }
@@ -456,19 +513,72 @@ pub(crate) fn module_values_for_def(
 /// and the values of each `(definition, trailing steps)` pair are
 /// computed once and replayed, which also bounds the acyclic shapes
 /// (`return g()` / `return h()` at every level of a call chain).
+///
+/// The cycle check is on the definition alone, not the `(definition,
+/// trailing steps)` pair the memo is keyed on. A rebind of a name to a
+/// call on itself lengthens the steps at every hop, so the pair never
+/// repeats while the definition does:
+///
+/// ```python
+/// cursor = collection.find(query)
+/// if sort:
+///     cursor = cursor.sort(sort)
+/// if offset:
+///     cursor = cursor.skip(offset)
+/// if limit:
+///     cursor = cursor.limit(limit)
+/// return cursor.to_list()
+/// ```
+///
+/// Every `cursor` read has four reachable definitions, three of which
+/// lead straight back to `cursor` with one more `.sort(…)` / `.skip(…)`
+/// / `.limit(…)` step, so a pair-keyed check fans out `4^depth` paths
+/// (and stores each as a memo key) before the depth cap ends them —
+/// gigabytes on a ten-line method. A value that reaches its own
+/// definition again cannot denote a module through that path anyway:
+/// whatever `cursor` is, it is not a module obtained by re-reading
+/// `cursor`.
 #[derive(Default)]
 struct ModuleValueWalk<'db> {
-    /// `(definition, trailing steps)` pairs on the current path.
-    active: FxHashSet<(Definition<'db>, Vec<ChainStep>)>,
+    /// Definitions on the current path.
+    active: FxHashSet<Definition<'db>>,
     /// Values already computed for a `(definition, trailing steps)` pair.
     memo: FxHashMap<(Definition<'db>, Vec<ChainStep>), Vec<ModuleValue>>,
+}
+
+/// Describe the module(s) calling `func` evaluates to: each `return`
+/// expression in its body, classified from the body's own scope, with
+/// `trailing` steps applied after it. A body ty gave no scope (which
+/// cannot happen for a `def` in a parsed module) denotes nothing.
+#[allow(clippy::too_many_arguments)]
+fn classify_function_returns<'db>(
+    db: &'db dyn ProjectDb,
+    file: File,
+    parsed: &ParsedModuleRef,
+    func: &StmtFunctionDef,
+    trailing: &[ChainStep],
+    depth: u32,
+    walk: &mut ModuleValueWalk<'db>,
+    out: &mut Vec<ModuleValue>,
+) {
+    let index = semantic_index(db, program_file(db, file));
+    let Some(body_scope) = index.try_node_scope(NodeWithScopeRef::Function(func)) else {
+        return;
+    };
+    let mut returns: Vec<&Expr> = Vec::new();
+    collect_return_values(&func.body, &mut returns);
+    for value in returns {
+        classify_module_value(
+            db, file, parsed, body_scope, value, trailing, depth, walk, out,
+        );
+    }
 }
 
 /// Describe the module(s) `expr` denotes, with `trailing` steps applied
 /// after it, into `out`. Peels the access chain to its root, then:
 ///
-/// * a `Name` is classified through each of its reachable definitions
-///   ([`classify_module_value_def`]);
+/// * a `Name` is classified through each of the definitions it refers
+///   to when read from `scope` ([`classify_module_value_def`]);
 /// * a dynamic-import call with a literal target is that module
 ///   ([`dynamic_call_module`]);
 /// * anything else denotes nothing.
@@ -477,6 +587,7 @@ fn classify_module_value<'db>(
     db: &'db dyn ProjectDb,
     file: File,
     parsed: &ParsedModuleRef,
+    scope: FileScopeId,
     expr: &Expr,
     trailing: &[ChainStep],
     depth: u32,
@@ -491,7 +602,7 @@ fn classify_module_value<'db>(
     match root {
         Expr::Name(name) => {
             let symbol = name.id.as_str();
-            for def in local_member_defs(db, file, symbol) {
+            for def in visible_member_defs(db, file, scope, symbol) {
                 classify_module_value_def(db, file, parsed, def, symbol, &steps, depth, walk, out);
             }
         }
@@ -514,9 +625,10 @@ fn classify_module_value<'db>(
 
 /// One definition of a chain root `name`, with `steps` applied to it:
 /// an import binding is the module its payload names; an assignment
-/// follows its right-hand side; a function consumes a leading `Call`
-/// step and follows its `return` expressions. Anything else (a class,
-/// a parameter, …) denotes no module.
+/// follows its right-hand side (read from the scope the assignment
+/// lives in); a function consumes a leading `Call` step and follows
+/// its `return` expressions. Anything else (a class, a parameter, …)
+/// denotes no module.
 #[allow(clippy::too_many_arguments)]
 fn classify_module_value_def<'db>(
     db: &'db dyn ProjectDb,
@@ -535,11 +647,12 @@ fn classify_module_value_def<'db>(
         return;
     }
     // Already being computed further up the path: a cycle denotes nothing.
-    if !walk.active.insert(key.clone()) {
+    if !walk.active.insert(def) {
         return;
     }
     let mut values: Vec<ModuleValue> = Vec::new();
     let kind = def.kind(db);
+    let def_scope = def.scope(db).file_scope_id(db);
     match kind {
         DefinitionKind::Import(_)
         | DefinitionKind::ImportFrom(_)
@@ -556,34 +669,50 @@ fn classify_module_value_def<'db>(
         }
         DefinitionKind::Assignment(assign) => {
             let value = assign.value(parsed);
-            classify_module_value(db, file, parsed, value, steps, depth + 1, walk, &mut values);
+            classify_module_value(
+                db,
+                file,
+                parsed,
+                def_scope,
+                value,
+                steps,
+                depth + 1,
+                walk,
+                &mut values,
+            );
         }
         DefinitionKind::AnnotatedAssignment(assign) => {
             if let Some(value) = assign.value(parsed) {
-                classify_module_value(db, file, parsed, value, steps, depth + 1, walk, &mut values);
+                classify_module_value(
+                    db,
+                    file,
+                    parsed,
+                    def_scope,
+                    value,
+                    steps,
+                    depth + 1,
+                    walk,
+                    &mut values,
+                );
             }
         }
         DefinitionKind::Function(func) => {
             if let Some((ChainStep::Call, rest)) = steps.split_first() {
-                let mut returns: Vec<&Expr> = Vec::new();
-                collect_return_values(&func.node(parsed).body, &mut returns);
-                for value in returns {
-                    classify_module_value(
-                        db,
-                        file,
-                        parsed,
-                        value,
-                        rest,
-                        depth + 1,
-                        walk,
-                        &mut values,
-                    );
-                }
+                classify_function_returns(
+                    db,
+                    file,
+                    parsed,
+                    func.node(parsed),
+                    rest,
+                    depth + 1,
+                    walk,
+                    &mut values,
+                );
             }
         }
         _ => {}
     }
-    walk.active.remove(&key);
+    walk.active.remove(&def);
     out.extend(values.iter().cloned());
     walk.memo.insert(key, values);
 }

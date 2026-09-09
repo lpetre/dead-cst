@@ -1083,6 +1083,205 @@ def test_imports(build_decl_graph, assert_edges, src, expected_extra_edges):
             },
             id="attribute-on-call-through-aliased-module",
         ),
+        pytest.param(
+            # The module lands in a *function-local* variable:
+            # ``m = importlib.import_module('pkg.config')`` inside
+            # ``who``'s body. A binding in a non-global scope has no
+            # node of its own, so ``m.NAME`` is attributed to the
+            # enclosing top-level decl: ``who`` edges to ``pkg.config``
+            # (the dynamic-import edge and the module hop of the use)
+            # and to ``pkg.config.NAME``. Same shape as a nested
+            # ``import``, whose use edges flow from the owner too.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": (
+                    "import importlib\n"
+                    "def who():\n"
+                    "    m = importlib.import_module('pkg.config')\n"
+                    "    return m.NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.importlib -> pkg.use",
+                "pkg.use.who -> pkg.config",
+                "pkg.use.who -> pkg.config.NAME",
+                "pkg.use.who -> pkg.use",
+                "pkg.use.who -> pkg.use.importlib",
+            },
+            id="attribute-on-local-variable-bound-by-import-module",
+        ),
+        pytest.param(
+            # A function-local re-binding of a *nested* import:
+            # ``from pkg import config`` then ``m = config``, both inside
+            # ``who``. Neither binding has a node; the value of ``m`` is
+            # classified from ``who``'s own scope, where ``config`` is the
+            # nested import, so ``m.NAME`` still reaches
+            # ``pkg.config.NAME``.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": (
+                    "def who():\n    from pkg import config\n    m = config\n    return m.NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.who -> pkg.config",
+                "pkg.use.who -> pkg.config.NAME",
+                "pkg.use.who -> pkg.use",
+            },
+            id="attribute-on-local-variable-rebinding-nested-import",
+        ),
+        pytest.param(
+            # A function-local re-binding of a *module-level* import:
+            # ``m = config`` inside ``who`` where ``config`` is the
+            # top-level alias. The lookup of ``config`` from ``who``'s
+            # scope climbs to the module scope, so ``who`` keeps its
+            # alias edge and gains the module / decl edges.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": "from pkg import config\ndef who():\n    m = config\n    return m.NAME\n",
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.config -> pkg.config",
+                "pkg.use.config -> pkg.use",
+                "pkg.use.who -> pkg.config",
+                "pkg.use.who -> pkg.config.NAME",
+                "pkg.use.who -> pkg.use",
+                "pkg.use.who -> pkg.use.config",
+            },
+            id="attribute-on-local-variable-rebinding-module-alias",
+        ),
+        pytest.param(
+            # A local that *shadows* a module alias with a non-module
+            # value: ``config = 1`` inside ``who``. Python's lexical
+            # lookup binds ``m = config`` to the local, so ``m.NAME`` is
+            # not a use of ``pkg.config.NAME`` and no edge is emitted;
+            # the top-level ``config`` alias keeps only its own edges.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\n",
+                "pkg/use.py": (
+                    "from pkg import config\n"
+                    "def who():\n"
+                    "    config = 1\n"
+                    "    m = config\n"
+                    "    return m.NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.config -> pkg.config",
+                "pkg.use.config -> pkg.use",
+                "pkg.use.who -> pkg.use",
+            },
+            id="attribute-on-local-variable-shadowing-module-alias",
+        ),
+        pytest.param(
+            # A top-level function whose module return value passes
+            # through a *local*: ``m = importlib.import_module(...)``
+            # then ``return m``. The function's return expressions are
+            # classified from its body scope, so ``get()`` denotes
+            # ``pkg.config`` and ``get().NAME`` reaches the decl.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\nOTHER = 'y'\n",
+                "pkg/use.py": (
+                    "import importlib\n"
+                    "def get():\n"
+                    "    m = importlib.import_module('pkg.config')\n"
+                    "    return m\n"
+                    "WHO = get().NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.config.OTHER -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.WHO -> pkg.config",
+                "pkg.use.WHO -> pkg.config.NAME",
+                "pkg.use.WHO -> pkg.use",
+                "pkg.use.WHO -> pkg.use.get",
+                "pkg.use.get -> pkg.config",
+                "pkg.use.get -> pkg.use",
+                "pkg.use.get -> pkg.use.importlib",
+                "pkg.use.importlib -> pkg.use",
+            },
+            id="attribute-on-call-returning-local-module-variable",
+        ),
+        pytest.param(
+            # An *inner* function returning a module, called inside its
+            # enclosing function: ``get().NAME``. The inner ``def`` has
+            # no node; its return descriptor is consumed by the ``Call``
+            # step and the ``NAME`` segment resolves in ``pkg.config``,
+            # all attributed to ``who``.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\n",
+                "pkg/use.py": (
+                    "from pkg import config\n"
+                    "def who():\n"
+                    "    def get():\n"
+                    "        return config\n"
+                    "    return get().NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.config -> pkg.config",
+                "pkg.use.config -> pkg.use",
+                "pkg.use.who -> pkg.config",
+                "pkg.use.who -> pkg.config.NAME",
+                "pkg.use.who -> pkg.use",
+                "pkg.use.who -> pkg.use.config",
+            },
+            id="attribute-on-call-to-inner-function-returning-module",
+        ),
+        pytest.param(
+            # A class-body variable holding a module: ``m =
+            # importlib.import_module(...)`` then ``WHO = m.NAME`` in the
+            # body of ``C``. Class-scope bindings have no node either;
+            # the use is attributed to the class.
+            {
+                "pkg/__init__.py": "",
+                "pkg/config.py": "NAME = 'x'\n",
+                "pkg/use.py": (
+                    "import importlib\n"
+                    "class C:\n"
+                    "    m = importlib.import_module('pkg.config')\n"
+                    "    WHO = m.NAME\n"
+                ),
+            },
+            {
+                "pkg.config -> pkg",
+                "pkg.config.NAME -> pkg.config",
+                "pkg.use -> pkg",
+                "pkg.use.C -> pkg.config",
+                "pkg.use.C -> pkg.config.NAME",
+                "pkg.use.C -> pkg.use",
+                "pkg.use.C -> pkg.use.importlib",
+                "pkg.use.importlib -> pkg.use",
+            },
+            id="attribute-on-class-body-variable-bound-by-import-module",
+        ),
     ],
 )
 def test_full_graph_edges(build_decl_graph, assert_edges, files, expected_edges):
