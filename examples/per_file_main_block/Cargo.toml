@@ -1,6 +1,6 @@
 [package]
 name = "per_file_main_block"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2021"
 publish = false
 
